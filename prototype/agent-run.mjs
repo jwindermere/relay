@@ -188,6 +188,20 @@ async function persistArtifact() {
     authentication: "managed local Codex credential store (run `codex login status` to verify)",
     threadId,
     activeTurnId,
+    turns: lifecycle
+      .filter((event) => event.method === "turn/start/response")
+      .map((event) => {
+        const turn = event.params.turn;
+        const completion = lifecycle.findLast(
+          (candidate) => candidate.method === "turn/completed" && candidate.params.turn.id === turn.id,
+        );
+        return {
+          id: turn.id,
+          status: completion?.params.turn.status ?? turn.status,
+          startedAt: turn.startedAt ?? null,
+          completedAt: completion?.params.turn.completedAt ?? null,
+        };
+      }),
     lifecycle,
     constraints: [
       "Persist the Codex threadId and every turnId before treating an AgentRun as recoverable.",

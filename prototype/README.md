@@ -21,7 +21,7 @@ npm run prototype:agent-run -- \
   --follow-up "Explain why that improvement matters for a Recoverable AgentRun."
 ```
 
-Prove cancellation by interrupting a real turn after a short delay:
+Attempt and assert cancellation by interrupting a real turn after it has started:
 
 ```sh
 npm run prototype:agent-run -- \
@@ -56,3 +56,6 @@ follow-up turn. The provider's locally persisted thread history must remain avai
 This deliberately does not expose a network listener, collect provider credentials,
 or make a multi-user control plane. Those are product concerns outside the smallest
 supported local proof.
+
+If a turn completes before interruption can be submitted, the command fails rather
+than claiming cancellation was proved; retry with a longer-running disposable prompt.
