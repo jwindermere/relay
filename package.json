@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "prototype:agent-run": "node prototype/agent-run.mjs",
-    "check": "node --check prototype/agent-run.mjs",
+    "prototype:realtime-agent-run": "node prototype/realtime-agent-run.mjs",
+    "check": "node --check prototype/agent-run.mjs && node --check prototype/realtime-agent-run-model.mjs && node --check prototype/realtime-agent-run.mjs",
     "test": "node --test"
   },
   "engines": {
