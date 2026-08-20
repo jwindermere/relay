@@ -1,0 +1,180 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { resolve } from "node:path";
+import { createInterface } from "node:readline";
+
+const repositoryDirectory = resolve(process.cwd());
+const outputDirectory = resolve(repositoryDirectory, "prototype/runs");
+const argumentsByName = new Map(
+  process.argv.slice(2).map((argument, index, argumentsList) => [
+    argument,
+    argumentsList[index + 1],
+  ]),
+);
+const prompt = argumentsByName.get("--prompt") ?? "Inspect README.md and report its title in one sentence.";
+const followUp = argumentsByName.get("--follow-up");
+const cancelAfterMilliseconds = Number(argumentsByName.get("--cancel-after-ms") ?? 0);
+const workspaceDirectory = resolve(argumentsByName.get("--workspace") ?? repositoryDirectory);
+
+if (!Number.isFinite(cancelAfterMilliseconds) || cancelAfterMilliseconds < 0) {
+  throw new Error("--cancel-after-ms must be a non-negative number.");
+}
+
+const lifecycle = [];
+const requests = new Map();
+let requestId = 0;
+let threadId;
+let activeTurnId;
+let cancellationTimer;
+
+const appServer = spawn(process.env.RELAY_CODEX_BIN ?? "codex", ["app-server", "--stdio"], {
+  cwd: workspaceDirectory,
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+appServer.stderr.setEncoding("utf8");
+appServer.stderr.on("data", (message) => record("app-server/stderr", { message }));
+appServer.on("error", (error) => failOutstandingRequests(error));
+appServer.on("exit", (code, signal) => {
+  if (requests.size > 0) {
+    failOutstandingRequests(new Error(`codex app-server exited before replying (code ${code}, signal ${signal}).`));
+  }
+});
+
+createInterface({ input: appServer.stdout }).on("line", (line) => {
+  try {
+    handleMessage(JSON.parse(line));
+  } catch (error) {
+    record("relay/protocol-error", { line, message: error.message });
+  }
+});
+
+function record(method, params) {
+  lifecycle.push({ at: new Date().toISOString(), method, params });
+}
+
+function failOutstandingRequests(error) {
+  for (const request of requests.values()) request.reject(error);
+  requests.clear();
+}
+
+function send(method, params) {
+  const id = ++requestId;
+  const message = { id, method, params };
+  record("relay/request", message);
+
+  return new Promise((resolveRequest, rejectRequest) => {
+    requests.set(id, { resolve: resolveRequest, reject: rejectRequest, method });
+    appServer.stdin.write(`${JSON.stringify(message)}\n`);
+  });
+}
+
+function handleMessage(message) {
+  if (message.id !== undefined) {
+    const request = requests.get(message.id);
+    if (!request) return;
+
+    requests.delete(message.id);
+    if (message.error) {
+      request.reject(new Error(`${request.method}: ${message.error.message}`));
+      return;
+    }
+
+    record(`${request.method}/response`, message.result);
+    request.resolve(message.result);
+    return;
+  }
+
+  record(message.method, message.params);
+  if (message.method === "turn/started") activeTurnId = message.params.turn.id;
+  if (message.method === "turn/completed") activeTurnId = undefined;
+}
+
+function waitForCompletion(turnId) {
+  return new Promise((resolveCompletion) => {
+    const timer = setInterval(() => {
+      const completion = lifecycle.findLast(
+        (event) => event.method === "turn/completed" && event.params.turn.id === turnId,
+      );
+      if (completion) {
+        clearInterval(timer);
+        resolveCompletion(completion.params.turn);
+      }
+    }, 50);
+  });
+}
+
+async function startTurn(input) {
+  const turn = await send("turn/start", {
+    threadId,
+    input: [{ type: "text", text: input }],
+  });
+  activeTurnId = turn.turn.id;
+  return turn.turn.id;
+}
+
+async function main() {
+  await send("initialize", {
+    clientInfo: { name: "relay-agent-run-prototype", version: "0.1.0" },
+    capabilities: {},
+  });
+
+  const thread = await send("thread/start", {
+    cwd: workspaceDirectory,
+    sandbox: "workspace-write",
+    approvalPolicy: "on-request",
+  });
+  threadId = thread.thread.id;
+
+  const firstTurnId = await startTurn(prompt);
+  if (cancelAfterMilliseconds > 0) {
+    cancellationTimer = setTimeout(() => {
+      if (activeTurnId) send("turn/interrupt", { threadId, turnId: activeTurnId }).catch(reportFailure);
+    }, cancelAfterMilliseconds);
+  }
+  await waitForCompletion(firstTurnId);
+  clearTimeout(cancellationTimer);
+
+  if (followUp) {
+    const followUpTurnId = await startTurn(followUp);
+    await waitForCompletion(followUpTurnId);
+  }
+
+  await writeArtifact();
+}
+
+async function writeArtifact() {
+  await mkdir(outputDirectory, { recursive: true });
+  const artifactPath = resolve(outputDirectory, `agent-run-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.json`);
+  const artifact = {
+    prototype: "persistent-codex-backed-agent-run",
+    appServer: "codex app-server --stdio",
+    workspaceDirectory,
+    authentication: "managed local Codex credential store (run `codex login status` to verify)",
+    threadId,
+    lifecycle,
+    constraints: [
+      "Persist the Codex threadId and every turnId before treating an AgentRun as recoverable.",
+      "Map streamed item events to concise visible status; a quiet connection is not completion.",
+      "Treat turn/completed status as authoritative for completed, failed, or interrupted outcomes.",
+      "A follow-up is a new turn/start on the same thread; it is not a reply injected into the original turn.",
+      "Cancellation requires turn/interrupt with both persisted identifiers and remains asynchronous until turn/completed.",
+      "This local stdio proof depends on the owner machine and its persisted Codex credential store; it is not a multi-tenant service boundary.",
+    ],
+  };
+  await writeFile(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`);
+  console.log(`AgentRun artifact: ${artifactPath}`);
+}
+
+function reportFailure(error) {
+  record("relay/failure", { message: error.message });
+  console.error(error);
+}
+
+main()
+  .catch(async (error) => {
+    reportFailure(error);
+    await writeArtifact();
+    process.exitCode = 1;
+  })
+  .finally(() => appServer.kill());

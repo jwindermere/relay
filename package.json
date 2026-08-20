@@ -1,0 +1,12 @@
+{
+  "name": "relay",
+  "private": true,
+  "scripts": {
+    "prototype:agent-run": "node prototype/agent-run.mjs",
+    "check": "node --check prototype/agent-run.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
