@@ -17,8 +17,8 @@ Send follow-up input on the same persisted thread:
 
 ```sh
 npm run prototype:agent-run -- \
-  --prompt "Inspect README.md and report its title." \
-  --follow-up "Now restate that title in uppercase."
+  --prompt "Inspect prototype/agent-run.mjs and propose one precise, no-write reliability improvement." \
+  --follow-up "Explain why that improvement matters for a Recoverable AgentRun."
 ```
 
 Prove cancellation by interrupting a real turn after a short delay:
@@ -26,8 +26,8 @@ Prove cancellation by interrupting a real turn after a short delay:
 ```sh
 npm run prototype:agent-run -- \
   --workspace /tmp \
-  --prompt "Think through a long list of numbers without accessing any files." \
-  --cancel-after-ms 1000
+  --prompt "Plan a careful engineering review without accessing any files." \
+  --cancel-after-ms 0
 ```
 
 `--workspace` defaults to the repository root. Point it at a disposable directory
@@ -49,7 +49,7 @@ follow-up turn. The provider's locally persisted thread history must remain avai
 - `item/started`, `item/completed` and `turn/completed` make lifecycle status visible.
 - A follow-up is a second `turn/start` on the same thread.
 - Cancellation is an asynchronous `turn/interrupt`, confirmed only by a later
-  `turn/completed` event.
+  `turn/completed` event whose status must be `interrupted`.
 - The integration is experimental; capacity follows the owner's plan/rate limit and
   has no documented account-level concurrency guarantee, so Relay must queue runs.
 

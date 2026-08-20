@@ -93,14 +93,18 @@ function handleMessage(message) {
 }
 
 function waitForCompletion(turnId) {
+  return waitForEvent(
+    (event) => event.method === "turn/completed" && event.params.turn.id === turnId,
+  ).then((event) => event.params.turn);
+}
+
+function waitForEvent(predicate) {
   return new Promise((resolveCompletion) => {
     const timer = setInterval(() => {
-      const completion = lifecycle.findLast(
-        (event) => event.method === "turn/completed" && event.params.turn.id === turnId,
-      );
-      if (completion) {
+      const event = lifecycle.findLast(predicate);
+      if (event) {
         clearInterval(timer);
-        resolveCompletion(completion.params.turn);
+        resolveCompletion(event);
       }
     }, 50);
   });
@@ -111,7 +115,10 @@ async function startTurn(input) {
     threadId,
     input: [{ type: "text", text: input }],
   });
-  activeTurnId = turn.turn.id;
+  const completed = lifecycle.some(
+    (event) => event.method === "turn/completed" && event.params.turn.id === turn.turn.id,
+  );
+  activeTurnId = completed ? undefined : turn.turn.id;
   await persistArtifact();
   return turn.turn.id;
 }
@@ -146,13 +153,22 @@ async function main() {
   const initialPrompt = resumePath && !argumentsByName.has("--prompt") ? undefined : prompt;
   if (initialPrompt) {
     const firstTurnId = await startTurn(initialPrompt);
-    if (cancelAfterMilliseconds > 0) {
-      cancellationTimer = setTimeout(() => {
-        if (activeTurnId) send("turn/interrupt", { threadId, turnId: activeTurnId }).catch(reportFailure);
-      }, cancelAfterMilliseconds);
+    if (argumentsByName.has("--cancel-after-ms")) {
+      await waitForEvent(
+        (event) => event.method === "turn/started" && event.params.turn.id === firstTurnId,
+      );
+      await new Promise((resolveDelay) => {
+        cancellationTimer = setTimeout(resolveDelay, cancelAfterMilliseconds);
+      });
+      if (!activeTurnId) throw new Error("The turn completed before cancellation could be requested.");
+      await send("turn/interrupt", { threadId, turnId: activeTurnId });
+      await persistArtifact();
     }
-    await waitForCompletion(firstTurnId);
+    const completedTurn = await waitForCompletion(firstTurnId);
     clearTimeout(cancellationTimer);
+    if (argumentsByName.has("--cancel-after-ms") && completedTurn.status !== "interrupted") {
+      throw new Error(`Expected an interrupted turn after cancellation, received ${completedTurn.status}.`);
+    }
     await persistArtifact();
   }
 

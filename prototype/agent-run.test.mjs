@@ -11,19 +11,27 @@ test("the CLI writes an inspectable completed AgentRun artifact from streamed ev
   await writeFile(codexFixture, `#!/usr/bin/env node
 import { createInterface } from "node:readline";
 setInterval(() => {}, 1_000);
+const cancelling = process.env.RELAY_FIXTURE_CANCEL === "true";
 createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   const reply = (result) => process.stdout.write(JSON.stringify({ id: request.id, result }) + String.fromCharCode(10));
   if (request.method === "initialize") reply({});
   if (request.method === "thread/start") reply({ thread: { id: "thread-1" } });
+  if (request.method === "thread/resume") reply({ thread: { id: "thread-1" } });
   if (request.method === "turn/start") {
     reply({ turn: { id: "turn-1" } });
     for (const message of [
       { method: "turn/started", params: { turn: { id: "turn-1" } } },
+      ...(cancelling ? [] : [
       { method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: {}, startedAtMs: 1 } },
       { method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: {}, completedAtMs: 2 } },
       { method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } },
+      ]),
     ]) process.stdout.write(JSON.stringify(message) + String.fromCharCode(10));
+  }
+  if (request.method === "turn/interrupt") {
+    reply({});
+    process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "interrupted" } } }) + String.fromCharCode(10));
   }
 });
 `);
@@ -42,6 +50,25 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   assert.equal(
     artifact.lifecycle.find((event) => event.method === "turn/completed").params.turn.status,
     "completed",
+  );
+
+  const resumed = await run(process.execPath, ["prototype/agent-run.mjs", "--resume", artifactPath, "--follow-up", "continue"], {
+    RELAY_CODEX_BIN: codexFixture,
+  });
+  assert.equal(resumed.code, 0, `${resumed.stdout}\n${resumed.stderr}`);
+  const resumedArtifact = JSON.parse(await readFile(artifactPath, "utf8"));
+  assert.ok(resumedArtifact.lifecycle.some((event) => event.method === "thread/resume/response"));
+
+  const interrupted = await run(process.execPath, ["prototype/agent-run.mjs", "--cancel-after-ms", "0"], {
+    RELAY_CODEX_BIN: codexFixture,
+    RELAY_FIXTURE_CANCEL: "true",
+  });
+  assert.equal(interrupted.code, 0, `${interrupted.stdout}\n${interrupted.stderr}`);
+  const interruptedPath = interrupted.stdout.match(/AgentRun artifact: (.+)/)?.[1];
+  const interruptedArtifact = JSON.parse(await readFile(interruptedPath, "utf8"));
+  assert.equal(
+    interruptedArtifact.lifecycle.findLast((event) => event.method === "turn/completed").params.turn.status,
+    "interrupted",
   );
 });
 
