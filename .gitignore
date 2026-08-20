@@ -1,1 +1,6 @@
 prototype/runs/
+.env
+.svelte-kit/
+build/
+build-runtime/
+node_modules/
