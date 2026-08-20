@@ -28,6 +28,7 @@ let threadId;
 let activeTurnId;
 let cancellationTimer;
 let artifactPath;
+let appServerFailure;
 
 const appServer = spawn(process.env.RELAY_CODEX_BIN ?? "codex", ["app-server", "--stdio"], {
   cwd: workspaceDirectory,
@@ -36,11 +37,13 @@ const appServer = spawn(process.env.RELAY_CODEX_BIN ?? "codex", ["app-server", "
 
 appServer.stderr.setEncoding("utf8");
 appServer.stderr.on("data", (message) => record("app-server/stderr", { message }));
-appServer.on("error", (error) => failOutstandingRequests(error));
+appServer.on("error", (error) => {
+  appServerFailure = error;
+  failOutstandingRequests(error);
+});
 appServer.on("exit", (code, signal) => {
-  if (requests.size > 0) {
-    failOutstandingRequests(new Error(`codex app-server exited before replying (code ${code}, signal ${signal}).`));
-  }
+  appServerFailure = new Error(`codex app-server exited (code ${code}, signal ${signal}).`);
+  failOutstandingRequests(appServerFailure);
 });
 
 createInterface({ input: appServer.stdout }).on("line", (line) => {
@@ -99,12 +102,17 @@ function waitForCompletion(turnId) {
 }
 
 function waitForEvent(predicate) {
-  return new Promise((resolveCompletion) => {
+  return new Promise((resolveEvent, rejectEvent) => {
     const timer = setInterval(() => {
+      if (appServerFailure) {
+        clearInterval(timer);
+        rejectEvent(appServerFailure);
+        return;
+      }
       const event = lifecycle.findLast(predicate);
       if (event) {
         clearInterval(timer);
-        resolveCompletion(event);
+        resolveEvent(event);
       }
     }, 50);
   });

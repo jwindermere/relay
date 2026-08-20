@@ -12,6 +12,7 @@ test("the CLI writes an inspectable completed AgentRun artifact from streamed ev
 import { createInterface } from "node:readline";
 setInterval(() => {}, 1_000);
 const cancelling = process.env.RELAY_FIXTURE_CANCEL === "true";
+const exitAfterTurnStart = process.env.RELAY_FIXTURE_EXIT_AFTER_TURN_START === "true";
 const turnId = process.env.RELAY_FIXTURE_TURN_ID ?? "turn-1";
 createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
@@ -21,6 +22,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (request.method === "thread/resume") reply({ thread: { id: "thread-1" } });
   if (request.method === "turn/start") {
     reply({ turn: { id: turnId } });
+    if (exitAfterTurnStart) setTimeout(() => process.exit(1), 20);
     for (const message of [
       { method: "turn/started", params: { turn: { id: turnId } } },
       ...(cancelling ? [] : [
@@ -73,6 +75,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     interruptedArtifact.lifecycle.findLast((event) => event.method === "turn/completed").params.turn.status,
     "interrupted",
   );
+
+  const failed = await run(process.execPath, ["prototype/agent-run.mjs"], {
+    RELAY_CODEX_BIN: codexFixture,
+    RELAY_FIXTURE_EXIT_AFTER_TURN_START: "true",
+  });
+  assert.equal(failed.code, 1);
+  const failedPath = failed.stdout.match(/AgentRun artifact: (.+)/)?.[1];
+  const failedArtifact = JSON.parse(await readFile(failedPath, "utf8"));
+  assert.ok(failedArtifact.lifecycle.some((event) => event.method === "relay/failure"));
 });
 
 function run(command, argumentsList, additionalEnvironment) {
