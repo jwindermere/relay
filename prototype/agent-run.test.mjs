@@ -12,6 +12,7 @@ test("the CLI writes an inspectable completed AgentRun artifact from streamed ev
 import { createInterface } from "node:readline";
 setInterval(() => {}, 1_000);
 const cancelling = process.env.RELAY_FIXTURE_CANCEL === "true";
+const turnId = process.env.RELAY_FIXTURE_TURN_ID ?? "turn-1";
 createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   const reply = (result) => process.stdout.write(JSON.stringify({ id: request.id, result }) + String.fromCharCode(10));
@@ -19,19 +20,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (request.method === "thread/start") reply({ thread: { id: "thread-1" } });
   if (request.method === "thread/resume") reply({ thread: { id: "thread-1" } });
   if (request.method === "turn/start") {
-    reply({ turn: { id: "turn-1" } });
+    reply({ turn: { id: turnId } });
     for (const message of [
-      { method: "turn/started", params: { turn: { id: "turn-1" } } },
+      { method: "turn/started", params: { turn: { id: turnId } } },
       ...(cancelling ? [] : [
-      { method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: {}, startedAtMs: 1 } },
-      { method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: {}, completedAtMs: 2 } },
-      { method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } },
+      { method: "item/started", params: { threadId: "thread-1", turnId, item: {}, startedAtMs: 1 } },
+      { method: "item/completed", params: { threadId: "thread-1", turnId, item: {}, completedAtMs: 2 } },
+      { method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } },
       ]),
     ]) process.stdout.write(JSON.stringify(message) + String.fromCharCode(10));
   }
   if (request.method === "turn/interrupt") {
     reply({});
-    process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "interrupted" } } }) + String.fromCharCode(10));
+    process.stdout.write(JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "interrupted" } } }) + String.fromCharCode(10));
   }
 });
 `);
@@ -54,10 +55,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 
   const resumed = await run(process.execPath, ["prototype/agent-run.mjs", "--resume", artifactPath, "--follow-up", "continue"], {
     RELAY_CODEX_BIN: codexFixture,
+    RELAY_FIXTURE_TURN_ID: "turn-2",
   });
   assert.equal(resumed.code, 0, `${resumed.stdout}\n${resumed.stderr}`);
   const resumedArtifact = JSON.parse(await readFile(artifactPath, "utf8"));
   assert.ok(resumedArtifact.lifecycle.some((event) => event.method === "thread/resume/response"));
+  assert.deepEqual(resumedArtifact.turns.map((turn) => turn.id), ["turn-1", "turn-2"]);
 
   const interrupted = await run(process.execPath, ["prototype/agent-run.mjs", "--cancel-after-ms", "0"], {
     RELAY_CODEX_BIN: codexFixture,
