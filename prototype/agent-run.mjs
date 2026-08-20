@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -15,6 +15,7 @@ const prompt = argumentsByName.get("--prompt") ?? "Inspect README.md and report 
 const followUp = argumentsByName.get("--follow-up");
 const cancelAfterMilliseconds = Number(argumentsByName.get("--cancel-after-ms") ?? 0);
 const workspaceDirectory = resolve(argumentsByName.get("--workspace") ?? repositoryDirectory);
+const resumePath = argumentsByName.get("--resume");
 
 if (!Number.isFinite(cancelAfterMilliseconds) || cancelAfterMilliseconds < 0) {
   throw new Error("--cancel-after-ms must be a non-negative number.");
@@ -26,6 +27,7 @@ let requestId = 0;
 let threadId;
 let activeTurnId;
 let cancellationTimer;
+let artifactPath;
 
 const appServer = spawn(process.env.RELAY_CODEX_BIN ?? "codex", ["app-server", "--stdio"], {
   cwd: workspaceDirectory,
@@ -110,6 +112,7 @@ async function startTurn(input) {
     input: [{ type: "text", text: input }],
   });
   activeTurnId = turn.turn.id;
+  await persistArtifact();
   return turn.turn.id;
 }
 
@@ -119,39 +122,56 @@ async function main() {
     capabilities: {},
   });
 
-  const thread = await send("thread/start", {
-    cwd: workspaceDirectory,
-    sandbox: "workspace-write",
-    approvalPolicy: "on-request",
-  });
-  threadId = thread.thread.id;
-
-  const firstTurnId = await startTurn(prompt);
-  if (cancelAfterMilliseconds > 0) {
-    cancellationTimer = setTimeout(() => {
-      if (activeTurnId) send("turn/interrupt", { threadId, turnId: activeTurnId }).catch(reportFailure);
-    }, cancelAfterMilliseconds);
+  if (resumePath) {
+    const previousArtifact = JSON.parse(await readFile(resolve(resumePath), "utf8"));
+    threadId = previousArtifact.threadId;
+    if (!threadId) throw new Error("The AgentRun artifact does not contain a threadId.");
+    artifactPath = resolve(resumePath);
+    lifecycle.push(...previousArtifact.lifecycle);
+    await send("thread/resume", { threadId });
+    await persistArtifact();
+  } else {
+    await mkdir(outputDirectory, { recursive: true });
+    artifactPath = resolve(outputDirectory, `agent-run-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.json`);
+    console.log(`AgentRun artifact: ${artifactPath}`);
+    const thread = await send("thread/start", {
+      cwd: workspaceDirectory,
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+    });
+    threadId = thread.thread.id;
+    await persistArtifact();
   }
-  await waitForCompletion(firstTurnId);
-  clearTimeout(cancellationTimer);
+
+  const initialPrompt = resumePath && !argumentsByName.has("--prompt") ? undefined : prompt;
+  if (initialPrompt) {
+    const firstTurnId = await startTurn(initialPrompt);
+    if (cancelAfterMilliseconds > 0) {
+      cancellationTimer = setTimeout(() => {
+        if (activeTurnId) send("turn/interrupt", { threadId, turnId: activeTurnId }).catch(reportFailure);
+      }, cancelAfterMilliseconds);
+    }
+    await waitForCompletion(firstTurnId);
+    clearTimeout(cancellationTimer);
+    await persistArtifact();
+  }
 
   if (followUp) {
     const followUpTurnId = await startTurn(followUp);
     await waitForCompletion(followUpTurnId);
+    await persistArtifact();
   }
-
-  await writeArtifact();
 }
 
-async function writeArtifact() {
-  await mkdir(outputDirectory, { recursive: true });
-  const artifactPath = resolve(outputDirectory, `agent-run-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.json`);
+async function persistArtifact() {
+  if (!artifactPath) return;
   const artifact = {
     prototype: "persistent-codex-backed-agent-run",
     appServer: "codex app-server --stdio",
     workspaceDirectory,
     authentication: "managed local Codex credential store (run `codex login status` to verify)",
     threadId,
+    activeTurnId,
     lifecycle,
     constraints: [
       "Persist the Codex threadId and every turnId before treating an AgentRun as recoverable.",
@@ -159,11 +179,21 @@ async function writeArtifact() {
       "Treat turn/completed status as authoritative for completed, failed, or interrupted outcomes.",
       "A follow-up is a new turn/start on the same thread; it is not a reply injected into the original turn.",
       "Cancellation requires turn/interrupt with both persisted identifiers and remains asynchronous until turn/completed.",
-      "This local stdio proof depends on the owner machine and its persisted Codex credential store; it is not a multi-tenant service boundary.",
+      "The local app-server integration is experimental and not a production-grade multi-tenant service boundary.",
+      "The owner account's plan entitlement and rate limits govern capacity; Relay must surface exhausted usage.",
+      "Codex does not guarantee account-level concurrency here, so Relay must queue AgentRuns and isolate their workspaces.",
     ],
   };
   await writeFile(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`);
-  console.log(`AgentRun artifact: ${artifactPath}`);
+}
+
+async function writeArtifact() {
+  if (!artifactPath) {
+    await mkdir(outputDirectory, { recursive: true });
+    artifactPath = resolve(outputDirectory, `agent-run-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.json`);
+    console.log(`AgentRun artifact: ${artifactPath}`);
+  }
+  await persistArtifact();
 }
 
 function reportFailure(error) {

@@ -37,6 +37,10 @@ The JSON artifact contains the thread ID, turn IDs, all protocol events and the
 integration constraints the Relay AgentRun contract must accommodate. The run output
 is intentionally ignored by Git because it may contain workspace-specific details.
 
+The artifact is written immediately after `thread/start` and each `turn/start`, so a
+new process can reopen it with `--resume path/to/artifact.json` and then send a
+follow-up turn. The provider's locally persisted thread history must remain available.
+
 ## What this establishes
 
 - The existing local ChatGPT-authenticated Codex installation can back a real turn;
@@ -46,6 +50,8 @@ is intentionally ignored by Git because it may contain workspace-specific detail
 - A follow-up is a second `turn/start` on the same thread.
 - Cancellation is an asynchronous `turn/interrupt`, confirmed only by a later
   `turn/completed` event.
+- The integration is experimental; capacity follows the owner's plan/rate limit and
+  has no documented account-level concurrency guarantee, so Relay must queue runs.
 
 This deliberately does not expose a network listener, collect provider credentials,
 or make a multi-user control plane. Those are product concerns outside the smallest
