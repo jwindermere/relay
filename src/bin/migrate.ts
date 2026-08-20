@@ -1,6 +1,7 @@
 import { createDatabasePool } from '../lib/server/database/pool.js';
 import { migrateDatabase } from '../lib/server/database/migrations.js';
 import { getSchemaVersions } from '../lib/server/database/schema.js';
+import { formatError } from '../lib/server/errors.js';
 
 const pool = createDatabasePool();
 
@@ -13,8 +14,4 @@ try {
   process.exitCode = 1;
 } finally {
   await pool.end();
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

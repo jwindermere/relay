@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { createDatabasePool } from '../lib/server/database/pool.js';
+import { formatError } from '../lib/server/errors.js';
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 
 const pool = createDatabasePool();
@@ -34,8 +35,4 @@ try {
   console.error(JSON.stringify({ event: 'web.startup.failed', error: formatError(error) }));
   await pool.end();
   process.exit(1);
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

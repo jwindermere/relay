@@ -12,16 +12,13 @@ import {
 
 let container: StartedPostgreSqlContainer | undefined;
 let connectionString = process.env.TEST_DATABASE_URL;
+const skipDatabaseTests = process.env.SKIP_DATABASE_TESTS === 'true';
 
-if (!connectionString) {
-  try {
-    container = await new PostgreSqlContainer('postgres:17-alpine').start();
-    connectionString = container.getConnectionUri();
-  } catch {
-    test('the production PostgreSQL seam', {
-      skip: 'requires TEST_DATABASE_URL or an available Docker daemon'
-    });
-  }
+if (skipDatabaseTests) {
+  test('the production PostgreSQL seam', { skip: 'SKIP_DATABASE_TESTS=true' });
+} else if (!connectionString) {
+  container = await new PostgreSqlContainer('postgres:17-alpine').start();
+  connectionString = container.getConnectionUri();
 }
 
 if (connectionString) {
@@ -42,8 +39,11 @@ if (connectionString) {
     `);
 
     assert.deepEqual(result.rows, [
+      { table_schema: 'auth', table_name: 'account' },
       { table_schema: 'auth', table_name: 'schema_migrations' },
-      { table_schema: 'auth', table_name: 'sessions' },
+      { table_schema: 'auth', table_name: 'session' },
+      { table_schema: 'auth', table_name: 'user' },
+      { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'relay', table_name: 'runtime_state' },
       { table_schema: 'relay', table_name: 'schema_migrations' }
     ]);

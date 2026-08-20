@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 
 import { getDatabasePool } from '$lib/server/database/pool.js';
+import { formatError } from '$lib/server/errors.js';
 import { checkRuntimeReadiness } from '$lib/server/runtime.js';
 
 export async function GET(): Promise<Response> {
@@ -11,8 +12,4 @@ export async function GET(): Promise<Response> {
     console.error(JSON.stringify({ event: 'web.health.failed', error: formatError(error) }));
     return json({ service: 'web', status: 'unavailable' }, { status: 503 });
   }
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

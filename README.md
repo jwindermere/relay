@@ -29,7 +29,9 @@ DATABASE_URL=postgres://relay:relay@localhost:5432/relay npm run db:migrate
 For local development, run `npm run dev:web` and `npm run dev:worker` separately
 after migrating PostgreSQL. Useful checks are `npm run check`, `npm run build`, and
 `npm test`. Database integration tests use a disposable PostgreSQL container, or an
-existing database supplied with `TEST_DATABASE_URL`.
+existing disposable database supplied with `TEST_DATABASE_URL`. A missing database
+runtime fails the check; use `SKIP_DATABASE_TESTS=true` only when intentionally
+running the non-database checks.
 
 ## Prototypes
 

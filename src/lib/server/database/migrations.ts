@@ -48,6 +48,7 @@ async function applySchemaMigrations(
   schema: SchemaName
 ): Promise<void> {
   await prepareSchema(client, schema);
+  await client.query(`SET LOCAL search_path TO ${schema}`);
   const applied = await client.query<{ version: number }>(
     `SELECT version FROM ${schema}.schema_migrations ORDER BY version`
   );

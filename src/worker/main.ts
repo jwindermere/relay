@@ -1,4 +1,5 @@
 import { createDatabasePool } from '../lib/server/database/pool.js';
+import { formatError } from '../lib/server/errors.js';
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 
 const HEALTH_INTERVAL_MS = 30_000;
@@ -29,7 +30,3 @@ const shutdown = async (signal: NodeJS.Signals) => {
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
