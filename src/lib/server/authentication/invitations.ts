@@ -3,6 +3,7 @@ import { hashPassword } from 'better-auth/crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import type { RelayAuth } from '../auth.js';
+import { addPilotToCollaborationProject } from '../collaboration/setup.js';
 import { WorkspaceAccessError, type WorkspaceAccess } from './authorization.js';
 
 const INVITATION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
@@ -298,6 +299,8 @@ export async function acceptWorkspaceInvitation(
     );
     const joined = membership.rows[0];
     if (!joined) throw new WorkspaceInvitationError('membership could not be created');
+
+    await addPilotToCollaborationProject(client, pending.workspace_id, joined.id);
 
     await client.query(
       `UPDATE public.workspace_invitation

@@ -14,6 +14,10 @@ import {
 } from '../src/lib/server/authentication/authorization.js';
 import { bootstrapOwner } from '../src/lib/server/authentication/bootstrap.js';
 import {
+  loadSharedAgentChannel,
+  postChannelMessage
+} from '../src/lib/server/collaboration/channel.js';
+import {
   acceptWorkspaceInvitation,
   issueWorkspaceInvitation,
   registerInvitedAccount
@@ -77,6 +81,11 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'user' },
       { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'public', table_name: 'audit_event' },
+      { table_schema: 'public', table_name: 'agent' },
+      { table_schema: 'public', table_name: 'channel' },
+      { table_schema: 'public', table_name: 'message' },
+      { table_schema: 'public', table_name: 'project' },
+      { table_schema: 'public', table_name: 'project_membership' },
       { table_schema: 'public', table_name: 'runtime_state' },
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'workspace' },
@@ -87,7 +96,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 3');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 4');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -97,7 +106,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 3 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 4 WHERE version = 99');
     }
   });
 
@@ -380,6 +389,90 @@ if (connectionString) {
     assert.doesNotMatch(
       JSON.stringify(audit.rows),
       new RegExp(`${invitation.token}|${replacementInvitation.token}`, 'i')
+    );
+  });
+
+  test('both Pilot members share attributable roots and direct replies with Alex', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const ownerSignIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const ownerCookie = ownerSignIn.headers.get('set-cookie');
+    assert.equal(ownerSignIn.status, 200);
+    assert.ok(ownerCookie);
+
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const initial = await loadSharedAgentChannel(pool, ownerAccess);
+
+    assert.equal(initial.project.name, 'Relay MVP');
+    assert.equal(initial.channel.name, 'agent-work');
+    assert.deepEqual(
+      initial.members.map(({ name, kind }) => ({ name, kind })),
+      [
+        { name: 'Alex', kind: 'agent' },
+        { name: 'Pilot member', kind: 'pilot' },
+        { name: 'Relay Owner', kind: 'pilot' }
+      ]
+    );
+
+    const root = await postChannelMessage(pool, ownerAccess, {
+      channelId: initial.channel.id,
+      body: 'Can we ship the reconnect fix?'
+    });
+    assert.equal(root.author.membershipId, ownerAccess.membership.id);
+    assert.equal(root.author.name, 'Relay Owner');
+    assert.equal(root.parentMessageId, null);
+
+    const reply = await postChannelMessage(pool, memberAccess, {
+      channelId: initial.channel.id,
+      parentMessageId: root.id,
+      body: 'Yes, after the focused checks pass.'
+    });
+    assert.equal(reply.author.membershipId, memberAccess.membership.id);
+    assert.equal(reply.author.name, 'Pilot member');
+    assert.equal(reply.parentMessageId, root.id);
+
+    await assert.rejects(
+      postChannelMessage(pool, ownerAccess, {
+        channelId: initial.channel.id,
+        parentMessageId: reply.id,
+        body: 'This nested reply must not be stored.'
+      }),
+      /reply directly to a channel root/
+    );
+
+    const reloadedByOwner = await loadSharedAgentChannel(pool, ownerAccess);
+    const reloadedByMember = await loadSharedAgentChannel(pool, memberAccess);
+    assert.deepEqual(reloadedByMember.messages, reloadedByOwner.messages);
+    assert.deepEqual(
+      reloadedByOwner.messages.map(({ body, parentMessageId, author }) => ({
+        body,
+        parentMessageId,
+        author: author.name
+      })),
+      [
+        {
+          body: 'Can we ship the reconnect fix?',
+          parentMessageId: null,
+          author: 'Relay Owner'
+        },
+        {
+          body: 'Yes, after the focused checks pass.',
+          parentMessageId: root.id,
+          author: 'Pilot member'
+        }
+      ]
     );
   });
 

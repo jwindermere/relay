@@ -1,22 +1,63 @@
-import { redirect } from '@sveltejs/kit';
+import { fail, redirect } from '@sveltejs/kit';
 
 import { getRelayAuth } from '$lib/server/auth.js';
-import { authorizeWorkspaceRequest } from '$lib/server/authentication/authorization.js';
+import {
+  authorizeWorkspaceRequest,
+  WorkspaceAccessError
+} from '$lib/server/authentication/authorization.js';
+import {
+  ChannelMessageError,
+  loadSharedAgentChannel,
+  postChannelMessage
+} from '$lib/server/collaboration/channel.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
 
 export async function load({ request }) {
   try {
+    const pool = getDatabasePool();
     const access = await authorizeWorkspaceRequest(
-      getDatabasePool(),
+      pool,
       getRelayAuth(),
       request.headers
     );
     return {
       email: access.identity.email,
       role: access.membership.role,
-      workspaceName: access.workspace.name
+      workspaceName: access.workspace.name,
+      sharedChannel: await loadSharedAgentChannel(pool, access)
     };
-  } catch {
-    redirect(303, '/sign-in');
+  } catch (error) {
+    if (error instanceof WorkspaceAccessError) redirect(303, '/sign-in');
+    throw error;
   }
 }
+
+export const actions = {
+  send: async ({ request }) => {
+    try {
+      const pool = getDatabasePool();
+      const access = await authorizeWorkspaceRequest(pool, getRelayAuth(), request.headers);
+      const form = await request.formData();
+      const channelId = form.get('channelId');
+      const body = form.get('body');
+      const parentMessageId = form.get('parentMessageId');
+      if (typeof channelId !== 'string' || typeof body !== 'string') {
+        return fail(400, { message: 'invalid Message request' });
+      }
+      await postChannelMessage(pool, access, {
+        channelId,
+        body,
+        ...(typeof parentMessageId === 'string' && parentMessageId ? { parentMessageId } : {})
+      });
+      return { sent: true };
+    } catch (error) {
+      if (error instanceof ChannelMessageError) {
+        return fail(400, { message: error.message });
+      }
+      if (error instanceof WorkspaceAccessError) {
+        return fail(401, { message: error.message });
+      }
+      throw error;
+    }
+  }
+};

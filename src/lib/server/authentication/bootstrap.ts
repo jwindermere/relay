@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { hashPassword } from 'better-auth/crypto';
 import type { Pool } from 'pg';
 
+import { createPilotCollaborationSurface } from '../collaboration/setup.js';
+
 const BOOTSTRAP_LOCK = 7_329_381_112;
 
 export interface BootstrapOwnerInput {
@@ -69,6 +71,7 @@ export async function bootstrapOwner(
        VALUES ($1, $2, $3, 'owner')`,
       [membershipId, workspaceId, userId]
     );
+    await createPilotCollaborationSurface(client, workspaceId, membershipId);
     await client.query(
       `INSERT INTO public.audit_event (
          workspace_id, actor_user_id, actor_membership_id,
