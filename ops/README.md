@@ -1,5 +1,11 @@
 # Self-hosted operations
 
+The final MVP acceptance exercise is the interactive
+[`pilot-journey.sh`](pilot-journey.sh) wizard. Run it only against the dedicated pilot
+Workspace and Linked pilot repository: its pre-agreed worker-loss stage deliberately
+kills the worker during disposable work so recovery and pause can be reviewed without
+replaying possible repository effects.
+
 Relay's production Compose topology exposes only Caddy on host port 443. `web`,
 `worker`, PostgreSQL, and the worker-local Codex app-server have no published host
 port. The proxy shares only an edge network with `web`; PostgreSQL and the worker

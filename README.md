@@ -27,6 +27,9 @@ incompatible.
 
 Deployment replacement, backup restoration, migration compatibility, and independent
 secret-rotation procedures are documented in [`ops/README.md`](ops/README.md).
+The final two-member acceptance journey is driven by
+[`ops/pilot-journey.sh`](ops/pilot-journey.sh); it combines the automated safety
+contracts with real Pilot-member delegation and a durable evidence report.
 
 The worker exclusively leases queued AgentRuns from PostgreSQL and runs one Codex
 turn at a time through worker-local app-server stdio. Its Codex state and isolated
@@ -121,6 +124,24 @@ npm run smoke:codex-worker
 The command claims exactly one queued AgentRun and succeeds only after the run has a
 persisted `turn/completed` result. Run it with the continuously supervised worker
 stopped so the smoke command can claim the prepared request.
+
+## Two-member pilot proof
+
+Run the repeatable acceptance wizard from the deployed checkout:
+
+```sh
+ops/pilot-journey.sh
+```
+
+The wizard keeps human-only browser, restart, worker-loss, and GitHub review actions
+explicit. Its final command reads PostgreSQL and exits non-zero until both active
+Pilot members have independently delegated, the required lifecycle evidence exists,
+durable effects are unique, and a completed AgentRun exposes a real `github.com`
+pull-request Artifact. Re-run only the report with:
+
+```sh
+docker compose exec web npm run start:verify-pilot
+```
 
 ## Linked pilot repository
 

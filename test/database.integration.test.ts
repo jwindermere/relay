@@ -49,6 +49,7 @@ import {
 } from '../src/lib/server/database/schema.js';
 import { attachAuthenticatedRealtime } from '../src/lib/server/realtime.js';
 import { issueRealtimeTicket } from '../src/lib/server/realtime-ticket.js';
+import { observePilotJourney } from '../src/lib/server/pilot-journey.js';
 
 let container: StartedPostgreSqlContainer | undefined;
 let connectionString = process.env.TEST_DATABASE_URL;
@@ -1214,6 +1215,28 @@ if (connectionString) {
          WHERE task.request_snapshot = '@Alex prove the transaction rolls back.') AS runs
     `, [failedSubmissionId]);
     assert.deepEqual(rolledBack.rows[0], { messages: 0, tasks: 0, runs: 0 });
+  });
+
+  test('the pilot verifier observes durable Shared agent channel evidence', async () => {
+    const observation = await observePilotJourney(pool);
+
+    assert.equal(observation.workspace.name, 'MVP pilot workspace');
+    assert.deepEqual(
+      observation.pilotMembers
+        .map(({ name, active }) => ({ name, active }))
+        .sort((left, right) => left.name.localeCompare(right.name)),
+      [
+        { name: 'Pilot member', active: true },
+        { name: 'Relay Owner', active: true }
+      ]
+    );
+    assert.ok(observation.acceptedMentions >= 1);
+    assert.ok(observation.rejectedMentions >= 1);
+    assert.ok(observation.eventTypes.includes('run.queued'));
+    assert.equal(observation.duplicateTasks, 0);
+    assert.equal(observation.duplicateTerminalEvents, 0);
+    assert.equal(observation.duplicateArtifacts, 0);
+    assert.equal(observation.artifactResultAnomalies, 0);
   });
 
   test('either Pilot member can answer one visible clarification while progress stays conversational', async () => {
