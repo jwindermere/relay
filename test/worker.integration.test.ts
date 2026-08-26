@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, stat } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -661,23 +662,55 @@ if (skipDatabaseTests) {
 
   test('an expired execution lease reconciles and pauses an indeterminate Provider turn', async () => {
     const ids = await seedQueuedAgentRun(pool, 'recovery');
-    await pool.query(
-      `UPDATE public.agent_run
-       SET status = 'working', provider_thread_id = 'thread-recovery',
-           active_turn_id = 'turn-recovery', lease_owner = 'dead-worker',
-           lease_token = 'dead-token', lease_expires_at = now() - interval '1 minute'
-       WHERE id = $1`,
-      [ids.runId]
-    );
+    await seedExpiredProviderBoundary(pool, ids, 'thread-recovery', 'turn-recovery');
+    const repositoryDirectory = await mkdtemp(join(tmpdir(), 'relay-recovery-repository-'));
+    const resultPath = join(repositoryDirectory, 'result.txt');
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: repositoryDirectory });
+    execFileSync('git', ['config', 'user.name', 'Relay fixture'], { cwd: repositoryDirectory });
+    execFileSync('git', ['config', 'user.email', 'relay-fixture@example.com'], {
+      cwd: repositoryDirectory
+    });
+    await writeFile(resultPath, 'write from the lost Provider turn\n');
+    execFileSync('git', ['add', 'result.txt'], { cwd: repositoryDirectory });
+    execFileSync('git', ['commit', '-m', 'Provider turn repository write'], {
+      cwd: repositoryDirectory
+    });
     const provider = new FixtureProvider(async () => {
+      await writeFile(resultPath, 'duplicate replay write\n', { flag: 'a' });
+      execFileSync('git', ['add', 'result.txt'], { cwd: repositoryDirectory });
+      execFileSync('git', ['commit', '-m', 'Duplicate Provider turn write'], {
+        cwd: repositoryDirectory
+      });
       assert.fail('an indeterminate turn must not be replayed');
-    }, async () => ({ outcome: 'indeterminate' }));
+    }, async () => {
+      const visible = await pool.query<{ status: string; event_type: string }>(
+        `SELECT run.status, event.event_type
+         FROM public.agent_run run
+         JOIN public.agent_run_event event ON event.agent_run_id = run.id
+         WHERE run.id = $1
+         ORDER BY event.sequence DESC
+         LIMIT 1`,
+        [ids.runId]
+      );
+      assert.deepEqual(visible.rows[0], {
+        status: 'recovering', event_type: 'run.recovering'
+      });
+      return { outcome: 'indeterminate' };
+    });
 
     const result = await processNextAgentRun(pool, provider, {
       workerId: 'recovery-worker', workspaceRoot, leaseDurationMs: 10_000
     });
     assert.deepEqual(result, { kind: 'recovered', agentRunId: ids.runId, status: 'paused' });
     assert.equal(provider.reconciliations.length, 1);
+    assert.equal(await readFile(resultPath, 'utf8'), 'write from the lost Provider turn\n');
+    assert.equal(
+      execFileSync('git', ['rev-list', '--count', 'HEAD'], {
+        cwd: repositoryDirectory,
+        encoding: 'utf8'
+      }).trim(),
+      '1'
+    );
 
     const run = await pool.query<{ status: string; active_turn_id: string | null }>(
       'SELECT status, active_turn_id FROM public.agent_run WHERE id = $1',
@@ -694,15 +727,137 @@ if (skipDatabaseTests) {
     ]);
   });
 
-  test('cancellation after worker loss interrupts the stored turn before reconciliation', async () => {
-    const ids = await seedQueuedAgentRun(pool, 'cancel-recovery');
+  test('known terminal Provider outcomes reconcile idempotently to Relay terminal states', async () => {
+    const cases = [
+      { suffix: 'recovery-completed', outcome: 'completed', status: 'completed' },
+      { suffix: 'recovery-failed', outcome: 'failed', status: 'failed' },
+      { suffix: 'recovery-interrupted', outcome: 'interrupted', status: 'cancelled' }
+    ] as const;
+
+    for (const recovery of cases) {
+      const ids = await seedQueuedAgentRun(pool, recovery.suffix);
+      const threadId = `thread-${recovery.suffix}`;
+      const turnId = `turn-${recovery.suffix}`;
+      await seedExpiredProviderBoundary(pool, ids, threadId, turnId);
+      const provider = new FixtureProvider(
+        async () => assert.fail('a lost Provider turn must not be replayed'),
+        async () => ({ outcome: recovery.outcome })
+      );
+
+      assert.deepEqual(await processNextAgentRun(pool, provider, {
+        workerId: `worker-${recovery.suffix}`, workspaceRoot, leaseDurationMs: 10_000
+      }), { kind: 'recovered', agentRunId: ids.runId, status: recovery.status });
+      assert.deepEqual(await processNextAgentRun(pool, provider, {
+        workerId: `second-worker-${recovery.suffix}`, workspaceRoot, leaseDurationMs: 10_000
+      }), { kind: 'idle' });
+      assert.equal(provider.executions.length, 0);
+      assert.equal(provider.reconciliations.length, 1);
+
+      const stored = await pool.query<{
+        status: string;
+        terminal_events: number;
+        provider_event_id: string;
+      }>(
+        `SELECT run.status,
+                count(event.id) FILTER (
+                  WHERE event.status IN ('completed', 'failed', 'cancelled')
+                )::integer AS terminal_events,
+                max(event.provider_event_id) FILTER (
+                  WHERE event.event_type = 'provider.turn.reconciled'
+                ) AS provider_event_id
+         FROM public.agent_run run
+         JOIN public.agent_run_event event ON event.agent_run_id = run.id
+         WHERE run.id = $1
+         GROUP BY run.status`,
+        [ids.runId]
+      );
+      assert.deepEqual(stored.rows[0], {
+        status: recovery.status,
+        terminal_events: 1,
+        provider_event_id: `${turnId}:turn/completed`
+      });
+    }
+  });
+
+  test('recovery pauses when stored Provider cursors lack matching durable AgentRun evidence', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'recovery-missing-evidence');
     await pool.query(
       `UPDATE public.agent_run
-       SET status = 'working', provider_thread_id = 'thread-cancel-recovery',
-           active_turn_id = 'turn-cancel-recovery', lease_owner = 'dead-worker',
+       SET status = 'working', provider_thread_id = 'thread-recovery-missing-evidence',
+           active_turn_id = 'turn-recovery-missing-evidence', lease_owner = 'dead-worker',
            lease_token = 'dead-token', lease_expires_at = now() - interval '1 minute'
        WHERE id = $1`,
       [ids.runId]
+    );
+    const provider = new FixtureProvider(
+      async () => assert.fail('recovery must not replay the request'),
+      async () => assert.fail('unverified Provider cursors must not be reconciled')
+    );
+
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'recovery-evidence-worker', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'recovered', agentRunId: ids.runId, status: 'paused' });
+    assert.equal(provider.executions.length, 0);
+    assert.equal(provider.reconciliations.length, 0);
+
+    const latest = await pool.query<{
+      status: string;
+      event_type: string;
+      reason: string;
+    }>(
+      `SELECT run.status, event.event_type, event.evidence->>'reason' AS reason
+       FROM public.agent_run run
+       JOIN public.agent_run_event event ON event.agent_run_id = run.id
+       WHERE run.id = $1
+       ORDER BY event.sequence DESC
+       LIMIT 1`,
+      [ids.runId]
+    );
+    assert.deepEqual(latest.rows[0], {
+      status: 'paused',
+      event_type: 'run.paused',
+      reason: 'unverified_provider_cursor'
+    });
+  });
+
+  test('a replacement worker claims recovery only after an execution lease expires', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'recovery-requires-expiry');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'working', provider_thread_id = 'thread-recovery-requires-expiry',
+           active_turn_id = 'turn-recovery-requires-expiry'
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-recovery-requires-expiry',
+      body: 'cancel this work'
+    });
+    const provider = new FixtureProvider(
+      async () => assert.fail('a replacement must not start Provider work without an expired lease')
+    );
+
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'replacement-without-expiry', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'idle' });
+    const stored = await pool.query<{ status: string; recovering_events: number }>(
+      `SELECT run.status,
+              count(event.id) FILTER (WHERE event.event_type = 'run.recovering')::integer
+                AS recovering_events
+       FROM public.agent_run run
+       JOIN public.agent_run_event event ON event.agent_run_id = run.id
+       WHERE run.id = $1
+       GROUP BY run.status`,
+      [ids.runId]
+    );
+    assert.deepEqual(stored.rows[0], { status: 'working', recovering_events: 0 });
+  });
+
+  test('cancellation after worker loss interrupts the stored turn before reconciliation', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'cancel-recovery');
+    await seedExpiredProviderBoundary(
+      pool, ids, 'thread-cancel-recovery', 'turn-cancel-recovery'
     );
     await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -728,15 +883,50 @@ if (skipDatabaseTests) {
     }]);
   });
 
+  test('pending cancellation follows a recovered completion instead of claiming cancellation', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'cancel-recovery-completed');
+    await seedExpiredProviderBoundary(
+      pool,
+      ids,
+      'thread-cancel-recovery-completed',
+      'turn-cancel-recovery-completed'
+    );
+    await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-cancel-recovery-completed',
+      body: 'cancel this work'
+    });
+    const provider = new FixtureProvider(
+      async () => assert.fail('recovery must not replay the request'),
+      async () => ({ outcome: 'completed' }),
+      async () => {}
+    );
+
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-cancel-recovery-completed',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    }), { kind: 'recovered', agentRunId: ids.runId, status: 'completed' });
+    const stored = await pool.query<{ run_status: string; task_status: string }>(
+      `SELECT run.status AS run_status, task.status AS task_status
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id
+       WHERE run.id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(stored.rows[0], {
+      run_status: 'completed', task_status: 'completed'
+    });
+  });
+
   test('an answered clarification survives worker loss and resumes the same Provider thread', async () => {
     const ids = await seedQueuedAgentRun(pool, 'clarification-recovery');
-    await pool.query(
-      `UPDATE public.agent_run
-       SET status = 'waiting_for_input', provider_thread_id = 'thread-clarification-recovery',
-           active_turn_id = 'turn-clarification-recovery', lease_owner = 'dead-worker',
-           lease_token = 'dead-token', lease_expires_at = now() - interval '1 minute'
-       WHERE id = $1`,
-      [ids.runId]
+    await seedExpiredProviderBoundary(
+      pool,
+      ids,
+      'thread-clarification-recovery',
+      'turn-clarification-recovery',
+      'waiting_for_input'
     );
     await pool.query(
       `INSERT INTO public.message (
@@ -846,6 +1036,48 @@ class FixtureProvider implements AgentRunProvider {
     this.interruptions.push(input);
     await this.interruptFixture();
   }
+}
+
+async function seedExpiredProviderBoundary(
+  pool: Pool,
+  ids: { runId: string; workspaceId: string },
+  threadId: string,
+  turnId: string,
+  status: 'working' | 'waiting_for_input' = 'working'
+): Promise<void> {
+  await pool.query(
+    `UPDATE public.agent_run
+     SET status = $2, provider_thread_id = $3, active_turn_id = $4,
+         lease_owner = 'dead-worker', lease_token = 'dead-token',
+         lease_expires_at = now() - interval '1 minute'
+     WHERE id = $1`,
+    [ids.runId, status, threadId, turnId]
+  );
+  await pool.query(
+    `WITH events AS (
+       INSERT INTO public.agent_run_event (
+         workspace_id, agent_run_id, sequence, event_type, status, summary,
+         provider_event_id, provider_turn_id
+       ) VALUES
+         ($1, $2, 2, 'provider.thread.started', 'planning', 'Codex thread started', $3, NULL),
+         ($1, $2, 3, 'provider.turn.started', 'working', 'Codex turn started', $4, $5)
+       RETURNING id, event_type, sequence
+     )
+     INSERT INTO public.notification_outbox (
+       workspace_id, agent_run_event_id, topic, payload
+     )
+     SELECT $1, id, 'agent_run.event', jsonb_build_object(
+       'agentRunId', $2::text, 'eventType', event_type, 'sequence', sequence
+     )
+     FROM events`,
+    [
+      ids.workspaceId,
+      ids.runId,
+      `thread:${threadId}:started`,
+      `turn:${turnId}:started`,
+      turnId
+    ]
+  );
 }
 
 async function seedQueuedAgentRun(pool: Pool, suffix: string) {

@@ -273,11 +273,7 @@ async function claimNextAgentRun(
               run.provider_thread_id, run.active_turn_id,
               connection.credential_store_reference,
               run.status,
-              ((run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1)
-                OR EXISTS (
-                  SELECT 1 FROM public.agent_run_cancellation_request cancellation
-                  WHERE cancellation.agent_run_id = run.id
-                )) AS recovering,
+              (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1) AS recovering,
               EXISTS (
                 SELECT 1 FROM public.agent_run_cancellation_request cancellation
                 WHERE cancellation.agent_run_id = run.id
@@ -299,12 +295,6 @@ async function claimNextAgentRun(
          AND (
            (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1
              AND run.status NOT IN ('completed', 'failed', 'cancelled'))
-           OR (run.lease_expires_at IS NULL
-             AND run.status NOT IN ('completed', 'failed', 'cancelled')
-             AND EXISTS (
-               SELECT 1 FROM public.agent_run_cancellation_request cancellation
-               WHERE cancellation.agent_run_id = run.id
-             ))
            OR (run.status = 'queued' AND run.available_at <= $1 AND run.lease_expires_at IS NULL)
          )
        ORDER BY
@@ -385,6 +375,24 @@ async function recoverAgentRun(
   provider: AgentRunProvider,
   claim: ClaimedAgentRun
 ): Promise<WorkerCycleResult> {
+  if (!claim.provider_thread_id || !claim.active_turn_id) {
+    await appendRunEvent(pool, claim, {
+      eventType: 'run.paused',
+      status: 'paused',
+      summary: 'Execution recovery needs human review',
+      evidence: { reason: 'missing_provider_cursor' }
+    });
+    return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
+  }
+  if (!await hasDurableProviderBoundary(pool, claim)) {
+    await appendRunEvent(pool, claim, {
+      eventType: 'run.paused',
+      status: 'paused',
+      summary: 'Recorded Provider work could not be verified; human review is required',
+      evidence: { reason: 'unverified_provider_cursor' }
+    });
+    return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
+  }
   if (claim.cancellation_requested && claim.provider_thread_id && claim.active_turn_id) {
     try {
       await provider.interrupt({
@@ -412,16 +420,6 @@ async function recoverAgentRun(
       return { kind: 'recovered', agentRunId: claim.id, status: clarificationStatus };
     }
   }
-  if (!claim.provider_thread_id || !claim.active_turn_id) {
-    await appendRunEvent(pool, claim, {
-      eventType: 'run.paused',
-      status: 'paused',
-      summary: 'Execution recovery needs human review',
-      evidence: { reason: 'missing_provider_cursor' }
-    });
-    return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
-  }
-
   try {
     const reconciliation = await provider.reconcile({
       threadId: claim.provider_thread_id,
@@ -445,6 +443,8 @@ async function recoverAgentRun(
         ? 'Codex completion recovered'
         : status === 'cancelled' ? 'Codex interruption recovered' : 'Codex failure recovered',
       evidence: { outcome: reconciliation.outcome, errorCode: reconciliation.errorCode },
+      providerEventId: `${claim.active_turn_id}:turn/completed`,
+      providerTurnId: claim.active_turn_id,
       completed: true,
       clearActiveTurn: true
     });
@@ -458,6 +458,34 @@ async function recoverAgentRun(
     });
     return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
   }
+}
+
+async function hasDurableProviderBoundary(
+  pool: Pool,
+  claim: Pick<ClaimedAgentRun, 'id' | 'provider_thread_id' | 'active_turn_id'>
+): Promise<boolean> {
+  const evidence = await pool.query<{ thread_recorded: boolean; turn_recorded: boolean }>(
+    `SELECT
+       EXISTS (
+         SELECT 1 FROM public.agent_run_event
+         WHERE agent_run_id = $1
+           AND event_type = 'provider.thread.started'
+           AND provider_event_id = $2
+       ) AS thread_recorded,
+       EXISTS (
+         SELECT 1 FROM public.agent_run_event
+         WHERE agent_run_id = $1
+           AND event_type = 'provider.turn.started'
+           AND provider_turn_id = $3
+       ) AS turn_recorded`,
+    [
+      claim.id,
+      `thread:${claim.provider_thread_id}:started`,
+      claim.active_turn_id
+    ]
+  );
+  return evidence.rows[0]?.thread_recorded === true
+    && evidence.rows[0]?.turn_recorded === true;
 }
 
 async function recoverApprovalBoundary(
@@ -569,22 +597,32 @@ async function persistProviderThread(
   claim: ClaimedAgentRun,
   threadId: string
 ): Promise<void> {
-  const updated = await pool.query(
-    `UPDATE public.agent_run
-     SET provider_thread_id = COALESCE(provider_thread_id, $3), updated_at = now()
-     WHERE id = $1 AND lease_token = $2 AND lease_owner IS NOT NULL
-       AND (provider_thread_id IS NULL OR provider_thread_id = $3)`,
-    [claim.id, claim.lease_token, threadId]
-  );
-  if (updated.rowCount !== 1) throw new Error('AgentRun lease or Provider thread changed');
-  claim.provider_thread_id = threadId;
-  await appendRunEvent(pool, claim, {
-    eventType: 'provider.thread.started',
-    status: 'planning',
-    summary: 'Codex thread started',
-    evidence: { provider: 'codex' },
-    providerEventId: `thread:${threadId}:started`
-  });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE public.agent_run
+       SET provider_thread_id = COALESCE(provider_thread_id, $3), updated_at = now()
+       WHERE id = $1 AND lease_token = $2 AND lease_owner IS NOT NULL
+         AND (provider_thread_id IS NULL OR provider_thread_id = $3)`,
+      [claim.id, claim.lease_token, threadId]
+    );
+    if (updated.rowCount !== 1) throw new Error('AgentRun lease or Provider thread changed');
+    await appendRunEventWithClient(client, claim, {
+      eventType: 'provider.thread.started',
+      status: 'planning',
+      summary: 'Codex thread started',
+      evidence: { provider: 'codex' },
+      providerEventId: `thread:${threadId}:started`
+    });
+    await client.query('COMMIT');
+    claim.provider_thread_id = threadId;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function persistProviderTurn(
