@@ -101,7 +101,8 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
-      { table_schema: 'public', table_name: 'github_repository_connection' },
+      { table_schema: 'public', table_name: 'github_connection' },
+      { table_schema: 'public', table_name: 'linked_repository' },
       { table_schema: 'public', table_name: 'message' },
       { table_schema: 'public', table_name: 'project' },
       { table_schema: 'public', table_name: 'project_membership' },
@@ -746,7 +747,7 @@ if (connectionString) {
       releaseBranches: ['release']
     });
     await assert.rejects(
-      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id),
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
       /verified Linked pilot repository is required/
     );
 
@@ -762,10 +763,12 @@ if (connectionString) {
     assert.equal(verified.readyForAutonomousWork, true);
     const executionRepository = await requireAutonomousLinkedRepository(
       pool,
-      ownerAccess.workspace.id
+      ownerAccess.workspace.id,
+      gateway
     );
     assert.deepEqual(executionRepository, {
-      connectionId: verified.configuration?.connectionId,
+      githubConnectionId: verified.configuration?.githubConnectionId,
+      linkedRepositoryId: verified.configuration?.linkedRepositoryId,
       installationId: '101',
       repositoryId: '202',
       owner: 'relay-owner',
@@ -774,6 +777,20 @@ if (connectionString) {
       releaseBranches: ['release']
     });
 
+    evidence = structuredClone(evidence);
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [17];
+    await assert.rejects(
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
+      /verified Linked pilot repository is required/
+    );
+    assert.equal((await loadLinkedRepository(pool, ownerAccess)).readyForAutonomousWork, false);
+    evidence = structuredClone(evidence);
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [];
+    assert.equal(
+      (await verifyLinkedRepository(pool, ownerAccess, gateway)).readyForAutonomousWork,
+      true
+    );
+
     inspectionFails = true;
     const unverifiable = await verifyLinkedRepository(pool, ownerAccess, gateway);
     assert.equal(unverifiable.readyForAutonomousWork, false);
@@ -781,7 +798,7 @@ if (connectionString) {
       'GitHub repository configuration could not be verified'
     ]);
     await assert.rejects(
-      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id),
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
       /verified Linked pilot repository is required/
     );
     inspectionFails = false;
@@ -800,7 +817,10 @@ if (connectionString) {
     const disabled = await disableLinkedRepository(pool, ownerAccess);
     assert.equal(disabled.state, 'disabled');
     assert.equal(disabled.readyForAutonomousWork, false);
-    assert.equal(inspected.length, 2);
+    const disabledVerification = await verifyLinkedRepository(pool, ownerAccess, gateway);
+    assert.equal(disabledVerification.state, 'disabled');
+    assert.equal(disabledVerification.readyForAutonomousWork, false);
+    assert.equal(inspected.length, 6);
 
     const stored = await pool.query<{
       installation_id: string;
@@ -809,8 +829,10 @@ if (connectionString) {
       owner_node_id: string;
     }>(
       `SELECT installation_id, repository_id, repository_node_id, owner_node_id
-       FROM public.github_repository_connection
-       WHERE workspace_id = $1`,
+       FROM public.github_connection connection
+       JOIN public.linked_repository repository
+         ON repository.github_connection_id = connection.id
+       WHERE connection.workspace_id = $1`,
       [ownerAccess.workspace.id]
     );
     assert.deepEqual(stored.rows, [{

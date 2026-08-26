@@ -11,12 +11,14 @@ import {
   type RepositoryProtectionResult
 } from './protection.js';
 
+export interface RepositoryInspectionInput {
+  installationId: string;
+  repositoryId?: string;
+  releaseBranches: string[];
+}
+
 export interface GitHubRepositoryGateway {
-  inspect(input: {
-    installationId: string;
-    repositoryId?: string;
-    releaseBranches: string[];
-  }): Promise<GitHubRepositoryEvidence>;
+  inspect(input: RepositoryInspectionInput): Promise<GitHubRepositoryEvidence>;
 }
 
 export interface SafeLinkedRepository {
@@ -24,7 +26,8 @@ export interface SafeLinkedRepository {
   readyForAutonomousWork: boolean;
   canManage: boolean;
   configuration?: {
-    connectionId: string;
+    githubConnectionId: string;
+    linkedRepositoryId: string;
     installationId: string;
     repositoryId: string;
     repository: {
@@ -46,14 +49,16 @@ export class LinkedRepositoryError extends Error {
 }
 
 interface LinkedRepositoryRow {
-  id: string;
+  github_connection_id: string;
+  linked_repository_id: string;
+  app_id: string;
   installation_id: string;
   repository_id: string;
   repository_owner: string;
   repository_name: string;
   default_branch: string;
   release_branches: string[];
-  status: 'linked' | 'disabled';
+  connection_status: 'active' | 'disabled';
   ready_for_autonomous_work: boolean;
   verification: RepositoryProtectionResult;
   checked_at: Date;
@@ -64,11 +69,25 @@ async function readConnection(
   workspaceId: string
 ): Promise<LinkedRepositoryRow | undefined> {
   const result = await client.query<LinkedRepositoryRow>(
-    `SELECT id, installation_id, repository_id, repository_owner, repository_name,
-       default_branch, release_branches, status, ready_for_autonomous_work,
-       verification, checked_at
-     FROM public.github_repository_connection
-     WHERE workspace_id = $1`,
+    `SELECT
+       connection.id AS github_connection_id,
+       repository.id AS linked_repository_id,
+       connection.app_id,
+       connection.installation_id,
+       repository.repository_id,
+       repository.repository_owner,
+       repository.repository_name,
+       repository.default_branch,
+       repository.release_branches,
+       connection.status AS connection_status,
+       repository.ready_for_autonomous_work,
+       repository.verification,
+       repository.checked_at
+     FROM public.github_connection connection
+     JOIN public.linked_repository repository
+       ON repository.github_connection_id = connection.id
+       AND repository.workspace_id = connection.workspace_id
+     WHERE connection.workspace_id = $1`,
     [workspaceId]
   );
   return result.rows[0];
@@ -82,12 +101,14 @@ function safeConnection(
     return { state: 'not_linked', readyForAutonomousWork: false, canManage };
   }
   return {
-    state: row.status,
-    readyForAutonomousWork: row.status === 'linked' && row.ready_for_autonomous_work,
+    state: row.connection_status === 'active' ? 'linked' : 'disabled',
+    readyForAutonomousWork:
+      row.connection_status === 'active' && row.ready_for_autonomous_work,
     canManage,
     ...(canManage ? {
       configuration: {
-        connectionId: row.id,
+        githubConnectionId: row.github_connection_id,
+        linkedRepositoryId: row.linked_repository_id,
         installationId: row.installation_id,
         repositoryId: row.repository_id,
         repository: {
@@ -103,11 +124,7 @@ function safeConnection(
   };
 }
 
-function validateLinkInput(input: {
-  installationId: string;
-  repositoryId?: string;
-  releaseBranches: string[];
-}): void {
+function validateLinkInput(input: RepositoryInspectionInput): void {
   if (!/^\d+$/.test(input.installationId) || (
     input.repositoryId !== undefined && !/^\d+$/.test(input.repositoryId)
   )) {
@@ -143,7 +160,7 @@ async function withCurrentOwner<T>(
 
 async function inspectRepository(
   gateway: GitHubRepositoryGateway,
-  input: { installationId: string; repositoryId?: string; releaseBranches: string[] }
+  input: RepositoryInspectionInput
 ): Promise<{ evidence: GitHubRepositoryEvidence; protection: RepositoryProtectionResult }> {
   let evidence: GitHubRepositoryEvidence;
   try {
@@ -178,7 +195,7 @@ export async function loadLinkedRepository(
 export async function linkGitHubRepository(
   pool: Pool,
   access: WorkspaceAccess,
-  input: { installationId: string; repositoryId?: string; releaseBranches: string[] },
+  input: RepositoryInspectionInput,
   gateway: GitHubRepositoryGateway
 ): Promise<SafeLinkedRepository> {
   validateLinkInput(input);
@@ -193,23 +210,44 @@ export async function linkGitHubRepository(
     if (project.rows.length !== 1) {
       throw new LinkedRepositoryError('the MVP Workspace must contain exactly one Project');
     }
-    const existing = await readConnection(client, access.workspace.id);
-    const connectionId = existing?.id ?? randomUUID();
+    const existingConnection = await client.query<{ id: string }>(
+      'SELECT id FROM public.github_connection WHERE workspace_id = $1',
+      [access.workspace.id]
+    );
+    const existingRepository = await client.query<{ id: string }>(
+      'SELECT id FROM public.linked_repository WHERE workspace_id = $1',
+      [access.workspace.id]
+    );
+    const githubConnectionId = existingConnection.rows[0]?.id ?? randomUUID();
+    const linkedRepositoryId = existingRepository.rows[0]?.id ?? randomUUID();
     await client.query(
-      `INSERT INTO public.github_repository_connection (
-         id, workspace_id, project_id, owner_membership_id, app_id,
-         installation_id, repository_id, repository_node_id, owner_node_id,
-         repository_owner, repository_name, default_branch, release_branches,
-         status, ready_for_autonomous_work, verification
-       ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-         'linked', $14, $15
-       )
+      `INSERT INTO public.github_connection (
+         id, workspace_id, owner_membership_id, app_id, installation_id, status
+       ) VALUES ($1, $2, $3, $4, $5, 'active')
        ON CONFLICT (workspace_id) DO UPDATE
-       SET project_id = EXCLUDED.project_id,
-           owner_membership_id = EXCLUDED.owner_membership_id,
+       SET owner_membership_id = EXCLUDED.owner_membership_id,
            app_id = EXCLUDED.app_id,
            installation_id = EXCLUDED.installation_id,
+           status = 'active',
+           connected_at = now(),
+           updated_at = now()`,
+      [
+        githubConnectionId,
+        access.workspace.id,
+        access.membership.id,
+        String(evidence.appId),
+        input.installationId
+      ]
+    );
+    await client.query(
+      `INSERT INTO public.linked_repository (
+         id, workspace_id, project_id, github_connection_id, repository_id,
+         repository_node_id, owner_node_id, repository_owner, repository_name,
+         default_branch, release_branches, ready_for_autonomous_work, verification
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       ON CONFLICT (workspace_id) DO UPDATE
+       SET project_id = EXCLUDED.project_id,
+           github_connection_id = EXCLUDED.github_connection_id,
            repository_id = EXCLUDED.repository_id,
            repository_node_id = EXCLUDED.repository_node_id,
            owner_node_id = EXCLUDED.owner_node_id,
@@ -217,19 +255,16 @@ export async function linkGitHubRepository(
            repository_name = EXCLUDED.repository_name,
            default_branch = EXCLUDED.default_branch,
            release_branches = EXCLUDED.release_branches,
-           status = 'linked',
            ready_for_autonomous_work = EXCLUDED.ready_for_autonomous_work,
            verification = EXCLUDED.verification,
            checked_at = now(),
            linked_at = now(),
            updated_at = now()`,
       [
-        connectionId,
+        linkedRepositoryId,
         access.workspace.id,
         project.rows[0]!.id,
-        access.membership.id,
-        String(evidence.appId),
-        input.installationId,
+        githubConnectionId,
         String(evidence.repository.id),
         evidence.repository.nodeId,
         evidence.repository.ownerNodeId,
@@ -245,7 +280,7 @@ export async function linkGitHubRepository(
       `INSERT INTO public.audit_event (
          workspace_id, actor_user_id, actor_membership_id,
          event_type, subject_type, subject_id, evidence
-       ) VALUES ($1, $2, $3, $4, 'github_repository_connection', $5,
+       ) VALUES ($1, $2, $3, $4, 'linked_repository', $5,
          jsonb_build_object(
            'installationId', $6::text,
            'repositoryId', $7::text,
@@ -255,8 +290,8 @@ export async function linkGitHubRepository(
         access.workspace.id,
         access.identity.userId,
         access.membership.id,
-        existing ? 'github.repository.replaced' : 'github.repository.linked',
-        connectionId,
+        existingRepository.rows[0] ? 'github.repository.replaced' : 'github.repository.linked',
+        linkedRepositoryId,
         input.installationId,
         String(evidence.repository.id),
         protection.readyForAutonomousWork
@@ -296,11 +331,15 @@ export async function verifyLinkedRepository(
     };
     return withCurrentOwner(pool, access, async (client) => {
       const updated = await client.query<{ id: string }>(
-        `UPDATE public.github_repository_connection
+        `UPDATE public.linked_repository repository
          SET ready_for_autonomous_work = false, verification = $4,
              checked_at = now(), updated_at = now()
-         WHERE workspace_id = $1 AND installation_id = $2 AND repository_id = $3
-         RETURNING id`,
+         FROM public.github_connection connection
+         WHERE repository.workspace_id = $1
+           AND repository.github_connection_id = connection.id
+           AND connection.installation_id = $2
+           AND repository.repository_id = $3
+         RETURNING repository.id`,
         [
           access.workspace.id,
           input.installationId,
@@ -316,7 +355,7 @@ export async function verifyLinkedRepository(
            workspace_id, actor_user_id, actor_membership_id,
            event_type, subject_type, subject_id, evidence
          ) VALUES ($1, $2, $3, 'github.repository.verification_failed',
-           'github_repository_connection', $4,
+           'linked_repository', $4,
            jsonb_build_object('readyForAutonomousWork', false))`,
         [
           access.workspace.id,
@@ -331,19 +370,24 @@ export async function verifyLinkedRepository(
   const { evidence, protection } = inspected;
 
   return withCurrentOwner(pool, access, async (client) => {
-    const updated = await client.query<{ id: string }>(
-      `UPDATE public.github_repository_connection
-       SET app_id = $4, repository_node_id = $5, owner_node_id = $6,
-           repository_owner = $7, repository_name = $8, default_branch = $9,
-           status = 'linked', ready_for_autonomous_work = $10,
-           verification = $11, checked_at = now(), updated_at = now()
-       WHERE workspace_id = $1 AND installation_id = $2 AND repository_id = $3
-       RETURNING id`,
+    const updated = await client.query<{ id: string; ready_for_autonomous_work: boolean }>(
+      `UPDATE public.linked_repository repository
+       SET repository_node_id = $4, owner_node_id = $5,
+           repository_owner = $6, repository_name = $7, default_branch = $8,
+           ready_for_autonomous_work = CASE
+             WHEN connection.status = 'active' THEN $9::boolean ELSE false
+           END,
+           verification = $10, checked_at = now(), updated_at = now()
+       FROM public.github_connection connection
+       WHERE repository.workspace_id = $1
+         AND repository.github_connection_id = connection.id
+         AND connection.installation_id = $2
+         AND repository.repository_id = $3
+       RETURNING repository.id, repository.ready_for_autonomous_work`,
       [
         access.workspace.id,
         input.installationId,
         input.repositoryId,
-        String(evidence.appId),
         evidence.repository.nodeId,
         evidence.repository.ownerNodeId,
         evidence.repository.owner,
@@ -361,14 +405,14 @@ export async function verifyLinkedRepository(
          workspace_id, actor_user_id, actor_membership_id,
          event_type, subject_type, subject_id, evidence
        ) VALUES ($1, $2, $3, 'github.repository.verified',
-         'github_repository_connection', $4,
+         'linked_repository', $4,
          jsonb_build_object('readyForAutonomousWork', $5::boolean))`,
       [
         access.workspace.id,
         access.identity.userId,
         access.membership.id,
         updated.rows[0].id,
-        protection.readyForAutonomousWork
+        updated.rows[0].ready_for_autonomous_work
       ]
     );
     return safeConnection(await readConnection(client, access.workspace.id), true);
@@ -381,9 +425,9 @@ export async function disableLinkedRepository(
 ): Promise<SafeLinkedRepository> {
   return withCurrentOwner(pool, access, async (client) => {
     const disabled = await client.query<{ id: string }>(
-      `UPDATE public.github_repository_connection
-       SET status = 'disabled', ready_for_autonomous_work = false, updated_at = now()
-       WHERE workspace_id = $1 AND status = 'linked'
+      `UPDATE public.github_connection
+       SET status = 'disabled', updated_at = now()
+       WHERE workspace_id = $1 AND status = 'active'
        RETURNING id`,
       [access.workspace.id]
     );
@@ -392,8 +436,8 @@ export async function disableLinkedRepository(
       `INSERT INTO public.audit_event (
          workspace_id, actor_user_id, actor_membership_id,
          event_type, subject_type, subject_id, evidence
-       ) VALUES ($1, $2, $3, 'github.repository.disabled',
-         'github_repository_connection', $4, '{}'::jsonb)`,
+       ) VALUES ($1, $2, $3, 'github.connection.disabled',
+         'github_connection', $4, '{}'::jsonb)`,
       [access.workspace.id, access.identity.userId, access.membership.id, disabled.rows[0].id]
     );
     return safeConnection(await readConnection(client, access.workspace.id), true);
@@ -402,9 +446,11 @@ export async function disableLinkedRepository(
 
 export async function requireAutonomousLinkedRepository(
   pool: Pool,
-  workspaceId: string
+  workspaceId: string,
+  gateway: GitHubRepositoryGateway
 ): Promise<{
-  connectionId: string;
+  githubConnectionId: string;
+  linkedRepositoryId: string;
   installationId: string;
   repositoryId: string;
   owner: string;
@@ -413,16 +459,85 @@ export async function requireAutonomousLinkedRepository(
   releaseBranches: string[];
 }> {
   const row = await readConnection(pool, workspaceId);
-  if (row?.status !== 'linked' || !row.ready_for_autonomous_work) {
+  if (row?.connection_status !== 'active' || !row.ready_for_autonomous_work) {
+    throw new LinkedRepositoryError('a verified Linked pilot repository is required');
+  }
+  const input = {
+    installationId: row.installation_id,
+    repositoryId: row.repository_id,
+    releaseBranches: row.release_branches
+  };
+  let evidence: GitHubRepositoryEvidence | undefined;
+  let protection: RepositoryProtectionResult;
+  try {
+    const inspected = await inspectRepository(gateway, input);
+    evidence = inspected.evidence;
+    protection = inspected.protection;
+  } catch {
+    protection = {
+      readyForAutonomousWork: false,
+      failures: ['GitHub repository configuration could not be verified'],
+      branches: [...new Set([row.default_branch, ...row.release_branches])].map((name) => ({
+        name,
+        protected: false,
+        failures: ['branch controls could not be verified']
+      }))
+    };
+  }
+
+  const verified = await pool.query<{ ready: boolean }>(
+    `WITH refreshed AS (
+       UPDATE public.linked_repository repository
+       SET repository_node_id = COALESCE($5, repository.repository_node_id),
+           owner_node_id = COALESCE($6, repository.owner_node_id),
+           repository_owner = COALESCE($7, repository.repository_owner),
+           repository_name = COALESCE($8, repository.repository_name),
+           default_branch = COALESCE($9, repository.default_branch),
+           ready_for_autonomous_work = connection.status = 'active' AND $10::boolean,
+           verification = $11,
+           checked_at = now(),
+           updated_at = now()
+       FROM public.github_connection connection
+       WHERE repository.id = $1
+         AND repository.workspace_id = $2
+         AND repository.github_connection_id = connection.id
+         AND connection.installation_id = $3
+         AND repository.repository_id = $4
+       RETURNING repository.id, repository.ready_for_autonomous_work
+     ), audited AS (
+       INSERT INTO public.audit_event (
+         workspace_id, event_type, subject_type, subject_id, evidence
+       )
+       SELECT $2, 'github.repository.execution_verified', 'linked_repository', id,
+         jsonb_build_object('readyForAutonomousWork', ready_for_autonomous_work)
+       FROM refreshed
+     )
+     SELECT ready_for_autonomous_work AS ready FROM refreshed`,
+    [
+      row.linked_repository_id,
+      workspaceId,
+      row.installation_id,
+      row.repository_id,
+      evidence?.repository.nodeId ?? null,
+      evidence?.repository.ownerNodeId ?? null,
+      evidence?.repository.owner ?? null,
+      evidence?.repository.name ?? null,
+      evidence?.repository.defaultBranch ?? null,
+      protection.readyForAutonomousWork,
+      JSON.stringify(protection)
+    ]
+  );
+  if (!verified.rows[0]?.ready) {
     throw new LinkedRepositoryError('a verified Linked pilot repository is required');
   }
   return {
-    connectionId: row.id,
+    githubConnectionId: row.github_connection_id,
+    linkedRepositoryId: row.linked_repository_id,
     installationId: row.installation_id,
     repositoryId: row.repository_id,
-    owner: row.repository_owner,
-    name: row.repository_name,
-    defaultBranch: row.default_branch,
+    owner: evidence?.repository.owner ?? row.repository_owner,
+    name: evidence?.repository.name ?? row.repository_name,
+    defaultBranch: evidence?.repository.defaultBranch ?? row.default_branch,
     releaseBranches: row.release_branches
   };
 }

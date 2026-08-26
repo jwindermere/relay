@@ -12,6 +12,7 @@
   let githubMessage = $state('');
   let githubInstallationId = $state('');
   let githubReleaseBranches = $state('');
+  let githubConfiguration = $derived(data.linkedRepository.configuration);
   let roots = $derived(data.sharedChannel.messages.filter((message) => !message.parentMessageId));
 
   function repliesFor(rootId: string) {
@@ -157,18 +158,18 @@
           ? 'Human-reviewed branch controls are verified.'
           : 'Autonomous repository work is unavailable.'}
       </p>
-      {#if data.linkedRepository.configuration}
+      {#if githubConfiguration}
         <p class="mt-2 break-all text-xs font-semibold">
-          {data.linkedRepository.configuration.repository.owner}/{data.linkedRepository.configuration.repository.name}
+          {githubConfiguration.repository.owner}/{githubConfiguration.repository.name}
         </p>
-        {#if data.linkedRepository.configuration.protection.failures.length > 0}
+        {#if githubConfiguration.protection.failures.length > 0}
           <ul class="mt-2 list-disc pl-4 text-xs text-error">
-            {#each data.linkedRepository.configuration.protection.failures as failure}
+            {#each githubConfiguration.protection.failures as failure}
               <li>{failure}</li>
             {/each}
           </ul>
         {/if}
-        {#each data.linkedRepository.configuration.protection.branches.filter((branch) => !branch.protected) as branch}
+        {#each githubConfiguration.protection.branches.filter((branch) => !branch.protected) as branch}
           <div class="mt-2 text-xs text-error">
             <strong>{branch.name}</strong>: {branch.failures.join('; ')}
           </div>

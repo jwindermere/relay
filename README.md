@@ -107,7 +107,9 @@ Administration, Actions, Workflows, Deployments, or other repository permissions
 The active Workspace owner links the resulting installation ID in Relay and may name
 release branches in addition to the repository's server-resolved default branch.
 Relay discovers the sole selected repository through GitHub, stores stable installation,
-repository, owner, and node identities, and verifies every configured branch. Agent
+repository, owner, and node identities, and verifies every configured branch. The
+Workspace-owned GitHub connection remains a separate credential boundary from the
+Project's Linked pilot repository. Agent
 execution remains unavailable unless active rules require a pull request with at least
 one review by someone other than the last pusher, dismiss stale approvals, require at
 least one status check, block force pushes and deletion, and do not let the Relay App
