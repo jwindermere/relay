@@ -17,6 +17,7 @@ import {
   loadSharedAgentChannel,
   postChannelMessage
 } from '../src/lib/server/collaboration/channel.js';
+import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   beginProviderConnectionLogin,
   disableProviderConnection,
@@ -165,7 +166,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 8');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 9');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -175,7 +176,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 8 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 9 WHERE version = 99');
     }
   });
 
@@ -1044,7 +1045,7 @@ if (connectionString) {
       event_type: string;
       event_summary: string;
       outbox_topic: string;
-      outbox_payload: { agentRunId: string; eventType: string };
+      outbox_payload: { agentRunId: string; eventType: string; sequence: number };
     }>(
       `SELECT task.id AS task_id, run.id AS run_id, run.linked_repository_id,
               task.request_snapshot, task.context_snapshot,
@@ -1069,8 +1070,41 @@ if (connectionString) {
     assert.equal(accepted.rows[0]?.outbox_topic, 'agent_run.event');
     assert.deepEqual(accepted.rows[0]?.outbox_payload, {
       agentRunId: accepted.rows[0]?.run_id,
-      eventType: 'run.queued'
+      eventType: 'run.queued',
+      sequence: 1
     });
+
+    const initialReconciliation = await loadChannelReconciliation(
+      pool,
+      memberAccess,
+      channel.channel.id,
+      {}
+    );
+    assert.deepEqual(initialReconciliation.runs, [{
+      id: accepted.rows[0]?.run_id,
+      sourceMessageId: first.id,
+      status: 'queued',
+      summary: 'Engineering request queued',
+      sequence: 1,
+      events: [{
+        sequence: 1,
+        status: 'queued',
+        summary: 'Engineering request queued'
+      }]
+    }]);
+    assert.equal(
+      initialReconciliation.messages.find(({ id }) => id === first.id)?.body,
+      first.body
+    );
+    assert.deepEqual(
+      (await loadChannelReconciliation(
+        pool,
+        memberAccess,
+        channel.channel.id,
+        { [accepted.rows[0]!.run_id]: 1 }
+      )).runs[0]?.events,
+      []
+    );
     assert.deepEqual(accepted.rows[0]?.context_snapshot.project, channel.project);
     assert.deepEqual(accepted.rows[0]?.context_snapshot.channel, channel.channel);
     assert.deepEqual(accepted.rows[0]?.context_snapshot.agent, {
@@ -1189,6 +1223,7 @@ if (connectionString) {
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
     const websocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
+      origin: `http://127.0.0.1:${address.port}`,
       headers: { cookie: sessionCookie.split(';', 1)[0] }
     });
     const ready = await new Promise<string>((resolve, reject) => {
@@ -1197,6 +1232,7 @@ if (connectionString) {
     });
     assert.deepEqual(JSON.parse(ready), { type: 'ready', workspaceId: httpAccess.workspace.id });
     const secondWebsocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
+      origin: `http://127.0.0.1:${address.port}`,
       headers: { cookie: secondSessionCookie.split(';', 1)[0] }
     });
     const secondReady = await new Promise<string>((resolve, reject) => {
@@ -1211,6 +1247,7 @@ if (connectionString) {
     assert.ok(pilotMemberHeaders);
     assert.ok(pilotMemberUserId);
     const memberWebsocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
+      origin: `http://127.0.0.1:${address.port}`,
       headers: { cookie: pilotMemberHeaders.get('cookie') ?? '' }
     });
     const memberReady = await new Promise<string>((resolve, reject) => {
@@ -1221,6 +1258,88 @@ if (connectionString) {
       type: 'ready',
       workspaceId: httpAccess.workspace.id
     });
+
+    const channel = await loadSharedAgentChannel(pool, httpAccess);
+    for (const client of [websocket, secondWebsocket, memberWebsocket]) {
+      const subscribed = new Promise<string>((resolve) => {
+        client.once('message', (data) => resolve(data.toString()));
+      });
+      client.send(JSON.stringify({ type: 'subscribe', channelId: channel.channel.id }));
+      assert.deepEqual(JSON.parse(await subscribed), {
+        type: 'subscribed',
+        channelId: channel.channel.id
+      });
+    }
+
+    const messageWake = new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Message wake-up was not delivered')), 2_000);
+      memberWebsocket.once('message', (data) => {
+        clearTimeout(timeout);
+        resolve(data.toString());
+      });
+    });
+    const convergedMessage = await postChannelMessage(pool, httpAccess, {
+      channelId: channel.channel.id,
+      body: 'Both Pilot views receive this committed Message.'
+    });
+    assert.deepEqual(JSON.parse(await messageWake), {
+      type: 'wake',
+      channelId: channel.channel.id
+    });
+    assert.equal(
+      (await loadChannelReconciliation(pool, httpAccess, channel.channel.id, {}))
+        .messages.find(({ id }) => id === convergedMessage.id)?.body,
+      convergedMessage.body
+    );
+
+    const wake = new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('realtime wake-up was not delivered')), 2_000);
+      memberWebsocket.once('message', (data) => {
+        clearTimeout(timeout);
+        resolve(data.toString());
+      });
+    });
+    const run = await pool.query<{ id: string; sequence: number }>(
+      `SELECT run.id, max(event.sequence)::integer AS sequence
+       FROM public.agent_run run
+       JOIN public.agent_run_event event ON event.agent_run_id = run.id
+       WHERE run.workspace_id = $1
+       GROUP BY run.id
+       ORDER BY run.created_at DESC
+       LIMIT 1`,
+      [httpAccess.workspace.id]
+    );
+    assert.ok(run.rows[0]);
+    const event = await pool.query<{ id: number }>(
+      `INSERT INTO public.agent_run_event (
+         workspace_id, agent_run_id, sequence, event_type, status, summary
+       ) VALUES ($1, $2, $3, 'run.test-wake', 'working', 'Working on the request')
+       RETURNING id`,
+      [httpAccess.workspace.id, run.rows[0].id, run.rows[0].sequence + 1]
+    );
+    await pool.query(
+      `INSERT INTO public.notification_outbox (
+         workspace_id, agent_run_event_id, topic, payload
+       ) VALUES ($1, $2, 'agent_run.event', $3)`,
+      [httpAccess.workspace.id, event.rows[0]!.id, {
+        agentRunId: run.rows[0].id,
+        eventType: 'run.test-wake',
+        sequence: run.rows[0].sequence + 1
+      }]
+    );
+    assert.deepEqual(JSON.parse(await wake), {
+      type: 'wake',
+      channelId: channel.channel.id
+    });
+
+    const crossOrigin = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
+      origin: 'https://attacker.example',
+      headers: { cookie: sessionCookie.split(';', 1)[0] }
+    });
+    const rejectedCrossOrigin = await new Promise<number>((resolve) => {
+      crossOrigin.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0));
+    });
+    assert.equal(rejectedCrossOrigin, 401);
     const memberRealtimeClosed = new Promise<number>((resolve) => {
       memberWebsocket.once('close', (code) => resolve(code));
     });
@@ -1259,8 +1378,11 @@ if (connectionString) {
     const secondAcknowledgement = new Promise<string>((resolve) => {
       secondWebsocket.once('message', (data) => resolve(data.toString()));
     });
-    secondWebsocket.send('still authorised');
-    assert.deepEqual(JSON.parse(await secondAcknowledgement), { type: 'ack' });
+    secondWebsocket.send(JSON.stringify({ type: 'subscribe', channelId: channel.channel.id }));
+    assert.deepEqual(JSON.parse(await secondAcknowledgement), {
+      type: 'subscribed',
+      channelId: channel.channel.id
+    });
 
     const secondRealtimeClosed = new Promise<number>((resolve) => {
       secondWebsocket.once('close', (code) => resolve(code));

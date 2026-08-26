@@ -11,6 +11,7 @@ import {
   loadSharedAgentChannel,
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
+import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliation.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
 import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 import { loadLinkedRepository } from '$lib/server/github/connection.js';
@@ -36,6 +37,12 @@ export async function load({ request }) {
       sharedChannel,
       providerConnection,
       linkedRepository,
+      reconciliation: await loadChannelReconciliation(
+        pool,
+        access,
+        sharedChannel.channel.id,
+        {}
+      ),
       messageSubmissionId: randomUUID(),
       readyForAgentExecution:
         providerConnection.readyForExecution && linkedRepository.readyForAutonomousWork

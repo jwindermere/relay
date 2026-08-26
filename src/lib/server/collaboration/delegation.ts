@@ -382,7 +382,7 @@ export async function acceptEligibleAgentMention(
     [
       context.workspaceId,
       event.rows[0]!.id,
-      JSON.stringify({ agentRunId, eventType: 'run.queued' })
+      JSON.stringify({ agentRunId, eventType: 'run.queued', sequence: 1 })
     ]
   );
   await client.query(

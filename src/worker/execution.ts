@@ -471,14 +471,14 @@ async function appendRunEventWithClient(
     );
     if (duplicate.rowCount) return;
   }
-  const inserted = await client.query<{ id: number }>(
+  const inserted = await client.query<{ id: number; sequence: number }>(
     `INSERT INTO public.agent_run_event (
        workspace_id, agent_run_id, sequence, event_type, status, summary, evidence,
        provider_event_id, provider_turn_id, provider_item_id
      )
      SELECT $2, $1, COALESCE(MAX(sequence), 0) + 1, $3, $4, $5, $6, $7, $8, $9
      FROM public.agent_run_event WHERE agent_run_id = $1
-     RETURNING id`,
+     RETURNING id, sequence`,
     [
       claim.id,
       claim.workspace_id,
@@ -492,14 +492,16 @@ async function appendRunEventWithClient(
     ]
   );
   const eventId = inserted.rows[0]?.id;
-  if (!eventId) throw new Error('AgentRun event was not persisted');
+  const sequence = inserted.rows[0]?.sequence;
+  if (!eventId || !sequence) throw new Error('AgentRun event was not persisted');
   await client.query(
     `INSERT INTO public.notification_outbox (
        workspace_id, agent_run_event_id, topic, payload
      ) VALUES ($1, $2, 'agent_run.event', $3)`,
     [claim.workspace_id, eventId, {
       agentRunId: claim.id,
-      eventType: event.eventType
+      eventType: event.eventType,
+      sequence
     }]
   );
   await client.query(

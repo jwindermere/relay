@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import type { GitHubRepositoryGateway } from '../github/connection.js';
+import { hasActivePilotChannelAccess } from './channel-access.js';
 import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
 
 export class ChannelMessageError extends Error {
@@ -190,6 +191,23 @@ export async function loadSharedAgentChannel(
   };
 }
 
+export async function loadAuthorizedChannelMessages(
+  pool: Pool,
+  access: WorkspaceAccess,
+  channelId: string
+): Promise<ChannelMessage[]> {
+  if (!await hasActivePilotChannelAccess(pool, access, channelId)) {
+    throw new ChannelMessageError('Shared agent channel access is required');
+  }
+  const messages = await pool.query<MessageRow>(
+    `${MESSAGE_PROJECTION}
+     WHERE m.channel_id = $1
+     ORDER BY m.created_at, m.id`,
+    [channelId]
+  );
+  return messages.rows.map(toChannelMessage);
+}
+
 export async function postChannelMessage(
   pool: Pool,
   access: WorkspaceAccess,
@@ -261,6 +279,12 @@ export async function postChannelMessage(
       );
     }
     if (storedMessageId === messageId) {
+      await client.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, message_id, topic, payload
+         ) VALUES ($1, $2, 'channel.message', $3)`,
+        [access.workspace.id, messageId, { messageId }]
+      );
       await acceptEligibleAgentMention(client, {
         messageId,
         workspaceId: access.workspace.id,

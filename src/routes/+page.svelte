@@ -1,6 +1,15 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
+  import { onMount } from 'svelte';
+  import {
+    applyChannelReconciliation,
+    encodeAgentRunCursors,
+    mergeChannelMessages,
+    type ChannelReconciliationUpdate,
+    type VisibleAgentRuns,
+    type VisibleAgentRunStatus
+  } from '$lib/reconciliation.js';
 
   let { data, form } = $props();
   let replyToId = $state<string | null>(null);
@@ -12,11 +21,20 @@
   let githubMessage = $state('');
   let githubInstallationId = $state('');
   let githubReleaseBranches = $state('');
+  let realtimeRuns = $state<VisibleAgentRuns>({});
+  let realtimeMessages = $state<typeof data.sharedChannel.messages>([]);
+  let reconciliationActive: Promise<void> | null = null;
+  let reconciliationRequested = false;
   let githubConfiguration = $derived(data.linkedRepository.configuration);
-  let roots = $derived(data.sharedChannel.messages.filter((message) => !message.parentMessageId));
+  let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
+  let channelMessages = $derived(mergeChannelMessages(
+    data.sharedChannel.messages,
+    realtimeMessages
+  ));
+  let roots = $derived(channelMessages.filter((message) => !message.parentMessageId));
 
   function repliesFor(rootId: string) {
-    return data.sharedChannel.messages.filter((message) => message.parentMessageId === rootId);
+    return channelMessages.filter((message) => message.parentMessageId === rootId);
   }
 
   function initials(name: string) {
@@ -32,6 +50,102 @@
     return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })
       .format(new Date(timestamp));
   }
+
+  function statusLabel(status: VisibleAgentRunStatus) {
+    return status.replaceAll('_', ' ');
+  }
+
+  function requestReconciliation(): Promise<void> {
+    reconciliationRequested = true;
+    if (reconciliationActive) return reconciliationActive;
+    reconciliationActive = (async () => {
+      while (reconciliationRequested) {
+        reconciliationRequested = false;
+        const cursors = Object.fromEntries(
+          Object.values(agentRuns).map((run) => [run.id, run.sequence])
+        );
+        const query = new URLSearchParams({ after: encodeAgentRunCursors(cursors) });
+        const response = await fetch(
+          `/api/workspace/channel/${encodeURIComponent(data.sharedChannel.channel.id)}/reconciliation?${query}`
+        );
+        if (response.status === 401) {
+          window.location.assign('/sign-in');
+          return;
+        }
+        if (!response.ok) throw new Error('Channel status could not be refreshed');
+        const update = await response.json() as ChannelReconciliationUpdate & {
+          messages: typeof data.sharedChannel.messages;
+        };
+        realtimeMessages = mergeChannelMessages(realtimeMessages, update.messages);
+        realtimeRuns = applyChannelReconciliation(agentRuns, update);
+      }
+    })().catch(() => {
+      // A later wake, focus, or reconnect retries from the last durable cursor.
+    }).finally(() => {
+      reconciliationActive = null;
+      if (reconciliationRequested) void requestReconciliation();
+    });
+    return reconciliationActive;
+  }
+
+  onMount(() => {
+    let stopped = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let websocket: WebSocket | undefined;
+    const connect = () => {
+      if (stopped) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      websocket = new WebSocket(`${protocol}//${window.location.host}/realtime`);
+      websocket.addEventListener('message', async ({ data: payload }) => {
+        let message: { type?: string; channelId?: string };
+        try {
+          message = JSON.parse(String(payload));
+        } catch {
+          return;
+        }
+        if (message.type === 'ready') {
+          await requestReconciliation();
+          if (websocket?.readyState === WebSocket.OPEN) {
+            websocket.send(JSON.stringify({
+              type: 'subscribe',
+              channelId: data.sharedChannel.channel.id
+            }));
+          }
+        } else if (
+          message.type === 'wake'
+          && message.channelId === data.sharedChannel.channel.id
+        ) {
+          void requestReconciliation();
+        } else if (
+          message.type === 'subscribed'
+          && message.channelId === data.sharedChannel.channel.id
+        ) {
+          // Close the fetch-to-subscribe race with one final durable read.
+          void requestReconciliation();
+        }
+      });
+      websocket.addEventListener('close', () => {
+        if (!stopped) reconnectTimer = setTimeout(connect, 1_000);
+      });
+    };
+    const wake = () => void requestReconciliation();
+    const visibilityWake = () => {
+      if (document.visibilityState === 'visible') wake();
+    };
+    window.addEventListener('focus', wake);
+    window.addEventListener('pageshow', wake);
+    document.addEventListener('visibilitychange', visibilityWake);
+    connect();
+
+    return () => {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      websocket?.close();
+      window.removeEventListener('focus', wake);
+      window.removeEventListener('pageshow', wake);
+      document.removeEventListener('visibilitychange', visibilityWake);
+    };
+  });
 
   async function signOut() {
     await fetch('/api/auth/sign-out', { method: 'POST' });
@@ -88,7 +202,22 @@
 
 {#snippet agentMentionStatus(agentMention: (typeof data.sharedChannel.messages)[number]['agentMention'])}
   {#if agentMention?.status === 'accepted'}
-    <p class="mt-2 text-xs font-semibold text-success">Engineering request queued</p>
+    {@const run = agentRuns[agentMention.agentRunId]}
+    <p class="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-success" role="status">
+      {#if run}
+        <span class="badge badge-sm badge-success">{statusLabel(run.status)}</span>
+        <span>{run.summary}</span>
+      {:else}
+        <span>Engineering request queued</span>
+      {/if}
+    </p>
+    {#if run && run.milestones.length > 1}
+      <ul class="mt-1 space-y-1 text-xs text-base-content/55" aria-label="Engineering request milestones">
+        {#each run.milestones.slice(0, -1) as entry (`${run.id}:${entry.sequence}`)}
+          <li>{entry.summary}</li>
+        {/each}
+      </ul>
+    {/if}
   {:else if agentMention?.status === 'rejected'}
     <p class="mt-2 text-xs text-warning" role="status">{agentMention.reason}</p>
   {/if}
