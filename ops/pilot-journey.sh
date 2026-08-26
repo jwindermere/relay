@@ -186,15 +186,28 @@ finish() {
 TOTAL_STAGES=8
 
 banner "Relay two-member MVP pilot proof"
+PILOT_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PILOT_EVIDENCE_FILE="${RELAY_PILOT_EVIDENCE_FILE:-.relay/pilot-journey-evidence.json}"
+
+require_confirmation() {
+  if ! confirm "$1"; then
+    warn "Pilot proof stopped: the stage was not confirmed."
+    exit 1
+  fi
+}
 
 stage "Automated safety gates"
 say "First prove the deterministic authentication, realtime, worker-loss, and GitHub safety contracts."
 step "Ensure Docker or TEST_DATABASE_URL points at a disposable PostgreSQL instance."
 step "The GitHub contract test is separate and must target a disposable protected repository."
+if [[ "${SKIP_DATABASE_TESTS:-false}" == "true" ]]; then
+  warn "SKIP_DATABASE_TESTS cannot be used for pilot proof."
+  exit 1
+fi
 npm run check
 npm test
-note "Run npm run test:github-contract separately when its dedicated App variables are available."
-pause "The deterministic gates passed and any contract-test evidence is saved?"
+npm run test:github-contract
+require_confirmation "The complete test output is retained as pilot evidence?"
 
 stage "Two authenticated Pilot members"
 say "Use two separate browser profiles so each Pilot member has an independent session."
@@ -203,15 +216,16 @@ open_url "$RELAY_URL"
 step "In profile A, sign in as the Provider account owner."
 step "In profile B, sign in as the invited, verified Pilot member."
 step "Confirm both views show the same Project, Shared agent channel, two humans, and Alex."
-pause "Both distinct Pilot identities can see the Shared agent channel?"
+require_confirmation "Both distinct Pilot identities can see the Shared agent channel?"
 
 stage "Rejected and accepted delegation"
 say "Keep the collaborator connected while the owner proves mention readiness and attribution."
-step "Temporarily make one readiness condition unavailable, then post an explicit @Alex request."
+step "As owner, click Disable in the Codex Provider panel, then post an explicit @Alex request."
 step "Confirm the Message remains visible as rejected and no Task or AgentRun appears."
-step "Restore readiness, then have the owner post a real, scoped @Alex engineering request."
+step "Click Replace, complete managed ChatGPT device login, and confirm Codex is ready again."
+step "Have the owner post a real scoped request that asks Alex to clarify one named choice before editing."
 step "Confirm both profiles see it queued once; reload profile A and confirm it still appears once."
-pause "The owner's real delegation is queued with correct attribution?"
+require_confirmation "The owner's real delegation is queued with correct attribution?"
 
 stage "Clarification across members"
 say "The collaborator must continue the owner's existing work instead of creating another Task."
@@ -219,45 +233,51 @@ step "When Alex asks a clarification, close profile A completely."
 step "In profile B, answer the clarification as a direct reply."
 step "Confirm the same AgentRun returns to queued or working and no second Task appears."
 step "Ask for progress through the ordinary composer and confirm only a concise projection appears."
-pause "The collaborator resumed the owner's AgentRun with attributable input?"
+require_confirmation "The collaborator resumed the owner's AgentRun with attributable input?"
 
 stage "Independent collaborator delegation"
 say "Now prove that shared Provider ownership does not prevent independent delegation."
 step "After capacity is available, have profile B post a different real @Alex engineering request."
 step "Confirm profile B is the request author and both profiles converge on its status."
-step "Exercise a disposable cancellation request and retain its cancellation evidence."
-step "Retain one understandable failed-run example without deleting its history."
-pause "The collaborator delegated independently and cancellation/failure evidence is visible?"
+step "Post a disposable request, reply 'Cancel this work.' while it is active, and retain the terminal cancellation evidence."
+step "Post a disposable request to inspect the repository but intentionally make no file changes; retain the resulting publication failure and history."
+require_confirmation "The collaborator delegated independently and cancellation/failure evidence is visible?"
 
 stage "Realtime and web replacement"
 say "Prove realtime is acceleration only; PostgreSQL remains authoritative."
 step "Disconnect one browser, let the other create updates, then reconnect the first."
-step "Drop one wake-up and deliver a duplicate wake-up with browser network tooling."
-step "Confirm reconciliation restores missing events and creates no duplicate Channel entries."
+step "Confirm the automated reconciliation test passed its dropped and duplicate wake-up cases."
+step "Confirm reconnect restores missing events and creates no duplicate Channel entries."
 step "While an AgentRun is active, replace only web with: ops/deploy.sh web"
 step "Confirm worker execution continues and both profiles converge after reconnect."
-pause "Browser and web-process loss preserved execution and a single history?"
+require_confirmation "Browser and web-process loss preserved execution and a single history?"
 
 stage "Worker-loss boundaries"
 say "Use only disposable pilot requests and the Linked pilot repository's run-specific branch."
 warn "Unknown-boundary loss can leave real repository side effects; never replay or manually requeue it."
-step "Exercise the tested known-boundary recovery path and confirm one Provider turn/repository effect."
+step "Confirm the worker integration output passed known-terminal reconciliation without duplicate Provider turns."
 step "For an unknown active boundary, confirm the run is disposable before forcing worker loss."
 if confirm "Force the pre-agreed disposable worker-loss exercise now?"; then
   docker compose kill --signal KILL worker
   docker compose start worker
 else
-  warn "Worker-loss exercise skipped; the durable verifier will remain incomplete."
+  warn "Pilot proof stopped before the required worker-loss exercise."
+  exit 1
 fi
 step "Wait for lease expiry, then confirm recovering becomes paused for human review."
 step "Confirm no duplicate Provider turn, branch update, commit, or pull request was created."
-pause "Known and unknown worker-loss evidence is retained?"
+require_confirmation "Known and unknown worker-loss evidence is retained?"
 
 stage "Pull-request review and durable verification"
 say "Finish with a real completed Artifact and an auditable report."
-step "Allow at least one real request to complete and open its pull-request Artifact in GitHub."
-step "A human other than the last pusher must confirm it is suitable for review; do not merge in Relay."
 step "Review the automated authorization results for invitation binding, revocation, owner-only management, cross-Workspace access, and WebSocket rejection."
-step "The verifier exits non-zero until every durable pilot gate is present."
-docker compose exec web npm run start:verify-pilot
+step "The verifier checks only durable evidence created since this wizard began."
+docker compose exec web npm run start:verify-pilot -- --since "$PILOT_STARTED_AT"
+step "Open the reported pull-request URL in GitHub and compare its branch, commit, and request with the Relay Artifact."
+step "A human other than the last pusher must confirm it is suitable for review; do not merge in Relay."
+require_confirmation "The GitHub pull request exists, is accessible, matches Relay, and is suitable for human review?"
+mkdir -p "$(dirname "$PILOT_EVIDENCE_FILE")"
+printf '{\n  "startedAt": "%s",\n  "completedAt": "%s",\n  "automatedContractsPassed": true,\n  "twoAuthenticatedPilotsConfirmed": true,\n  "realtimeAndRestartConfirmed": true,\n  "workerLossConfirmed": true,\n  "githubReviewConfirmed": true\n}\n' \
+  "$PILOT_STARTED_AT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$PILOT_EVIDENCE_FILE"
+note "wrote human-confirmed evidence to $PILOT_EVIDENCE_FILE"
 finish

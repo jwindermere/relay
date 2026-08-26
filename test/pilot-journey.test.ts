@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  evaluatePilotJourney,
+  evaluatePilotJourneyDurableEvidence,
   type PilotJourneyObservation
 } from '../src/lib/pilot-journey.js';
 
@@ -25,25 +25,19 @@ function completeObservation(): PilotJourneyObservation {
     ],
     acceptedMentions: 2,
     rejectedMentions: 1,
-    eventTypes: [
-      'run.queued',
-      'provider.thread.started',
-      'provider.turn.started',
-      'run.clarification_requested',
-      'run.clarification_answered',
-      'run.cancellation_requested',
-      'provider.turn.completed',
-      'run.failed',
-      'run.recovering',
-      'run.paused'
-    ],
+    collaborativeRuns: 1,
     crossMemberClarifications: 1,
-    cancelledRuns: 1,
+    cancelledRunsWithRequest: 1,
     failedRuns: 1,
+    pausedRecoveries: 1,
     pullRequestArtifacts: [
       {
         runId: 'run-completed',
-        runStatus: 'completed',
+        completed: true,
+        repositoryOwner: 'jwindermere',
+        repositoryName: 'relay',
+        branch: 'relay/run-completed',
+        commitSha: 'a'.repeat(40),
         pullRequestNumber: 28,
         url: 'https://github.com/jwindermere/relay/pull/28'
       }
@@ -51,12 +45,14 @@ function completeObservation(): PilotJourneyObservation {
     duplicateTasks: 0,
     duplicateTerminalEvents: 0,
     duplicateArtifacts: 0,
-    artifactResultAnomalies: 0
+    artifactResultAnomalies: 0,
+    duplicateProviderTurns: 0,
+    duplicateRepositoryOperations: 0
   };
 }
 
 test('a complete two-member pilot journey passes every durable evidence gate', () => {
-  const report = evaluatePilotJourney(completeObservation());
+  const report = evaluatePilotJourneyDurableEvidence(completeObservation());
 
   assert.equal(report.passed, true);
   assert.deepEqual(report.failures, []);
@@ -69,7 +65,7 @@ test('the report explains missing independent delegation and real pull-request e
   observation.pilotMembers[1]!.acceptedDelegations = 0;
   observation.pullRequestArtifacts[0]!.url = 'https://github.test/relay/pull/28';
 
-  const report = evaluatePilotJourney(observation);
+  const report = evaluatePilotJourneyDurableEvidence(observation);
 
   assert.equal(report.passed, false);
   assert.deepEqual(report.failures, [
@@ -79,15 +75,27 @@ test('the report explains missing independent delegation and real pull-request e
   assert.deepEqual(report.pullRequests, []);
 });
 
+test('pull-request evidence must match its Linked pilot repository and AgentRun branch', () => {
+  const observation = completeObservation();
+  observation.pullRequestArtifacts[0]!.branch = 'relay/a-different-run';
+
+  const report = evaluatePilotJourneyDurableEvidence(observation);
+
+  assert.deepEqual(report.failures, [
+    'No completed AgentRun has a real github.com pull-request Artifact.'
+  ]);
+});
+
 test('the report requires the collaboration and recovery lifecycle exercised by the pilot', () => {
   const observation = completeObservation();
   observation.rejectedMentions = 0;
-  observation.eventTypes = ['run.queued', 'provider.turn.completed'];
+  observation.collaborativeRuns = 0;
   observation.crossMemberClarifications = 0;
-  observation.cancelledRuns = 0;
+  observation.cancelledRunsWithRequest = 0;
   observation.failedRuns = 0;
+  observation.pausedRecoveries = 0;
 
-  const report = evaluatePilotJourney(observation);
+  const report = evaluatePilotJourneyDurableEvidence(observation);
 
   assert.deepEqual(report.failures, [
     'The pilot has not retained both accepted and rejected Agent mentions.',
@@ -104,8 +112,10 @@ test('the report rejects duplicate durable repository and Channel effects', () =
   observation.duplicateTerminalEvents = 1;
   observation.duplicateArtifacts = 1;
   observation.artifactResultAnomalies = 1;
+  observation.duplicateProviderTurns = 1;
+  observation.duplicateRepositoryOperations = 1;
 
-  const report = evaluatePilotJourney(observation);
+  const report = evaluatePilotJourneyDurableEvidence(observation);
 
   assert.deepEqual(report.failures, [
     'Duplicate durable effects or an incomplete Artifact result were found.'

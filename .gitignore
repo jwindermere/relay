@@ -5,3 +5,4 @@ secrets/
 build/
 build-runtime/
 node_modules/
+.relay/

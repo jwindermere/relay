@@ -133,14 +133,18 @@ Run the repeatable acceptance wizard from the deployed checkout:
 ops/pilot-journey.sh
 ```
 
-The wizard keeps human-only browser, restart, worker-loss, and GitHub review actions
-explicit. Its final command reads PostgreSQL and exits non-zero until both active
+The wizard requires explicit confirmation for human-only browser, restart, worker-loss,
+and GitHub review actions and writes a local attestation under `.relay/`. Its final
+command reads PostgreSQL only for evidence created during that wizard run and exits
+non-zero until both active
 Pilot members have independently delegated, the required lifecycle evidence exists,
 durable effects are unique, and a completed AgentRun exposes a real `github.com`
-pull-request Artifact. Re-run only the report with:
+pull-request Artifact consistent with the linked repository, run branch, and commit.
+The database report does not replace the wizard confirmations or automated contract
+tests. Re-run only the durable report with the `startedAt` value from the attestation:
 
 ```sh
-docker compose exec web npm run start:verify-pilot
+docker compose exec web npm run start:verify-pilot -- --since 2026-08-26T12:00:00Z
 ```
 
 ## Linked pilot repository

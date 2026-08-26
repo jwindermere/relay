@@ -8,13 +8,18 @@ export interface PilotJourneyObservation {
   }>;
   acceptedMentions: number;
   rejectedMentions: number;
-  eventTypes: string[];
+  collaborativeRuns: number;
   crossMemberClarifications: number;
-  cancelledRuns: number;
+  cancelledRunsWithRequest: number;
   failedRuns: number;
+  pausedRecoveries: number;
   pullRequestArtifacts: Array<{
     runId: string;
-    runStatus: string;
+    completed: boolean;
+    repositoryOwner: string;
+    repositoryName: string;
+    branch: string;
+    commitSha: string;
     pullRequestNumber: number;
     url: string;
   }>;
@@ -22,6 +27,8 @@ export interface PilotJourneyObservation {
   duplicateTerminalEvents: number;
   duplicateArtifacts: number;
   artifactResultAnomalies: number;
+  duplicateProviderTurns: number;
+  duplicateRepositoryOperations: number;
 }
 
 export interface PilotJourneyCheck {
@@ -30,7 +37,7 @@ export interface PilotJourneyCheck {
   failure: string;
 }
 
-export interface PilotJourneyReport {
+export interface PilotJourneyDurableReport {
   workspace: PilotJourneyObservation['workspace'];
   passed: boolean;
   checks: PilotJourneyCheck[];
@@ -38,12 +45,12 @@ export interface PilotJourneyReport {
   pullRequests: string[];
 }
 
-export function evaluatePilotJourney(
+export function evaluatePilotJourneyDurableEvidence(
   observation: PilotJourneyObservation
-): PilotJourneyReport {
+): PilotJourneyDurableReport {
   const activePilots = observation.pilotMembers.filter(({ active }) => active);
   const pullRequests = observation.pullRequestArtifacts
-    .filter((artifact) => artifact.runStatus === 'completed' && isGitHubPullRequest(artifact.url))
+    .filter((artifact) => artifact.completed && isConsistentGitHubPullRequest(artifact))
     .map(({ url }) => url);
   const checks: PilotJourneyCheck[] = [
     {
@@ -59,12 +66,7 @@ export function evaluatePilotJourney(
     },
     {
       name: 'collaborative execution',
-      passed: includesEvery(observation.eventTypes, [
-        'run.queued',
-        'provider.turn.started',
-        'run.clarification_requested',
-        'run.clarification_answered'
-      ]),
+      passed: observation.collaborativeRuns > 0,
       failure: 'The pilot has not exercised queued, working, and clarification states.'
     },
     {
@@ -74,14 +76,12 @@ export function evaluatePilotJourney(
     },
     {
       name: 'cancelled and failed outcomes',
-      passed: observation.cancelledRuns > 0
-        && observation.failedRuns > 0
-        && observation.eventTypes.includes('run.cancellation_requested'),
+      passed: observation.cancelledRunsWithRequest > 0 && observation.failedRuns > 0,
       failure: 'The pilot has not produced both cancelled and failed AgentRun evidence.'
     },
     {
       name: 'safe worker recovery',
-      passed: includesEvery(observation.eventTypes, ['run.recovering', 'run.paused']),
+      passed: observation.pausedRecoveries > 0,
       failure: 'The pilot has not exercised recovering and human-reviewed paused states.'
     },
     {
@@ -89,7 +89,9 @@ export function evaluatePilotJourney(
       passed: observation.duplicateTasks === 0
         && observation.duplicateTerminalEvents === 0
         && observation.duplicateArtifacts === 0
-        && observation.artifactResultAnomalies === 0,
+        && observation.artifactResultAnomalies === 0
+        && observation.duplicateProviderTurns === 0
+        && observation.duplicateRepositoryOperations === 0,
       failure: 'Duplicate durable effects or an incomplete Artifact result were found.'
     },
     {
@@ -108,17 +110,17 @@ export function evaluatePilotJourney(
   };
 }
 
-function includesEvery(values: string[], required: string[]): boolean {
-  const observed = new Set(values);
-  return required.every((value) => observed.has(value));
-}
-
-function isGitHubPullRequest(value: string): boolean {
+function isConsistentGitHubPullRequest(
+  artifact: PilotJourneyObservation['pullRequestArtifacts'][number]
+): boolean {
   try {
-    const url = new URL(value);
+    const url = new URL(artifact.url);
     return url.protocol === 'https:'
       && url.hostname === 'github.com'
-      && /^\/[^/]+\/[^/]+\/pull\/\d+\/?$/u.test(url.pathname);
+      && url.pathname === `/${artifact.repositoryOwner}/${artifact.repositoryName}`
+        + `/pull/${artifact.pullRequestNumber}`
+      && artifact.branch === `relay/${artifact.runId}`
+      && /^[0-9a-f]{40}$/u.test(artifact.commitSha);
   } catch {
     return false;
   }

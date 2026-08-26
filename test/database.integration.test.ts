@@ -1232,11 +1232,21 @@ if (connectionString) {
     );
     assert.ok(observation.acceptedMentions >= 1);
     assert.ok(observation.rejectedMentions >= 1);
-    assert.ok(observation.eventTypes.includes('run.queued'));
     assert.equal(observation.duplicateTasks, 0);
     assert.equal(observation.duplicateTerminalEvents, 0);
     assert.equal(observation.duplicateArtifacts, 0);
     assert.equal(observation.artifactResultAnomalies, 0);
+
+    const future = await observePilotJourney(pool, { since: new Date('2999-01-01T00:00:00Z') });
+    assert.equal(future.acceptedMentions, 0);
+    assert.equal(future.rejectedMentions, 0);
+    assert.equal(future.collaborativeRuns, 0);
+    assert.equal(future.cancelledRunsWithRequest, 0);
+    assert.equal(future.failedRuns, 0);
+    assert.equal(future.pausedRecoveries, 0);
+    assert.equal(future.pullRequestArtifacts.length, 0);
+    assert.equal(future.pilotMembers.every(({ acceptedDelegations }) =>
+      acceptedDelegations === 0), true);
   });
 
   test('either Pilot member can answer one visible clarification while progress stays conversational', async () => {

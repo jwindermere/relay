@@ -5,6 +5,10 @@ The final MVP acceptance exercise is the interactive
 Workspace and Linked pilot repository: its pre-agreed worker-loss stage deliberately
 kills the worker during disposable work so recovery and pause can be reviewed without
 replaying possible repository effects.
+The wizard refuses `SKIP_DATABASE_TESTS`, runs the focused live GitHub contract, limits
+its database audit to evidence created after the wizard starts, and records the
+human-confirmed portions in `.relay/pilot-journey-evidence.json`. The database audit
+is deliberately not presented as proof of browser behavior or pull-request suitability.
 
 Relay's production Compose topology exposes only Caddy on host port 443. `web`,
 `worker`, PostgreSQL, and the worker-local Codex app-server have no published host
