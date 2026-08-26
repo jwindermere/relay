@@ -1,9 +1,10 @@
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
-import type { Notification, Pool, PoolClient } from 'pg';
+import type { Pool } from 'pg';
 
 import type { RelayAuth } from './auth.js';
+import { subscribeToAccessRevocations } from './authentication/access-revocation.js';
 import { authorizeWorkspaceRequest } from './authentication/authorization.js';
 
 function requestHeaders(request: IncomingMessage): Headers {
@@ -30,27 +31,18 @@ export function attachAuthenticatedRealtime(
 ): WebSocketServer {
   const realtime = new WebSocketServer({ noServer: true });
   const socketsByUser = new Map<string, Set<WebSocket>>();
-  let notificationClient: PoolClient | undefined;
-  const onNotification = ({ channel, payload }: Notification) => {
-    if (channel !== 'relay_access_revoked' || !payload) return;
-    for (const websocket of socketsByUser.get(payload) ?? []) {
+  const socketsBySession = new Map<string, Set<WebSocket>>();
+  const unsubscribe = subscribeToAccessRevocations(pool, (revocation) => {
+    const sockets = revocation.kind === 'session'
+      ? socketsBySession.get(revocation.sessionId)
+      : socketsByUser.get(revocation.userId);
+    for (const websocket of sockets ?? []) {
       websocket.close(1008, 'Workspace access revoked');
     }
-  };
-  const notificationsReady = pool.connect().then(async (client) => {
-    notificationClient = client;
-    client.on('notification', onNotification);
-    await client.query('LISTEN relay_access_revoked');
   });
 
   realtime.once('close', () => {
-    void notificationsReady.finally(async () => {
-      if (!notificationClient) return;
-      notificationClient.removeListener('notification', onNotification);
-      await notificationClient.query('UNLISTEN relay_access_revoked');
-      notificationClient.release();
-      notificationClient = undefined;
-    });
+    void unsubscribe.then((stop) => stop());
   });
 
   server.on('upgrade', async (request, socket, head) => {
@@ -62,16 +54,21 @@ export function attachAuthenticatedRealtime(
 
     const headers = requestHeaders(request);
     try {
-      await notificationsReady;
+      await unsubscribe;
       const access = await authorizeWorkspaceRequest(pool, auth, headers);
       realtime.handleUpgrade(request, socket, head, (websocket) => {
         realtime.emit('connection', websocket, request);
         const userSockets = socketsByUser.get(access.identity.userId) ?? new Set<WebSocket>();
+        const sessionSockets = socketsBySession.get(access.identity.sessionId) ?? new Set<WebSocket>();
         userSockets.add(websocket);
+        sessionSockets.add(websocket);
         socketsByUser.set(access.identity.userId, userSockets);
+        socketsBySession.set(access.identity.sessionId, sessionSockets);
         websocket.once('close', () => {
           userSockets.delete(websocket);
+          sessionSockets.delete(websocket);
           if (userSockets.size === 0) socketsByUser.delete(access.identity.userId);
+          if (sessionSockets.size === 0) socketsBySession.delete(access.identity.sessionId);
         });
         websocket.send(JSON.stringify({ type: 'ready', workspaceId: access.workspace.id }));
 

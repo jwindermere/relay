@@ -2,6 +2,7 @@ import { betterAuth } from 'better-auth';
 import { Pool } from 'pg';
 
 import { requireDatabaseUrl } from './database/pool.js';
+import { publishAccessRevoked } from './authentication/access-revocation.js';
 
 export function createAuthDatabasePool(connectionString = requireDatabaseUrl()): Pool {
   return new Pool({
@@ -34,10 +35,6 @@ async function recordSessionAudit(
   );
 }
 
-async function notifyAccessRevoked(pool: Pool, userId: string): Promise<void> {
-  await pool.query(`SELECT pg_notify('relay_access_revoked', $1)`, [userId]);
-}
-
 export function createRelayAuth({ pool, baseURL, secret }: RelayAuthOptions) {
   return betterAuth({
     database: pool,
@@ -58,7 +55,11 @@ export function createRelayAuth({ pool, baseURL, secret }: RelayAuthOptions) {
         delete: {
           after: async (session) => {
             await recordSessionAudit(pool, session, 'authentication.session.revoked');
-            await notifyAccessRevoked(pool, session.userId);
+            await publishAccessRevoked(pool, {
+              kind: 'session',
+              sessionId: session.id,
+              userId: session.userId
+            });
           }
         }
       }

@@ -1,6 +1,7 @@
 import type { Pool } from 'pg';
 
 import type { RelayAuth } from '../auth.js';
+import { publishAccessRevoked } from './access-revocation.js';
 
 export interface WorkspaceAccess {
   identity: {
@@ -144,7 +145,7 @@ export async function revokeWorkspaceMembership(
          jsonb_build_object('targetUserId', $3::text, 'sessionsRevoked', true))`,
       [actor.workspace.id, actor.identity.userId, targetUserId]
     );
-    await client.query(`SELECT pg_notify('relay_access_revoked', $1)`, [targetUserId]);
+    await publishAccessRevoked(client, { kind: 'user', userId: targetUserId });
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

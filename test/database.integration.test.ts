@@ -165,6 +165,17 @@ if (connectionString) {
     assert.equal(signInResponse.status, 200);
     const sessionCookie = signInResponse.headers.get('set-cookie');
     assert.ok(sessionCookie);
+    const secondSignInResponse = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const secondSessionCookie = secondSignInResponse.headers.get('set-cookie');
+    assert.equal(secondSignInResponse.status, 200);
+    assert.ok(secondSessionCookie);
     const requestHeaders = new Headers({ cookie: sessionCookie.split(';', 1)[0] });
 
     const httpAccess = await authorizeWorkspaceRequest(pool, auth, requestHeaders);
@@ -215,6 +226,17 @@ if (connectionString) {
       websocket.once('error', reject);
     });
     assert.deepEqual(JSON.parse(ready), { type: 'ready', workspaceId: httpAccess.workspace.id });
+    const secondWebsocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
+      headers: { cookie: secondSessionCookie.split(';', 1)[0] }
+    });
+    const secondReady = await new Promise<string>((resolve, reject) => {
+      secondWebsocket.once('message', (data) => resolve(data.toString()));
+      secondWebsocket.once('error', reject);
+    });
+    assert.deepEqual(JSON.parse(secondReady), {
+      type: 'ready',
+      workspaceId: httpAccess.workspace.id
+    });
 
     const realtimeClosed = new Promise<number>((resolve) => {
       websocket.once('close', (code) => resolve(code));
@@ -234,6 +256,24 @@ if (connectionString) {
     );
 
     assert.equal(await realtimeClosed, 1008);
+    const secondAcknowledgement = new Promise<string>((resolve) => {
+      secondWebsocket.once('message', (data) => resolve(data.toString()));
+    });
+    secondWebsocket.send('still authorised');
+    assert.deepEqual(JSON.parse(await secondAcknowledgement), { type: 'ack' });
+
+    const secondRealtimeClosed = new Promise<number>((resolve) => {
+      secondWebsocket.once('close', (code) => resolve(code));
+    });
+    const secondSignOutResponse = await auth.handler(new Request('http://relay.test/api/auth/sign-out', {
+      method: 'POST',
+      headers: {
+        cookie: secondSessionCookie.split(';', 1)[0],
+        origin: 'http://relay.test'
+      }
+    }));
+    assert.equal(secondSignOutResponse.status, 200);
+    assert.equal(await secondRealtimeClosed, 1008);
     realtime.close();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
