@@ -55,6 +55,28 @@ in at <http://localhost:3000/sign-in>. Browser sessions are opaque PostgreSQL-ba
 Better Auth sessions; protected HTTP endpoints and the `/realtime` WebSocket resolve
 the active Workspace membership on the server for each protected interaction.
 
+The owner creates the second Pilot member's 24-hour invitation through
+`POST /api/workspace/invitations`. The returned registration path creates only an
+unverified account for the invited email. Relay then asks the configured email
+delivery gateway to send Better Auth's one-hour verification link; the collaborator
+must follow that link, sign in, and call the returned acceptance path. Acceptance
+rechecks the verified session email and atomically creates the membership while
+consuming the invitation.
+
+Configure `RELAY_EMAIL_DELIVERY_URL` as an HTTPS endpoint that accepts this server-side
+request (and `RELAY_EMAIL_DELIVERY_TOKEN` when it requires a bearer credential):
+
+```json
+{
+  "to": "member@example.com",
+  "template": "verify-relay-email",
+  "verificationUrl": "https://relay.example/api/auth/verify-email?token=..."
+}
+```
+
+The gateway response must be successful before registration reports success. Relay
+stores neither the invitation's raw token nor the email-verification token.
+
 ## Prototypes
 
 The existing prototypes still prove persistent Codex-backed AgentRun execution

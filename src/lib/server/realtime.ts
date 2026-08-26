@@ -30,12 +30,12 @@ export function attachAuthenticatedRealtime(
   auth: RelayAuth
 ): WebSocketServer {
   const realtime = new WebSocketServer({ noServer: true });
-  const socketsByUser = new Map<string, Set<WebSocket>>();
+  const socketsByMembership = new Map<string, Set<WebSocket>>();
   const socketsBySession = new Map<string, Set<WebSocket>>();
   const subscriptionReady = subscribeToAccessRevocations(pool, (revocation) => {
     const sockets = revocation.kind === 'session'
       ? socketsBySession.get(revocation.sessionId)
-      : socketsByUser.get(revocation.userId);
+      : socketsByMembership.get(revocation.membershipId);
     for (const websocket of sockets ?? []) {
       websocket.close(1008, 'Workspace access revoked');
     }
@@ -58,16 +58,17 @@ export function attachAuthenticatedRealtime(
       const access = await authorizeWorkspaceRequest(pool, auth, headers);
       realtime.handleUpgrade(request, socket, head, (websocket) => {
         realtime.emit('connection', websocket, request);
-        const userSockets = socketsByUser.get(access.identity.userId) ?? new Set<WebSocket>();
+        const membershipKey = access.membership.id;
+        const membershipSockets = socketsByMembership.get(membershipKey) ?? new Set<WebSocket>();
         const sessionSockets = socketsBySession.get(access.identity.sessionId) ?? new Set<WebSocket>();
-        userSockets.add(websocket);
+        membershipSockets.add(websocket);
         sessionSockets.add(websocket);
-        socketsByUser.set(access.identity.userId, userSockets);
+        socketsByMembership.set(membershipKey, membershipSockets);
         socketsBySession.set(access.identity.sessionId, sessionSockets);
         websocket.once('close', () => {
-          userSockets.delete(websocket);
+          membershipSockets.delete(websocket);
           sessionSockets.delete(websocket);
-          if (userSockets.size === 0) socketsByUser.delete(access.identity.userId);
+          if (membershipSockets.size === 0) socketsByMembership.delete(membershipKey);
           if (sessionSockets.size === 0) socketsBySession.delete(access.identity.sessionId);
         });
         websocket.send(JSON.stringify({ type: 'ready', workspaceId: access.workspace.id }));

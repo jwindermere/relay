@@ -14,6 +14,7 @@ export interface WorkspaceAccess {
     name: string;
   };
   membership: {
+    id: string;
     userId: string;
     role: 'owner' | 'member';
     joinedAt: Date;
@@ -39,6 +40,7 @@ export async function authorizeWorkspaceRequest(
   if (!authenticated?.user.emailVerified) throw new WorkspaceAccessError();
 
   const result = await pool.query<{
+    membership_id: string;
     workspace_id: string;
     workspace_name: string;
     user_id: string;
@@ -46,6 +48,7 @@ export async function authorizeWorkspaceRequest(
     joined_at: Date;
   }>(
     `SELECT
+       m.id AS membership_id,
        w.id AS workspace_id,
        w.name AS workspace_name,
        m.user_id,
@@ -68,7 +71,12 @@ export async function authorizeWorkspaceRequest(
       sessionId: authenticated.session.id
     },
     workspace: { id: row.workspace_id, name: row.workspace_name },
-    membership: { userId: row.user_id, role: row.role, joinedAt: row.joined_at }
+    membership: {
+      id: row.membership_id,
+      userId: row.user_id,
+      role: row.role,
+      joinedAt: row.joined_at
+    }
   };
 }
 
@@ -98,8 +106,8 @@ export async function revokeWorkspaceMembership(
       throw new WorkspaceAccessError('current Workspace owner access is required');
     }
 
-    const target = await client.query<{ role: 'owner' | 'member' }>(
-      `SELECT role
+    const target = await client.query<{ id: string; role: 'owner' | 'member' }>(
+      `SELECT id, role
        FROM public.workspace_membership
        WHERE workspace_id = $1 AND user_id = $2 AND revoked_at IS NULL
        FOR UPDATE`,
@@ -118,34 +126,33 @@ export async function revokeWorkspaceMembership(
       }
     }
 
-    const revoked = await client.query<{ user_id: string }>(
+    const revoked = await client.query<{ id: string; user_id: string }>(
       `UPDATE public.workspace_membership
        SET revoked_at = now()
        WHERE workspace_id = $1 AND user_id = $2 AND revoked_at IS NULL
-       RETURNING user_id`,
+       RETURNING id, user_id`,
       [actor.workspace.id, targetUserId]
     );
     if (!revoked.rows[0]) throw new WorkspaceAccessError('active Workspace membership was not found');
 
     await client.query(
       `INSERT INTO public.audit_event (
-         workspace_id, actor_user_id, event_type, subject_type, subject_id, evidence
-       )
-       SELECT $1, $2, 'authentication.session.revoked', 'session', id,
-         jsonb_build_object('userId', $3::text, 'revokedByUserId', $2::text)
-       FROM auth.session
-       WHERE "userId" = $3`,
-      [actor.workspace.id, actor.identity.userId, targetUserId]
+         workspace_id, actor_user_id, actor_membership_id,
+         event_type, subject_type, subject_id, evidence
+       ) VALUES ($1, $2, $3, 'membership.revoked', 'workspace_membership', $4,
+         jsonb_build_object('targetUserId', $5::text))`,
+      [
+        actor.workspace.id,
+        actor.identity.userId,
+        actor.membership.id,
+        revoked.rows[0].id,
+        targetUserId
+      ]
     );
-    await client.query('DELETE FROM auth.session WHERE "userId" = $1', [targetUserId]);
-    await client.query(
-      `INSERT INTO public.audit_event (
-         workspace_id, actor_user_id, event_type, subject_type, subject_id, evidence
-       ) VALUES ($1, $2, 'membership.revoked', 'workspace_membership', $3,
-         jsonb_build_object('targetUserId', $3::text, 'sessionsRevoked', true))`,
-      [actor.workspace.id, actor.identity.userId, targetUserId]
-    );
-    await publishAccessRevoked(client, { kind: 'user', userId: targetUserId });
+    await publishAccessRevoked(client, {
+      kind: 'membership',
+      membershipId: revoked.rows[0].id
+    });
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

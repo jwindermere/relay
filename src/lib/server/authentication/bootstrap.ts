@@ -32,6 +32,7 @@ export async function bootstrapOwner(
   const client = await pool.connect();
   const userId = randomUUID();
   const workspaceId = randomUUID();
+  const membershipId = randomUUID();
 
   try {
     await client.query('BEGIN');
@@ -64,16 +65,17 @@ export async function bootstrapOwner(
       workspaceName
     ]);
     await client.query(
-      `INSERT INTO public.workspace_membership (workspace_id, user_id, role)
-       VALUES ($1, $2, 'owner')`,
-      [workspaceId, userId]
+      `INSERT INTO public.workspace_membership (id, workspace_id, user_id, role)
+       VALUES ($1, $2, $3, 'owner')`,
+      [membershipId, workspaceId, userId]
     );
     await client.query(
       `INSERT INTO public.audit_event (
-         workspace_id, actor_user_id, event_type, subject_type, subject_id, evidence
-       ) VALUES ($1, $2, 'workspace.bootstrapped', 'workspace', $1,
+         workspace_id, actor_user_id, actor_membership_id,
+         event_type, subject_type, subject_id, evidence
+       ) VALUES ($1, $2, $3, 'workspace.bootstrapped', 'workspace', $1,
          jsonb_build_object('ownerUserId', $2::text))`,
-      [workspaceId, userId]
+      [workspaceId, userId, membershipId]
     );
     await client.query('COMMIT');
     return { userId, workspaceId };

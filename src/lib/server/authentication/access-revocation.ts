@@ -4,7 +4,7 @@ const ACCESS_REVOCATION_CHANNEL = 'relay_access_revoked';
 
 export type AccessRevocation =
   | { kind: 'session'; sessionId: string; userId: string }
-  | { kind: 'user'; userId: string };
+  | { kind: 'membership'; membershipId: string };
 
 interface Queryable {
   query: (text: string, values?: unknown[]) => Promise<QueryResult>;
@@ -29,7 +29,10 @@ export async function subscribeToAccessRevocations(
     if (channel !== ACCESS_REVOCATION_CHANNEL || !payload) return;
     try {
       const revocation = JSON.parse(payload) as AccessRevocation;
-      if (revocation.kind === 'user' && typeof revocation.userId === 'string') {
+      if (
+        revocation.kind === 'membership' &&
+        typeof revocation.membershipId === 'string'
+      ) {
         onRevoked(revocation);
       } else if (
         revocation.kind === 'session' &&

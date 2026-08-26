@@ -30,6 +30,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      RELAY_EMAIL_DELIVERY_URL: ${RELAY_EMAIL_DELIVERY_URL:?set RELAY_EMAIL_DELIVERY_URL in .env}
+      RELAY_EMAIL_DELIVERY_TOKEN: ${RELAY_EMAIL_DELIVERY_TOKEN:-}
       HOST: 0.0.0.0
       PORT: 3000
     command: ["npm", "run", "start:web"]
