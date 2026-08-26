@@ -291,6 +291,97 @@ if (skipDatabaseTests) {
     assert.doesNotMatch(JSON.stringify(decisions.rows), /before|after|installation/);
   });
 
+  test('a pull-request result is not exposed unless AgentRun completion is durable', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-finalization-failure');
+    await pool.query(`
+      CREATE FUNCTION fail_test_artifact_insert() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.agent_run_id = '${ids.runId}' THEN
+          RAISE EXCEPTION 'forced artifact persistence failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER fail_test_artifact_insert
+      BEFORE INSERT ON public.artifact
+      FOR EACH ROW EXECUTE FUNCTION fail_test_artifact_insert()
+    `);
+    try {
+      const remote: GitHubBrokerRemote = {
+        async execute(input) {
+          if (input.request.operation === 'clone') {
+            return {
+              commitSha: 'c'.repeat(40),
+              files: [{
+                path: 'README.md',
+                content: Buffer.from('before\n').toString('base64'),
+                encoding: 'base64'
+              }]
+            };
+          }
+          if (input.request.operation === 'create_branch') return { commitSha: 'c'.repeat(40) };
+          if (input.request.operation === 'commit'
+            || input.request.operation === 'update_branch') {
+            return { commitSha: 'd'.repeat(40) };
+          }
+          if (input.request.operation === 'pull_request_upsert') {
+            return {
+              commitSha: 'd'.repeat(40),
+              pullRequestNumber: 26,
+              pullRequestUrl: 'https://github.test/relay-owner/pilot/pull/26'
+            };
+          }
+          throw new Error('unexpected broker operation');
+        }
+      };
+      const provider = new FixtureProvider(async (input, observer) => {
+        await writeFile(join(input.workspaceDirectory, 'README.md'), 'after\n');
+        await observer.threadStarted('thread-github-finalization-failure');
+        await observer.turnStarted('turn-github-finalization-failure');
+        await observer.notification({
+          method: 'turn/completed',
+          providerEventId: 'turn-github-finalization-failure:completed',
+          turn: { id: 'turn-github-finalization-failure', status: 'completed' }
+        });
+      });
+
+      const result = await processNextAgentRun(pool, provider, {
+        workerId: 'worker-github-finalization-failure',
+        workspaceRoot,
+        leaseDurationMs: 10_000,
+        githubWorkspaceBroker: new AgentRunGitHubWorkspaceBroker(pool, remote)
+      });
+      assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'failed' });
+      const durable = await pool.query<{
+        status: string;
+        completed_events: number;
+        artifacts: number;
+        result_messages: number;
+      }>(
+        `SELECT run.status,
+                (SELECT count(*)::integer FROM public.agent_run_event
+                 WHERE agent_run_id = run.id AND status = 'completed') AS completed_events,
+                (SELECT count(*)::integer FROM public.artifact
+                 WHERE agent_run_id = run.id) AS artifacts,
+                (SELECT count(*)::integer FROM public.message
+                 WHERE workspace_id = run.workspace_id
+                   AND parent_message_id = $2
+                   AND body LIKE 'Completed the engineering request.%') AS result_messages
+         FROM public.agent_run run WHERE run.id = $1`,
+        [ids.runId, 'message-github-finalization-failure']
+      );
+      assert.deepEqual(durable.rows[0], {
+        status: 'failed',
+        completed_events: 0,
+        artifacts: 0,
+        result_messages: 0
+      });
+    } finally {
+      await pool.query('DROP TRIGGER fail_test_artifact_insert ON public.artifact');
+      await pool.query('DROP FUNCTION fail_test_artifact_insert()');
+    }
+  });
+
   test('one leased worker executes a queued AgentRun and persists safe Provider evidence once', async () => {
     const ids = await seedQueuedAgentRun(pool, 'complete');
     const provider = new FixtureProvider(async (input, observer) => {

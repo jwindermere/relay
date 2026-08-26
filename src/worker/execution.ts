@@ -4,6 +4,10 @@ import { resolve, sep } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 import { postApprovalResolutionMessage } from '../lib/server/collaboration/approvals.js';
 import {
+  recordPullRequestResult,
+  type PullRequestPublication
+} from '../lib/server/collaboration/pull-request-result.js';
+import {
   AgentRunProviderError,
   mapProviderOutcomeToAgentRunStatus,
   readSafeCodexErrorCode,
@@ -137,6 +141,7 @@ export async function processNextAgentRun(
   }, Math.max(250, Math.floor(leaseDurationMs / 3)));
   renewal.unref();
   let preparedRepository: PreparedAgentRunRepository | undefined;
+  let pullRequestPublication: PullRequestPublication | undefined;
   let repositoryPublicationFailed = false;
 
   try {
@@ -183,7 +188,7 @@ export async function processNextAgentRun(
           if (!preparedRepository) {
             throw new Error('AgentRun repository preparation boundary is unavailable');
           }
-          await options.githubWorkspaceBroker.publish(
+          pullRequestPublication = await options.githubWorkspaceBroker.publish(
             claim.id,
             workspaceDirectory,
             preparedRepository
@@ -193,8 +198,12 @@ export async function processNextAgentRun(
           throw error;
         }
       }
-      terminalStatus = await persistProviderNotification(pool, claim, terminalNotification)
-        ?? terminalStatus;
+      terminalStatus = await persistProviderNotification(
+        pool,
+        claim,
+        terminalNotification,
+        pullRequestPublication
+      ) ?? terminalStatus;
     }
 
     if (!terminalStatus) {
@@ -734,29 +743,41 @@ async function persistProviderTurn(
 async function persistProviderNotification(
   pool: Pool,
   claim: ClaimedAgentRun,
-  notification: ProviderNotification
+  notification: ProviderNotification,
+  publication?: PullRequestPublication
 ): Promise<AgentRunStatus | undefined> {
   if (notification.method === 'turn/completed' && notification.turn) {
     const errorCode = readSafeCodexErrorCode(notification.turn.error?.codexErrorInfo);
     const status = mapProviderOutcomeToAgentRunStatus(notification.turn.status);
-    await appendRunEvent(pool, claim, {
-      eventType: 'provider.turn.completed',
-      status,
-      summary: errorCode === 'UsageLimitExceeded'
-        ? 'Codex usage limit reached'
-        : status === 'completed'
-        ? 'Engineering request completed'
-        : status === 'cancelled' ? 'Engineering request cancelled' : 'Codex turn failed',
-      evidence: {
-        provider: 'codex',
-        outcome: notification.turn.status,
-        errorCode
-      },
-      providerEventId: notification.providerEventId,
-      providerTurnId: notification.turn.id,
-      completed: true,
-      clearActiveTurn: true
-    });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await appendRunEventWithClient(client, claim, {
+        eventType: 'provider.turn.completed',
+        status,
+        summary: errorCode === 'UsageLimitExceeded'
+          ? 'Codex usage limit reached'
+          : status === 'completed'
+          ? 'Engineering request completed'
+          : status === 'cancelled' ? 'Engineering request cancelled' : 'Codex turn failed',
+        evidence: {
+          provider: 'codex',
+          outcome: notification.turn.status,
+          errorCode
+        },
+        providerEventId: notification.providerEventId,
+        providerTurnId: notification.turn.id,
+        completed: true,
+        clearActiveTurn: true
+      });
+      if (publication) await recordPullRequestResult(client, publication);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     const stored = await pool.query<{ status: AgentRunStatus }>(
       'SELECT status FROM public.agent_run WHERE id = $1',
       [claim.id]
