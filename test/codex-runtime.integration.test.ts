@@ -161,8 +161,8 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
       method: 'thread/start',
       params: {
         cwd: '/tmp/relay-run-1',
-        approvalPolicy: 'onRequest',
-        sandbox: 'workspaceWrite',
+        approvalPolicy: 'on-request',
+        sandbox: 'workspace-write',
         serviceName: 'relay-worker'
       }
     },
@@ -172,16 +172,13 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
         threadId: 'thread-1',
         input: [{ type: 'text', text: 'Inspect the test' }],
         cwd: '/tmp/relay-run-1',
-        approvalPolicy: 'onRequest',
+        approvalPolicy: 'on-request',
         sandboxPolicy: {
           type: 'workspaceWrite',
           writableRoots: ['/tmp/relay-run-1'],
-          readOnlyAccess: {
-            type: 'restricted',
-            includePlatformDefaults: true,
-            readableRoots: ['/tmp/relay-run-1']
-          },
-          networkAccess: false
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true
         }
       }
     }
