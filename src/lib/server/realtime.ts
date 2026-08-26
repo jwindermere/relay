@@ -56,7 +56,8 @@ export function attachAuthenticatedRealtime(
   server: HttpServer,
   pool: Pool,
   auth: RelayAuth,
-  ticketSecret: string
+  ticketSecret: string,
+  options: { ignoreUnknownUpgrades?: boolean } = {}
 ): WebSocketServer {
   const realtime = new WebSocketServer({ noServer: true });
   const clients = new Set<RealtimeClient>();
@@ -97,7 +98,7 @@ export function attachAuthenticatedRealtime(
   server.on('upgrade', async (request, socket, head) => {
     const url = new URL(request.url ?? '/', 'http://relay.local');
     if (url.pathname !== '/realtime') {
-      socket.destroy();
+      if (!options.ignoreUnknownUpgrades) socket.destroy();
       return;
     }
     if (!isSameOrigin(request)) {
