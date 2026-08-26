@@ -363,6 +363,66 @@ if (skipDatabaseTests) {
     ]);
   });
 
+  test('a completed Provider turn without repository changes replies visibly once', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-no-changes');
+    const operations: string[] = [];
+    const remote: GitHubBrokerRemote = {
+      async execute(input) {
+        operations.push(input.request.operation);
+        if (input.request.operation === 'clone') {
+          return {
+            commitSha: '1'.repeat(40),
+            files: [{
+              path: 'README.md',
+              content: Buffer.from('unchanged\n').toString('base64'),
+              encoding: 'base64',
+              mode: '100644'
+            }]
+          };
+        }
+        if (input.request.operation === 'create_branch') return { commitSha: '1'.repeat(40) };
+        throw new Error('unexpected broker operation');
+      }
+    };
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-github-no-changes');
+      await observer.turnStarted('turn-github-no-changes');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-github-no-changes:completed',
+        turn: { id: 'turn-github-no-changes', status: 'completed' }
+      });
+    });
+
+    const result = await processNextAgentRun(pool, provider, {
+      workerId: 'worker-github-no-changes',
+      workspaceRoot,
+      leaseDurationMs: 10_000,
+      githubWorkspaceBroker: new AgentRunGitHubWorkspaceBroker(pool, remote)
+    });
+
+    assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'failed' });
+    assert.deepEqual(operations, ['clone', 'create_branch']);
+    const reply = await pool.query<{
+      author_workspace_member_id: string;
+      body: string;
+      notifications: number;
+    }>(
+      `SELECT message.author_workspace_member_id, message.body,
+              count(outbox.id)::integer AS notifications
+       FROM public.message message
+       LEFT JOIN public.notification_outbox outbox ON outbox.message_id = message.id
+       WHERE message.id = $1
+       GROUP BY message.id`,
+      [`agent-run-result:${ids.runId}`]
+    );
+    assert.deepEqual(reply.rows[0], {
+      author_workspace_member_id: ids.agentMemberId,
+      body: 'I finished checking the repository, but there were no changes to publish, so no pull request was created.',
+      notifications: 1
+    });
+  });
+
   test('a pull-request result is not exposed unless AgentRun completion is durable', async () => {
     const ids = await seedQueuedAgentRun(pool, 'github-finalization-failure');
     await pool.query(`

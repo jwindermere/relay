@@ -4,6 +4,10 @@ import { resolve, sep } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 import { postApprovalResolutionMessage } from '../lib/server/collaboration/approvals.js';
 import {
+  recordAgentRunFailureResult,
+  type AgentRunFailureResult
+} from '../lib/server/collaboration/agent-run-result.js';
+import {
   recordPullRequestResult,
   type PullRequestPublication
 } from '../lib/server/collaboration/pull-request-result.js';
@@ -28,6 +32,7 @@ import type {
   AgentRunGitHubWorkspaceBroker,
   PreparedAgentRunRepository
 } from '../lib/server/github/workspace.js';
+import { AgentRunGitHubPublicationError } from '../lib/server/github/workspace.js';
 
 export interface WorkerExecutionOptions {
   workerId: string;
@@ -144,7 +149,7 @@ export async function processNextAgentRun(
   renewal.unref();
   let preparedRepository: PreparedAgentRunRepository | undefined;
   let pullRequestPublication: PullRequestPublication | undefined;
-  let repositoryPublicationFailed = false;
+  let repositoryPublicationError: unknown;
 
   try {
     if (options.githubWorkspaceBroker) {
@@ -196,7 +201,7 @@ export async function processNextAgentRun(
             preparedRepository
           );
         } catch (error) {
-          repositoryPublicationFailed = true;
+          repositoryPublicationError = error;
           throw error;
         }
       }
@@ -219,14 +224,14 @@ export async function processNextAgentRun(
         });
         return { kind: 'executed', agentRunId: claim.id, status: 'paused' };
       }
-      await appendRunEvent(pool, claim, {
+      await failAgentRun(pool, claim, {
         eventType: 'run.failed',
         status: 'failed',
         summary: 'Codex stopped without a terminal turn result',
         evidence: { reason: 'missing_terminal_event' },
         completed: true,
         clearActiveTurn: true
-      });
+      }, 'provider_failed');
       terminalStatus = 'failed';
     }
     return { kind: 'executed', agentRunId: claim.id, status: terminalStatus };
@@ -251,18 +256,23 @@ export async function processNextAgentRun(
       return { kind: 'deferred', agentRunId: claim.id, reason: error.code };
     }
 
-    await appendRunEvent(pool, claim, {
+    const failureResult: AgentRunFailureResult = repositoryPublicationError
+      ? repositoryPublicationError instanceof AgentRunGitHubPublicationError
+        ? repositoryPublicationError.code
+        : 'github_publication_failed'
+      : 'provider_failed';
+    await failAgentRun(pool, claim, {
       eventType: 'run.failed',
       status: 'failed',
       summary: 'Codex execution failed',
       evidence: {
-        reason: repositoryPublicationFailed
+        reason: repositoryPublicationError
           ? 'github_publication_failed'
           : error instanceof AgentRunProviderError ? error.code : 'provider_failed'
       },
       completed: true,
       clearActiveTurn: true
-    });
+    }, failureResult);
     return { kind: 'executed', agentRunId: claim.id, status: 'failed' };
   } finally {
     clearInterval(renewal);
@@ -1168,6 +1178,26 @@ async function appendRunEvent(
   try {
     await client.query('BEGIN');
     await appendRunEventWithClient(client, claim, event);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function failAgentRun(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  event: AgentRunEventInput,
+  result: AgentRunFailureResult
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await appendRunEventWithClient(client, claim, event);
+    await recordAgentRunFailureResult(client, claim.id, result);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

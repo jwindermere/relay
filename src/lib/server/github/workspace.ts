@@ -32,6 +32,13 @@ export interface WorkspaceFileSnapshot {
   mode: GitHubFileMode;
 }
 
+export class AgentRunGitHubPublicationError extends Error {
+  constructor(readonly code: 'no_repository_changes') {
+    super('AgentRun completed without repository changes');
+    this.name = 'AgentRunGitHubPublicationError';
+  }
+}
+
 export class AgentRunGitHubWorkspaceBroker {
   constructor(private readonly pool: Pool, private readonly remote: GitHubBrokerRemote) {}
 
@@ -102,7 +109,9 @@ export class AgentRunGitHubWorkspaceBroker {
       workspaceDirectory,
       prepared.originalFiles
     );
-    if (changedFiles.length === 0) throw new Error('AgentRun completed without repository changes');
+    if (changedFiles.length === 0) {
+      throw new AgentRunGitHubPublicationError('no_repository_changes');
+    }
 
     const commit = await executeGitHubBrokerOperation(this.pool, this.remote, {
       ...common,
