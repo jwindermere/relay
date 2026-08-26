@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Relay realtime delivery mental model</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <h1>Realtime delivery: the four-part mental model</h1>
+  <div class="model">
+    <div class="card"><strong>Notebook</strong>The durable event log contains what actually happened.</div>
+    <div class="card"><strong>To-do slip</strong>The outbox remembers that committed news still needs announcing.</div>
+    <div class="card"><strong>Doorbell</strong>The WebSocket wakes a browser quickly, but is not the record.</div>
+  </div>
+  <div class="card"><strong>Bookmark</strong>Each member cursor records the last sequence their view applied.</div>
+  <h2>The invariant</h2>
+  <p>Write the notebook and to-do slip first. Ring the doorbell afterward. On every ring or reconnect, read everything after the bookmark. Never infer history from whether a doorbell was heard.</p>
+  <h2>Failure meanings</h2>
+  <ul>
+    <li><strong>Browser offline:</strong> reconnect and read after its bookmark.</li>
+    <li><strong>Wake-up lost:</strong> retry the durable outbox.</li>
+    <li><strong>Web restarted:</strong> execution and durable history continue elsewhere.</li>
+    <li><strong>Worker outcome unknown:</strong> pause for review; do not replay side effects.</li>
+  </ul>
+  <p><a href="../lessons/0001-walk-through-realtime-agentrun.html">Return to the guided lesson</a></p>
+</main>
+</body>
+</html>

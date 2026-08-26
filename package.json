@@ -16,6 +16,7 @@
     "start:worker": "node build-runtime/worker/main.js",
     "prototype:agent-run": "node prototype/agent-run.mjs",
     "prototype:realtime-agent-run": "node prototype/realtime-agent-run.mjs",
+    "prototype:shared-channel-ux": "npm --prefix prototype/shared-channel-ux run dev --",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --noEmit -p tsconfig.runtime.json && node --check prototype/agent-run.mjs && node --check prototype/realtime-agent-run-model.mjs && node --check prototype/realtime-agent-run.mjs",
     "test": "npm run test:prototype && npm run test:integration",
     "test:prototype": "node --test prototype/*.test.mjs",

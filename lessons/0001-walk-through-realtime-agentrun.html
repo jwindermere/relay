@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Walk through the realtime AgentRun prototype</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <h1>Walk through the realtime AgentRun prototype</h1>
+  <p><strong>Your goal:</strong> decide whether both pilot members remain correctly informed when realtime delivery fails. You are reviewing behavior, not terminal styling.</p>
+
+  <div class="model">
+    <div class="card"><strong>Database = notebook</strong>Authoritative, numbered history.</div>
+    <div class="card"><strong>WebSocket = doorbell</strong>Fast notification that may disappear.</div>
+    <div class="card"><strong>Cursor = bookmark</strong>Where each member last read.</div>
+  </div>
+
+  <h2>Start</h2>
+  <pre>npm run prototype:realtime-agent-run</pre>
+  <p>Enter one letter, press Return, and inspect the new screen. Use <kbd>z</kbd> to reset and <kbd>q</kbd> to quit.</p>
+
+  <h2>1. Normal operation</h2>
+  <p>Press <kbd>a</kbd> three times. Expect durable sequence 3, status <code>working</code>, and both cursors at 3.</p>
+  <p class="check">Meaning: both members saw the same committed history.</p>
+
+  <h2>2. Offline member and lost wake-up</h2>
+  <p>Press <kbd>2</kbd>, then <kbd>a</kbd>, then <kbd>m</kbd>. Pilot B stays behind; the outbox becomes pending. Press <kbd>o</kbd>: Pilot A catches up. Press <kbd>2</kbd>: Pilot B reconnects and catches up. Press <kbd>d</kbd>: no duplicate update should appear.</p>
+  <p class="check">Meaning: missed and repeated notifications do not lose or duplicate durable history.</p>
+
+  <h2>3. Web restart</h2>
+  <p>Press <kbd>x</kbd>. Both members go offline, but the durable AgentRun is unchanged. Press <kbd>1</kbd> and <kbd>2</kbd>; both return to the latest sequence.</p>
+  <p class="check">Meaning: the web process is only a delivery path, not the owner of execution.</p>
+
+  <h2>4. Unknown worker outcome</h2>
+  <p>Press <kbd>z</kbd>, press <kbd>a</kbd> three times, then press <kbd>k</kbd>. Expect <code>recovering</code> followed by <code>paused</code>.</p>
+  <p class="warning">Meaning: Relay does not automatically replay repository work when it cannot prove what the earlier attempt did.</p>
+
+  <h2>Your verdict</h2>
+  <p>Ask: Is this understandable enough for both pilot members? Is any update too noisy or missing? Should an unknown worker outcome pause, or should some other behavior occur?</p>
+  <p>Primary sources: <a href="../prototype/REALTIME-AGENT-RUN.md">prototype guide</a> and <a href="../docs/research/recoverable-agentrun-execution-architecture.md">Relay recovery decision</a>. See also the <a href="../reference/realtime-delivery-mental-model.html">one-page reference</a>.</p>
+  <p>If anything is unclear, ask the agent about the exact screen or action before choosing a verdict.</p>
+</main>
+</body>
+</html>
