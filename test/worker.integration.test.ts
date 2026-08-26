@@ -115,7 +115,7 @@ if (skipDatabaseTests) {
        WHERE delivery.delivery_id = 'delivery-github-broker'`,
       [ids.runId]
     );
-    assert.equal(evidence.rows[0]?.decisions, 2);
+    assert.equal(evidence.rows[0]?.decisions, 3);
     assert.equal(evidence.rows[0]?.deliveries, 1);
     assert.equal(evidence.rows[0]?.denied, 1);
     assert.equal(evidence.rows[0]?.correlated, ids.runId);
@@ -199,7 +199,7 @@ if (skipDatabaseTests) {
     });
     const decisions = await pool.query<{ decision: string; operation: string }>(
       `SELECT decision, operation FROM public.github_broker_decision
-       WHERE agent_run_id = $1 ORDER BY id`,
+       WHERE agent_run_id = $1 AND phase = 'decision' ORDER BY id`,
       [ids.runId]
     );
     assert.deepEqual(decisions.rows, operations.map((operation) => ({ decision: 'allow', operation })));

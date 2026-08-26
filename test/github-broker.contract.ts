@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { createGitHubBrokerRemote } from '../src/lib/server/github/api.js';
-import { decideGitHubBrokerOperation, type GitHubBrokerRequest } from '../src/lib/server/github/broker-policy.js';
+import {
+  executeGitHubBrokerBoundary,
+  GitHubBrokerDeniedError,
+  type GitHubBrokerRemote
+} from '../src/lib/server/github/broker.js';
+import type { GitHubBrokerRequest } from '../src/lib/server/github/broker-policy.js';
 
 const requiredEnvironment = [
   'RELAY_GITHUB_APP_ID', 'RELAY_GITHUB_PRIVATE_KEY',
@@ -24,7 +29,7 @@ test('disposable protected repository enforces the complete broker contract', {
     releaseBranches: (process.env.RELAY_GITHUB_CONTRACT_RELEASE_BRANCHES ?? '').split(',').filter(Boolean),
     agentRunId: runId
   };
-  const remote = createGitHubBrokerRemote({
+  const githubRemote = createGitHubBrokerRemote({
     appId: process.env.RELAY_GITHUB_APP_ID!,
     privateKey: process.env.RELAY_GITHUB_PRIVATE_KEY!.replace(/\\n/g, '\n')
   });
@@ -38,9 +43,34 @@ test('disposable protected repository enforces the complete broker contract', {
     repositoryId, agentRunId: runId, attemptNumber: 1,
     actorWorkspaceMemberId: `agent-${runId}`
   };
+  const remoteCalls: string[] = [];
+  const remote: GitHubBrokerRemote = {
+    async execute(input) {
+      remoteCalls.push(input.request.operation);
+      return githubRemote.execute(input);
+    }
+  };
+  const evidence: Array<{ operation: string; decision: string; phase: string }> = [];
+  const brokerBoundary = {
+    policy: boundary,
+    remote: {
+      installationId: remoteBoundary.installationId,
+      repositoryId: remoteBoundary.repositoryId,
+      repositoryOwner: remoteBoundary.repositoryOwner,
+      repositoryName: remoteBoundary.repositoryName,
+      defaultBranch: remoteBoundary.defaultBranch
+    }
+  };
   const executeAllowed = async (request: GitHubBrokerRequest) => {
-    assert.equal(decideGitHubBrokerOperation(boundary, request).decision, 'allow');
-    return remote.execute({ ...remoteBoundary, request });
+    const execution = await executeGitHubBrokerBoundary(
+      brokerBoundary,
+      remote,
+      request,
+      async (decision, phase) => {
+        evidence.push({ operation: request.operation, decision: decision.decision, phase });
+      }
+    );
+    return execution.result;
   };
 
   const clone = await executeAllowed({ ...common, operation: 'clone' });
@@ -80,6 +110,19 @@ test('disposable protected repository enforces the complete broker contract', {
     { ...common, operation: 'read', repositoryId: `${repositoryId}-alternate` }
   ];
   for (const request of forbidden) {
-    assert.equal(decideGitHubBrokerOperation(boundary, request).decision, 'deny');
+    const callsBeforeDenial = remoteCalls.length;
+    await assert.rejects(executeGitHubBrokerBoundary(
+      brokerBoundary,
+      remote,
+      request,
+      async (decision, phase) => {
+        evidence.push({ operation: request.operation, decision: decision.decision, phase });
+      }
+    ), GitHubBrokerDeniedError);
+    assert.equal(remoteCalls.length, callsBeforeDenial);
   }
+  assert.equal(
+    evidence.filter(({ decision, phase }) => decision === 'deny' && phase === 'decision').length,
+    forbidden.length
+  );
 });

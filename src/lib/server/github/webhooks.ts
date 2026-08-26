@@ -43,9 +43,9 @@ export function parseSignedGitHubWebhook(input: {
     throw new Error('GitHub webhook payload is invalid');
   }
   const payload = parsed as Record<string, unknown>;
-  const repository = record(payload.repository);
-  const installation = record(payload.installation);
-  const pullRequest = record(payload.pull_request);
+  const repository = asRecordOrEmpty(payload.repository);
+  const installation = asRecordOrEmpty(payload.installation);
+  const pullRequest = asRecordOrEmpty(payload.pull_request);
   const repositoryId = safeIdentifier(repository.id, 'repository ID');
   const installationId = safeIdentifier(installation.id, 'installation ID');
   const branch = readBranch(payload, pullRequest);
@@ -61,7 +61,9 @@ export function parseSignedGitHubWebhook(input: {
     ...(branch?.startsWith('relay/') ? { agentRunId: branch.slice('relay/'.length) } : {}),
     ...(commitSha ? { commitSha } : {}),
     ...(pullRequestNumber ? { pullRequestNumber } : {}),
-    payload: redactCredentialMaterial(payload) as Record<string, unknown>
+    payload: safeWebhookEvidence(payload, {
+      repositoryId, installationId, branch, commitSha, pullRequestNumber
+    })
   };
 }
 
@@ -117,7 +119,7 @@ export async function ingestGitHubWebhook(
   };
 }
 
-function record(value: unknown): Record<string, unknown> {
+function asRecordOrEmpty(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
@@ -138,25 +140,48 @@ function safePositiveInteger(value: unknown): number | undefined {
 function readBranch(payload: Record<string, unknown>, pullRequest: Record<string, unknown>) {
   const ref = typeof payload.ref === 'string' ? payload.ref : undefined;
   if (ref?.startsWith('refs/heads/')) return ref.slice('refs/heads/'.length);
-  const headRef = record(pullRequest.head).ref;
+  const headRef = asRecordOrEmpty(pullRequest.head).ref;
   return typeof headRef === 'string' && headRef.length <= 255 ? headRef : undefined;
 }
 
 function readCommitSha(payload: Record<string, unknown>, pullRequest: Record<string, unknown>) {
   const candidate = typeof payload.after === 'string'
     ? payload.after
-    : record(pullRequest.head).sha;
+    : asRecordOrEmpty(pullRequest.head).sha;
   return typeof candidate === 'string' && /^[a-f0-9]{40,64}$/i.test(candidate)
     ? candidate.toLowerCase()
     : undefined;
 }
 
-function redactCredentialMaterial(value: unknown, key = ''): unknown {
-  if (/(?:token|secret|password|authorization|private.?key|credential)/i.test(key)) {
-    return '[REDACTED]';
+function safeWebhookEvidence(
+  payload: Record<string, unknown>,
+  correlation: {
+    repositoryId: string;
+    installationId: string;
+    branch?: string;
+    commitSha?: string;
+    pullRequestNumber?: number;
   }
-  if (Array.isArray(value)) return value.map((entry) => redactCredentialMaterial(entry));
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-    .map(([entryKey, entry]) => [entryKey, redactCredentialMaterial(entry, entryKey)]));
+): Record<string, unknown> {
+  const sender = asRecordOrEmpty(payload.sender);
+  const senderId = typeof sender.id === 'number' || typeof sender.id === 'string'
+    ? String(sender.id)
+    : undefined;
+  const senderLogin = typeof sender.login === 'string' && /^[A-Za-z0-9-]{1,100}$/.test(sender.login)
+    ? sender.login
+    : undefined;
+  const action = typeof payload.action === 'string' && /^[a-z_]{1,100}$/.test(payload.action)
+    ? payload.action
+    : undefined;
+  return {
+    repository: { id: correlation.repositoryId },
+    installation: { id: correlation.installationId },
+    ...(correlation.branch ? { branch: correlation.branch } : {}),
+    ...(correlation.commitSha ? { commitSha: correlation.commitSha } : {}),
+    ...(correlation.pullRequestNumber
+      ? { pullRequest: { number: correlation.pullRequestNumber } }
+      : {}),
+    ...(action ? { action } : {}),
+    ...(senderId || senderLogin ? { sender: { id: senderId, login: senderLogin } } : {})
+  };
 }

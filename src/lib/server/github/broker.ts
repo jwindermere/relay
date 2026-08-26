@@ -44,6 +44,36 @@ export class GitHubBrokerDeniedError extends Error {
   }
 }
 
+interface GitHubBrokerExecutionBoundary {
+  policy: Parameters<typeof decideGitHubBrokerOperation>[0];
+  remote: Omit<Parameters<GitHubBrokerRemote['execute']>[0], 'request' | 'assignedBranch'>;
+}
+
+export async function executeGitHubBrokerBoundary(
+  boundary: GitHubBrokerExecutionBoundary,
+  remote: GitHubBrokerRemote,
+  request: GitHubBrokerRequest,
+  record: (
+    decision: GitHubBrokerDecision,
+    phase: 'decision' | 'result',
+    result?: Awaited<ReturnType<GitHubBrokerRemote['execute']>>
+  ) => Promise<void>
+): Promise<{
+  decision: GitHubBrokerDecision;
+  result: Awaited<ReturnType<GitHubBrokerRemote['execute']>>;
+}> {
+  const decision = decideGitHubBrokerOperation(boundary.policy, request);
+  await record(decision, 'decision');
+  if (decision.decision === 'deny') throw new GitHubBrokerDeniedError(decision.reason);
+  const result = await remote.execute({
+    ...boundary.remote,
+    assignedBranch: decision.assignedBranch,
+    request
+  });
+  await record(decision, 'result', result);
+  return { decision, result };
+}
+
 export async function executeGitHubBrokerOperation(
   pool: Pool,
   remote: GitHubBrokerRemote,
@@ -53,7 +83,7 @@ export async function executeGitHubBrokerOperation(
   result: Awaited<ReturnType<GitHubBrokerRemote['execute']>>;
 }> {
   const boundary = await loadBoundary(pool, request.agentRunId);
-  if (!boundary) throw new GitHubBrokerDeniedError('unknown_agent_run');
+  if (!boundary) throw new Error('AgentRun repository context is unavailable');
 
   const policyBoundary = {
     repositoryId: boundary.repository_id,
@@ -70,27 +100,18 @@ export async function executeGitHubBrokerOperation(
     decision = { ...decision, decision: 'deny', reason: 'repository_not_ready' };
   }
 
-  if (decision.decision === 'deny') {
-    await recordDecision(pool, boundary, request, decision, undefined, 'denied');
-    throw new GitHubBrokerDeniedError(decision.reason);
-  }
-
-  try {
-    const result = await remote.execute({
+  return executeGitHubBrokerBoundary({
+    policy: policyBoundary,
+    remote: {
       installationId: boundary.installation_id,
       repositoryId: boundary.repository_id,
       repositoryOwner: boundary.repository_owner,
       repositoryName: boundary.repository_name,
-      defaultBranch: boundary.default_branch,
-      assignedBranch: decision.assignedBranch,
-      request
-    });
-    await recordDecision(pool, boundary, request, decision, result, 'completed');
-    return { decision, result };
-  } catch (error) {
-    await recordDecision(pool, boundary, request, decision, undefined, 'remote_failed');
-    throw error;
-  }
+      defaultBranch: boundary.default_branch
+    }
+  }, remote, request, (recordedDecision, phase, result) =>
+    recordDecision(pool, boundary, request, recordedDecision, phase, result)
+  );
 }
 
 async function loadBoundary(pool: Pool, agentRunId: string): Promise<BrokerBoundaryRow | undefined> {
@@ -122,15 +143,15 @@ async function recordDecision(
   boundary: BrokerBoundaryRow,
   request: GitHubBrokerRequest,
   decision: GitHubBrokerDecision,
-  result: Awaited<ReturnType<GitHubBrokerRemote['execute']>> | undefined,
-  outcome: 'denied' | 'completed' | 'remote_failed'
+  phase: 'decision' | 'result',
+  result?: Awaited<ReturnType<GitHubBrokerRemote['execute']>>
 ): Promise<void> {
   await pool.query(
     `INSERT INTO public.github_broker_decision (
        workspace_id, actor_workspace_member_id, agent_run_id, attempt_number,
-       repository_id, repository_owner, repository_name, operation, decision,
+       repository_id, repository_owner, repository_name, operation, phase, decision,
        reason, branch, commit_sha, pull_request_number, evidence
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
     [
       boundary.workspace_id,
       boundary.agent_workspace_member_id,
@@ -140,6 +161,7 @@ async function recordDecision(
       boundary.repository_owner,
       boundary.repository_name,
       request.operation,
+      phase,
       decision.decision,
       decision.reason,
       request.branch ?? null,
@@ -150,7 +172,7 @@ async function recordDecision(
         requestedActorWorkspaceMemberId: request.actorWorkspaceMemberId,
         requestedRepositoryId: request.repositoryId,
         force: request.force === true,
-        outcome,
+        outcome: phase === 'result' ? 'completed' : decision.decision,
         ...(result?.pullRequestUrl ? { pullRequestUrl: result.pullRequestUrl } : {})
       }
     ]

@@ -5,6 +5,11 @@ import {
   decideGitHubBrokerOperation,
   type GitHubBrokerRequest
 } from '../src/lib/server/github/broker-policy.js';
+import {
+  executeGitHubBrokerBoundary,
+  GitHubBrokerDeniedError,
+  type GitHubBrokerRemote
+} from '../src/lib/server/github/broker.js';
 
 const boundary = {
   repositoryId: '202',
@@ -83,4 +88,36 @@ test('broker denies destructive, privileged, protected-branch, and alternate-rep
   for (const operation of denied) {
     assert.equal(decideGitHubBrokerOperation(boundary, operation).decision, 'deny');
   }
+});
+
+test('broker records decisions before remote access and records successful results append-only', async () => {
+  const evidence: string[] = [];
+  const remote: GitHubBrokerRemote = {
+    async execute() {
+      evidence.push('remote');
+      return { commitSha: 'a'.repeat(40) };
+    }
+  };
+  const executionBoundary = {
+    policy: boundary,
+    remote: {
+      installationId: '101', repositoryId: '202', repositoryOwner: 'relay-owner',
+      repositoryName: 'pilot', defaultBranch: 'main'
+    }
+  };
+  await executeGitHubBrokerBoundary(
+    executionBoundary,
+    remote,
+    request({ operation: 'fetch' }),
+    async (_decision, phase) => { evidence.push(phase); }
+  );
+  assert.deepEqual(evidence, ['decision', 'remote', 'result']);
+
+  await assert.rejects(executeGitHubBrokerBoundary(
+    executionBoundary,
+    remote,
+    request({ operation: 'merge' }),
+    async (_decision, phase) => { evidence.push(`deny:${phase}`); }
+  ), GitHubBrokerDeniedError);
+  assert.deepEqual(evidence.slice(-1), ['deny:decision']);
 });

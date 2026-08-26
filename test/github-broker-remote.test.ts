@@ -75,3 +75,42 @@ test('broker remote retains one repository-scoped installation token while retur
   assert.ok(requests.slice(1).every(({ authorization }) => authorization === 'Bearer installation-secret'));
   assert.doesNotMatch(JSON.stringify(clone), /installation-secret|BEGIN PRIVATE/);
 });
+
+test('broker remote refuses to update a pull request from another branch', async () => {
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const requests: Array<{ path: string; method: string }> = [];
+  const remote = createGitHubBrokerRemote({
+    appId: '17',
+    privateKey: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+    fetch: async (url, init = {}) => {
+      const path = new URL(String(url)).pathname;
+      requests.push({ path, method: init.method ?? 'GET' });
+      if (path.endsWith('/access_tokens')) {
+        return Response.json({ token: 'installation-secret' });
+      }
+      if (path.endsWith('/pulls/99')) {
+        return Response.json({ head: { ref: 'unrelated', repo: { id: 202 } } });
+      }
+      return Response.json({ message: 'not found' }, { status: 404 });
+    }
+  });
+
+  await assert.rejects(remote.execute({
+    installationId: '101',
+    repositoryId: '202',
+    repositoryOwner: 'relay-owner',
+    repositoryName: 'pilot',
+    defaultBranch: 'main',
+    assignedBranch: 'relay/run-25',
+    request: {
+      operation: 'pull_request_upsert',
+      repositoryId: '202',
+      agentRunId: 'run-25',
+      attemptNumber: 1,
+      actorWorkspaceMemberId: 'agent-member-25',
+      branch: 'relay/run-25',
+      pullRequestNumber: 99
+    }
+  }), /does not belong to the AgentRun branch/);
+  assert.equal(requests.filter(({ path, method }) => path.endsWith('/pulls/99') && method === 'PATCH').length, 0);
+});

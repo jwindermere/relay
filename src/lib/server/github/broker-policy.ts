@@ -40,9 +40,23 @@ export interface GitHubBrokerBoundary {
 
 export interface GitHubBrokerDecision {
   decision: 'allow' | 'deny';
-  reason: string;
+  reason: GitHubBrokerDecisionReason;
   assignedBranch: string;
 }
+
+export type GitHubBrokerDecisionReason =
+  | 'operation_allowed'
+  | 'alternate_repository'
+  | 'alternate_agent_run'
+  | 'force_update'
+  | 'forbidden_operation'
+  | 'protected_branch'
+  | 'alternate_branch'
+  | 'invalid_commit'
+  | 'invalid_commit_content'
+  | 'alternate_attempt'
+  | 'alternate_actor'
+  | 'repository_not_ready';
 
 const READ_OPERATIONS = new Set<GitHubBrokerOperation>(['clone', 'read', 'fetch']);
 const WRITE_OPERATIONS = new Set<GitHubBrokerOperation>([
@@ -54,7 +68,7 @@ export function decideGitHubBrokerOperation(
   request: GitHubBrokerRequest
 ): GitHubBrokerDecision {
   const assignedBranch = `relay/${boundary.agentRunId}`;
-  const deny = (reason: string): GitHubBrokerDecision => ({
+  const deny = (reason: GitHubBrokerDecisionReason): GitHubBrokerDecision => ({
     decision: 'deny', reason, assignedBranch
   });
 

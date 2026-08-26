@@ -30,7 +30,13 @@ test('signed GitHub webhooks are validated and reduced to redacted correlation e
   assert.equal(delivery.commitSha, 'a'.repeat(40));
   assert.equal(delivery.pullRequestNumber, 17);
   assert.doesNotMatch(JSON.stringify(delivery.payload), /must-not-survive|also-private/);
-  assert.match(JSON.stringify(delivery.payload), /\[REDACTED\]/);
+  assert.deepEqual(delivery.payload, {
+    repository: { id: '202' },
+    installation: { id: '101' },
+    branch: 'relay/run-25',
+    commitSha: 'a'.repeat(40),
+    pullRequest: { number: 17 }
+  });
 });
 
 test('an invalid webhook signature is rejected before its payload is parsed', () => {

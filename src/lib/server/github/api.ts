@@ -21,6 +21,15 @@ interface GitHubGatewayConfiguration {
   apiBaseUrl?: string;
 }
 
+function loadGitHubGatewayConfiguration(): GitHubGatewayConfiguration {
+  const appId = process.env.RELAY_GITHUB_APP_ID;
+  const privateKey = process.env.RELAY_GITHUB_PRIVATE_KEY?.replace(/\\n/g, '\n');
+  if (!appId || !/^\d+$/.test(appId) || !privateKey) {
+    throw new Error('RELAY_GITHUB_APP_ID and RELAY_GITHUB_PRIVATE_KEY must configure the GitHub App');
+  }
+  return { appId, privateKey };
+}
+
 function encodeJwtPart(value: object): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
 }
@@ -251,12 +260,7 @@ let githubBrokerRemote: GitHubBrokerRemote | undefined;
 
 export function getGitHubRepositoryGateway(): GitHubRepositoryGateway {
   if (githubRepositoryGateway) return githubRepositoryGateway;
-  const appId = process.env.RELAY_GITHUB_APP_ID;
-  const privateKey = process.env.RELAY_GITHUB_PRIVATE_KEY?.replace(/\\n/g, '\n');
-  if (!appId || !/^\d+$/.test(appId) || !privateKey) {
-    throw new Error('RELAY_GITHUB_APP_ID and RELAY_GITHUB_PRIVATE_KEY must configure the GitHub App');
-  }
-  githubRepositoryGateway = createGitHubRepositoryGateway({ appId, privateKey });
+  githubRepositoryGateway = createGitHubRepositoryGateway(loadGitHubGatewayConfiguration());
   return githubRepositoryGateway;
 }
 
@@ -315,19 +319,19 @@ export function createGitHubBrokerRemote(
       const token = await installationToken(input.installationId, input.repositoryId);
       const owner = encodeURIComponent(input.repositoryOwner);
       const repository = encodeURIComponent(input.repositoryName);
-      const request = input.request;
+      const brokerRequest = input.request;
       const refPath = (branch: string) => encodeURIComponent(`heads/${branch}`);
 
-      if (request.operation === 'clone'
-        || request.operation === 'read'
-        || request.operation === 'fetch') {
-        const ref = await requestJson<{ object?: { sha?: unknown } }>(
+      if (brokerRequest.operation === 'clone'
+        || brokerRequest.operation === 'read'
+        || brokerRequest.operation === 'fetch') {
+        const ref = await request<{ object?: { sha?: unknown } }>(
           `/repos/${owner}/${repository}/git/ref/${refPath(input.defaultBranch)}`,
           token
         );
         const commitSha = requiredString(ref.object?.sha, 'branch commit SHA');
-        if (request.operation !== 'clone') return { commitSha };
-        const tree = await requestJson<{
+        if (brokerRequest.operation !== 'clone') return { commitSha };
+        const tree = await request<{
           truncated?: unknown;
           tree?: Array<{ path?: unknown; type?: unknown; sha?: unknown; size?: unknown }>;
         }>(`/repos/${owner}/${repository}/git/trees/${commitSha}?recursive=1`, token);
@@ -344,7 +348,7 @@ export function createGitHubBrokerRemote(
           throw new Error('GitHub clone exceeds the AgentRun workspace size limit');
         }
         const files = await Promise.all(blobs.map(async (blob) => {
-          const response = await requestJson<{ content?: unknown; encoding?: unknown }>(
+          const response = await request<{ content?: unknown; encoding?: unknown }>(
             `/repos/${owner}/${repository}/git/blobs/${encodeURIComponent(blob.sha)}`,
             token
           );
@@ -357,37 +361,37 @@ export function createGitHubBrokerRemote(
         }));
         return { commitSha, files };
       }
-      if (request.operation === 'create_branch') {
+      if (brokerRequest.operation === 'create_branch') {
         try {
-          const existing = await requestJson<{ object?: { sha?: unknown } }>(
+          const existing = await request<{ object?: { sha?: unknown } }>(
             `/repos/${owner}/${repository}/git/ref/${refPath(input.assignedBranch)}`,
             token
           );
           const existingSha = requiredString(existing.object?.sha, 'branch commit SHA');
-          if (existingSha !== request.commitSha) {
+          if (existingSha !== brokerRequest.commitSha) {
             throw new Error('existing AgentRun branch has an unexpected commit');
           }
           return { commitSha: existingSha };
         } catch (error) {
           if (!(error instanceof Error) || !/status 404$/.test(error.message)) throw error;
         }
-        const ref = await requestJson<{ object?: { sha?: unknown } }>(
+        const ref = await request<{ object?: { sha?: unknown } }>(
           `/repos/${owner}/${repository}/git/refs`,
           token,
-          { method: 'POST', body: { ref: `refs/heads/${input.assignedBranch}`, sha: request.commitSha } }
+          { method: 'POST', body: { ref: `refs/heads/${input.assignedBranch}`, sha: brokerRequest.commitSha } }
         );
         return { commitSha: requiredString(ref.object?.sha, 'branch commit SHA') };
       }
-      if (request.operation === 'commit') {
-        const parent = await requestJson<{ tree?: { sha?: unknown } }>(
-          `/repos/${owner}/${repository}/git/commits/${encodeURIComponent(request.commitSha ?? '')}`,
+      if (brokerRequest.operation === 'commit') {
+        const parent = await request<{ tree?: { sha?: unknown } }>(
+          `/repos/${owner}/${repository}/git/commits/${encodeURIComponent(brokerRequest.commitSha ?? '')}`,
           token
         );
-        const blobs = await Promise.all((request.files ?? []).map(async (file) => {
+        const blobs = await Promise.all((brokerRequest.files ?? []).map(async (file) => {
           if (file.content === null) {
             return { path: file.path, mode: '100644', type: 'blob', sha: null };
           }
-          const blob = await requestJson<{ sha?: unknown }>(
+          const blob = await request<{ sha?: unknown }>(
             `/repos/${owner}/${repository}/git/blobs`,
             token,
             {
@@ -397,7 +401,7 @@ export function createGitHubBrokerRemote(
           );
           return { path: file.path, mode: '100644', type: 'blob', sha: requiredString(blob.sha, 'blob SHA') };
         }));
-        const tree = await requestJson<{ sha?: unknown }>(
+        const tree = await request<{ sha?: unknown }>(
           `/repos/${owner}/${repository}/git/trees`,
           token,
           {
@@ -405,32 +409,32 @@ export function createGitHubBrokerRemote(
             body: { base_tree: requiredString(parent.tree?.sha, 'parent tree SHA'), tree: blobs }
           }
         );
-        const commit = await requestJson<{ sha?: unknown }>(
+        const commit = await request<{ sha?: unknown }>(
           `/repos/${owner}/${repository}/git/commits`,
           token,
           {
             method: 'POST',
             body: {
-              message: request.commitMessage,
+              message: brokerRequest.commitMessage,
               tree: requiredString(tree.sha, 'tree SHA'),
-              parents: [request.commitSha]
+              parents: [brokerRequest.commitSha]
             }
           }
         );
         return { commitSha: requiredString(commit.sha, 'commit SHA') };
       }
-      if (request.operation === 'update_branch') {
-        const ref = await requestJson<{ object?: { sha?: unknown } }>(
+      if (brokerRequest.operation === 'update_branch') {
+        const ref = await request<{ object?: { sha?: unknown } }>(
           `/repos/${owner}/${repository}/git/refs/${refPath(input.assignedBranch)}`,
           token,
-          { method: 'PATCH', body: { sha: request.commitSha, force: false } }
+          { method: 'PATCH', body: { sha: brokerRequest.commitSha, force: false } }
         );
         return { commitSha: requiredString(ref.object?.sha, 'branch commit SHA') };
       }
-      if (request.operation === 'pull_request_upsert') {
-        let pullRequestNumber = request.pullRequestNumber;
+      if (brokerRequest.operation === 'pull_request_upsert') {
+        let pullRequestNumber = brokerRequest.pullRequestNumber;
         if (!pullRequestNumber) {
-          const existing = await requestJson<Array<{ number?: unknown }>>(
+          const existing = await request<Array<{ number?: unknown }>>(
             `/repos/${owner}/${repository}/pulls?state=open&head=${encodeURIComponent(
               `${input.repositoryOwner}:${input.assignedBranch}`
             )}`,
@@ -442,15 +446,24 @@ export function createGitHubBrokerRemote(
         const path = pullRequestNumber
           ? `/repos/${owner}/${repository}/pulls/${pullRequestNumber}`
           : `/repos/${owner}/${repository}/pulls`;
-        const pullRequest = await requestJson<{
+        if (pullRequestNumber) {
+          const existing = await request<{
+            head?: { ref?: unknown; repo?: { id?: unknown } };
+          }>(`/repos/${owner}/${repository}/pulls/${pullRequestNumber}`, token);
+          if (existing.head?.ref !== input.assignedBranch
+            || String(existing.head.repo?.id) !== input.repositoryId) {
+            throw new Error('pull request does not belong to the AgentRun branch');
+          }
+        }
+        const pullRequest = await request<{
           number?: unknown;
           html_url?: unknown;
           head?: { sha?: unknown };
         }>(path, token, {
           method: pullRequestNumber ? 'PATCH' : 'POST',
           body: {
-            title: request.pullRequestTitle ?? `Relay AgentRun ${request.agentRunId}`,
-            body: request.pullRequestBody ?? 'Created by the Relay engineering Agent.',
+            title: brokerRequest.pullRequestTitle ?? `Relay AgentRun ${brokerRequest.agentRunId}`,
+            body: brokerRequest.pullRequestBody ?? 'Created by the Relay engineering Agent.',
             ...(!pullRequestNumber
               ? { head: input.assignedBranch, base: input.defaultBranch }
               : {})
@@ -466,22 +479,10 @@ export function createGitHubBrokerRemote(
     }
   };
 
-  function requestJson<T>(
-    path: string,
-    token: string,
-    options: { method?: string; body?: unknown } = {}
-  ): Promise<T> {
-    return request<T>(path, token, options);
-  }
 }
 
 export function getGitHubBrokerRemote(): GitHubBrokerRemote {
   if (githubBrokerRemote) return githubBrokerRemote;
-  const appId = process.env.RELAY_GITHUB_APP_ID;
-  const privateKey = process.env.RELAY_GITHUB_PRIVATE_KEY?.replace(/\\n/g, '\n');
-  if (!appId || !/^\d+$/.test(appId) || !privateKey) {
-    throw new Error('RELAY_GITHUB_APP_ID and RELAY_GITHUB_PRIVATE_KEY must configure the GitHub App');
-  }
-  githubBrokerRemote = createGitHubBrokerRemote({ appId, privateKey });
+  githubBrokerRemote = createGitHubBrokerRemote(loadGitHubGatewayConfiguration());
   return githubBrokerRemote;
 }

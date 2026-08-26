@@ -135,7 +135,7 @@ bypass the ruleset. The owner can re-verify or disable the link from the Channel
 sidebar; other Pilot members see readiness without sensitive connection configuration.
 
 The worker checks out repository content through the server-side broker into a
-credential-free local Git workspace. It publishes only the run's `relay/<AgentRun>`
+credential-free local Git workspace. It publishes only the AgentRun's `relay/<AgentRun>`
 branch and pull request after Codex completes; installation tokens remain inside the
 broker. Configure `RELAY_GITHUB_WEBHOOK_SECRET` on both Relay and the App webhook at
 `POST /api/github/webhooks` so signed deliveries can be deduplicated and correlated.

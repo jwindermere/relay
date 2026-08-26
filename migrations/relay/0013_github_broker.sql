@@ -8,6 +8,7 @@ CREATE TABLE public.github_broker_decision (
   repository_owner text NOT NULL,
   repository_name text NOT NULL,
   operation text NOT NULL,
+  phase text NOT NULL CHECK (phase IN ('decision', 'result')),
   decision text NOT NULL CHECK (decision IN ('allow', 'deny')),
   reason text NOT NULL,
   branch text,
