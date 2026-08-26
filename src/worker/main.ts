@@ -11,6 +11,7 @@ import { AgentRunGitHubWorkspaceBroker } from '../lib/server/github/workspace.js
 import { LocalCodexAgentRunProvider } from '../lib/server/provider/codex-agent-run.js';
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 import { processNextAgentRun } from './execution.js';
+import { processNextConversationTurn } from './conversation.js';
 
 await loadFileBackedEnvironment(WORKER_SECRET_ENVIRONMENT);
 
@@ -51,9 +52,12 @@ process.once('SIGTERM', shutdown);
 
 while (!draining) {
   try {
-    const result = await processNextAgentRun(pool, provider, {
+    const agentRunResult = await processNextAgentRun(pool, provider, {
       workerId, workspaceRoot, githubWorkspaceBroker
     });
+    const result = agentRunResult.kind === 'idle'
+      ? await processNextConversationTurn(pool, provider, { workerId, workspaceRoot })
+      : agentRunResult;
     if (result.kind !== 'idle') console.log(JSON.stringify({ event: 'worker.cycle', ...result }));
   } catch (error) {
     console.error(JSON.stringify({ event: 'worker.cycle.failed', error: formatError(error) }));

@@ -5,6 +5,32 @@ import {
   evaluatePilotJourneyDurableEvidence,
   type PilotJourneyObservation
 } from '../src/lib/pilot-journey.js';
+import { isConcreteEngineeringRequest } from '../src/lib/server/collaboration/conversation.js';
+
+test('ordinary and ambiguous Agent mentions remain conversational', () => {
+  for (const message of [
+    '@Alex hello',
+    '@Alex how are you?',
+    '@Alex can you explain what you do?',
+    '@Alex test'
+  ]) {
+    assert.equal(isConcreteEngineeringRequest(message, 'Alex'), false, message);
+  }
+});
+
+test('concrete repository outcomes remain engineering delegations', () => {
+  for (const message of [
+    '@Alex fix the websocket reconnect bug',
+    '@Alex please add a regression test',
+    '@Alex investigate the failing deployment check',
+    '@Alex run the tests',
+    '@Alex deploy this to production',
+    '@Alex destroy the repository',
+    '@Alex push directly to main'
+  ]) {
+    assert.equal(isConcreteEngineeringRequest(message, 'Alex'), true, message);
+  }
+});
 
 function completeObservation(): PilotJourneyObservation {
   return {

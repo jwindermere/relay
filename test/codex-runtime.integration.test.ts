@@ -6,6 +6,7 @@ import {
   type CodexAppServerSession
 } from '../src/lib/server/provider/codex-runtime.js';
 import { LocalCodexAgentRunProvider } from '../src/lib/server/provider/codex-agent-run.js';
+import type { ProviderNotification } from '../src/lib/server/provider/agent-run.js';
 
 test('the local Codex adapter uses managed device login and logout without API credentials', async () => {
   const requests: Array<{ method: string; params?: Record<string, unknown> }> = [];
@@ -182,6 +183,82 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
         }
       }
     }
+  ]);
+});
+
+test('the Codex adapter serializes conversational turns as read-only and no-network', async () => {
+  const requests: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  let session!: CodexAppServerSession;
+  const provider = new LocalCodexAgentRunProvider('codex-fixture', () => {
+    session = {
+      async initialize() {},
+      async send(method, params) {
+        requests.push({ method, params });
+        if (method === 'thread/start') return { thread: { id: 'thread-conversation' } };
+        if (method === 'turn/start') {
+          session.onNotification?.({
+            method: 'item/completed',
+            params: {
+              turnId: 'turn-conversation',
+              item: {
+                id: 'message-conversation', type: 'agentMessage', text: 'Hello there.'
+              }
+            }
+          });
+          session.onNotification?.({
+            method: 'turn/completed',
+            params: { turn: { id: 'turn-conversation', status: 'completed' } }
+          });
+          return { turn: { id: 'turn-conversation', status: 'inProgress' } };
+        }
+        return {};
+      },
+      close() {}
+    };
+    return session;
+  });
+  const notifications: ProviderNotification[] = [];
+
+  await provider.execute({
+    signal: new AbortController().signal,
+    credentialStoreReference: 'codex:test-reference',
+    workspaceDirectory: '/tmp/relay-conversation',
+    prompt: 'Hello',
+    approvalPolicy: 'onRequest',
+    sandboxPolicy: { type: 'readOnly', networkAccess: false }
+  }, {
+    async threadStarted() {},
+    async turnStarted() {},
+    async notification(notification) { notifications.push(notification); },
+    async clarificationRequested() { assert.fail('no clarification was requested'); },
+    async clarificationDelivered() { assert.fail('no clarification was delivered'); },
+    async approvalRequested() { return 'denied'; },
+    async actionRejected() {}
+  });
+
+  assert.deepEqual(requests, [
+    {
+      method: 'thread/start',
+      params: {
+        cwd: '/tmp/relay-conversation',
+        approvalPolicy: 'on-request',
+        sandbox: 'read-only',
+        serviceName: 'relay-worker'
+      }
+    },
+    {
+      method: 'turn/start',
+      params: {
+        threadId: 'thread-conversation',
+        input: [{ type: 'text', text: 'Hello' }],
+        cwd: '/tmp/relay-conversation',
+        approvalPolicy: 'on-request',
+        sandboxPolicy: { type: 'readOnly', networkAccess: false }
+      }
+    }
+  ]);
+  assert.deepEqual(notifications.map(({ method }) => method), [
+    'item/completed', 'turn/completed'
   ]);
 });
 

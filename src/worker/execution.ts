@@ -384,6 +384,11 @@ async function claimNextAgentRun(
          WHERE provider_connection_id = $1 AND id <> $2
            AND lease_expires_at > $3
            AND status NOT IN ('completed', 'failed', 'cancelled')
+       ) OR EXISTS (
+         SELECT 1 FROM public.agent_conversation_turn turn
+         JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
+         WHERE conversation.provider_connection_id = $1
+           AND turn.lease_expires_at > $3 AND turn.status = 'working'
        ) AS occupied`,
       [row.provider_connection_id, row.id, now]
     );

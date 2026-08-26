@@ -9,6 +9,12 @@ import {
 
 export type AgentMentionResult =
   | { status: 'accepted'; agentId: string; taskId: string; agentRunId: string }
+  | {
+      status: 'conversation';
+      agentId: string;
+      conversationTurnId: string;
+      turnStatus: 'queued' | 'working' | 'completed' | 'failed';
+    }
   | { status: 'rejected'; agentId: string; reason: string }
   | null;
 

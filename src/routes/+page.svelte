@@ -247,6 +247,15 @@
         {/each}
       </ul>
     {/if}
+  {:else if message.agentMention?.status === 'conversation'
+    && message.agentMention.turnStatus !== 'completed'}
+    <p class="mt-2 text-xs text-base-content/60" role="status">
+      {message.agentMention.turnStatus === 'queued'
+        ? 'Alex will reply shortly.'
+        : message.agentMention.turnStatus === 'working'
+          ? 'Alex is replying…'
+          : 'Alex could not reply.'}
+    </p>
   {:else if message.agentMention?.status === 'rejected'}
     <p class="mt-2 text-xs text-warning" role="status">{message.agentMention.reason}</p>
   {/if}

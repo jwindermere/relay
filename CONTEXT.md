@@ -46,7 +46,15 @@ A communication posted by exactly one Workspace member in exactly one Channel, e
 
 ## Accepted Agent mention
 
-An explicit Agent mention that passes the Agent, Project, provider, repository, and safety readiness checks and therefore creates a Task and initial AgentRun atomically. A Message whose mention fails readiness remains communication but creates no work.
+An explicit Agent mention that Relay accepts for either conversation or engineering delegation after the relevant Agent, Project, and provider readiness checks pass. A Message whose mention fails readiness remains communication but creates no work.
+
+## Conversational Agent mention
+
+An Accepted Agent mention intended for ordinary discussion, explanation, or an underspecified request. It creates a durable conversational turn and an attributable reply Message, but no Task, AgentRun, repository branch, or Artifact. Direct human replies in the same Thread continue the conversation without requiring another mention.
+
+## Engineering delegation
+
+An Accepted Agent mention that requests a concrete repository outcome. It creates a Task and initial AgentRun atomically after repository and safety readiness checks also pass. Ambiguous intent remains conversational until a concrete outcome is established.
 
 ## Thread
 

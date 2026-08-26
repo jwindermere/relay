@@ -54,16 +54,18 @@ export interface AgentRunProviderInput {
   prompt: string;
   providerThreadId?: string;
   approvalPolicy: 'onRequest';
-  sandboxPolicy: {
-    type: 'workspaceWrite';
-    writableRoots: string[];
-    readOnlyAccess: {
-      type: 'restricted';
-      includePlatformDefaults: boolean;
-      readableRoots: string[];
-    };
-    networkAccess: false;
-  };
+  sandboxPolicy:
+    | {
+        type: 'workspaceWrite';
+        writableRoots: string[];
+        readOnlyAccess: {
+          type: 'restricted';
+          includePlatformDefaults: boolean;
+          readableRoots: string[];
+        };
+        networkAccess: false;
+      }
+    | { type: 'readOnly'; networkAccess: false };
 }
 
 export interface AgentRunProviderObserver {

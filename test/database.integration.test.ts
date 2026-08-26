@@ -145,6 +145,8 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'user' },
       { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'public', table_name: 'agent' },
+      { table_schema: 'public', table_name: 'agent_conversation' },
+      { table_schema: 'public', table_name: 'agent_conversation_turn' },
       { table_schema: 'public', table_name: 'agent_run' },
       { table_schema: 'public', table_name: 'agent_run_cancellation_request' },
       { table_schema: 'public', table_name: 'agent_run_clarification' },

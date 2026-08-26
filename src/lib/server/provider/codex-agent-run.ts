@@ -32,6 +32,9 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
     const session = this.createSession(this.binary);
     const approvalPolicy = serializeApprovalPolicy(input.approvalPolicy);
     const sandboxPolicy = serializeSandboxPolicy(input.sandboxPolicy);
+    const sandbox = input.sandboxPolicy.type === 'workspaceWrite'
+      ? 'workspace-write'
+      : 'read-only';
     let releaseNotifications!: () => void;
     const referencesPersisted = new Promise<void>((resolve) => { releaseNotifications = resolve; });
     let notificationChain = Promise.resolve();
@@ -138,7 +141,7 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
           : {
               cwd: input.workspaceDirectory,
               approvalPolicy,
-              sandbox: 'workspace-write',
+              sandbox,
               serviceName: 'relay-worker'
             }
       ));
@@ -225,13 +228,16 @@ function serializeApprovalPolicy(
 
 function serializeSandboxPolicy(
   policy: AgentRunProviderInput['sandboxPolicy']
-): {
-  type: 'workspaceWrite';
-  writableRoots: string[];
-  networkAccess: false;
-  excludeTmpdirEnvVar: true;
-  excludeSlashTmp: true;
-} {
+):
+  | {
+      type: 'workspaceWrite';
+      writableRoots: string[];
+      networkAccess: false;
+      excludeTmpdirEnvVar: true;
+      excludeSlashTmp: true;
+    }
+  | { type: 'readOnly'; networkAccess: false } {
+  if (policy.type === 'readOnly') return policy;
   return {
     type: policy.type,
     writableRoots: policy.writableRoots,
