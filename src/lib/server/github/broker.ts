@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import {
   decideGitHubBrokerOperation,
   type GitHubBrokerDecision,
+  type GitHubBrokerDecisionReason,
   type GitHubBrokerRequest
 } from './broker-policy.js';
 
@@ -38,7 +39,7 @@ export interface GitHubBrokerRemote {
 }
 
 export class GitHubBrokerDeniedError extends Error {
-  constructor(readonly reason: string) {
+  constructor(readonly reason: GitHubBrokerDecisionReason) {
     super(`GitHub broker denied the operation: ${reason}`);
     this.name = 'GitHubBrokerDeniedError';
   }
