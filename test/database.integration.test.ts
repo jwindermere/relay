@@ -178,24 +178,24 @@ if (connectionString) {
   test('a runtime accepts additive mixed-version schemas and rejects unsafe contracts', async () => {
     await pool.query(
       `INSERT INTO public.schema_migrations (version, name, minimum_runtime_version)
-       VALUES (15, '0015_expand_only.sql', 14)`
+       VALUES (16, '0016_expand_only.sql', 15)`
     );
     await assert.doesNotReject(assertCompatibleSchema(pool));
 
     await pool.query(
       `INSERT INTO public.schema_migrations (version, name, minimum_runtime_version)
-       VALUES (16, '0016_contract.sql', 16)`
+       VALUES (17, '0017_contract.sql', 17)`
     );
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
         assert.ok(error instanceof IncompatibleSchemaError);
-        assert.match(error.message, /relay schema version 16 requires runtime schema interface 16/);
+        assert.match(error.message, /relay schema version 17 requires runtime schema interface 17/);
         assert.deepEqual(error.requiredVersions, REQUIRED_MIGRATION_STREAM_VERSIONS);
         return true;
       });
     } finally {
-      await pool.query('DELETE FROM public.schema_migrations WHERE version IN (15, 16)');
+      await pool.query('DELETE FROM public.schema_migrations WHERE version IN (16, 17)');
     }
   });
 
