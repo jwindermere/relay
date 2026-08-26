@@ -4,7 +4,7 @@ import { createHmac } from 'node:crypto';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, test } from 'node:test';
+import { after, afterEach, test } from 'node:test';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { Pool } from 'pg';
 
@@ -43,6 +43,16 @@ if (skipDatabaseTests) {
   const pool = new Pool({ connectionString });
   const workspaceRoot = await mkdtemp(join(tmpdir(), 'relay-worker-test-'));
   await migrateDatabase(pool);
+
+  afterEach(async () => {
+    // A few tests deliberately leave work queued after asserting its state. Keep those fixtures
+    // from being claimed by a later test, since the production worker selects globally by age.
+    await pool.query(
+      `UPDATE public.agent_run
+       SET available_at = 'infinity'
+       WHERE status = 'queued'`
+    );
+  });
 
   after(async () => {
     await pool.end();
@@ -662,7 +672,7 @@ if (skipDatabaseTests) {
     assert.equal(stored.rows[0]?.decision_message_id, decision.id);
     assert.equal(
       stored.rows[0]?.decided_by_workspace_member_id,
-      ids.memberAccess.membership.id
+      ids.memberWorkspaceMemberId
     );
     await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -1294,8 +1304,10 @@ if (skipDatabaseTests) {
       [
         ids.workspaceId,
         ids.runId,
-        [{ id: 'recovery', header: 'Recovery', question: 'Include restart recovery?', options: null }],
-        { recovery: ['Yes, include restart recovery.'] },
+        JSON.stringify([
+          { id: 'recovery', header: 'Recovery', question: 'Include restart recovery?', options: null }
+        ]),
+        JSON.stringify({ recovery: ['Yes, include restart recovery.'] }),
         ids.pilotMemberId
       ]
     );
@@ -1556,6 +1568,7 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     agentMemberId,
     channelId,
     pilotMemberId,
+    memberWorkspaceMemberId: secondPilotMemberId,
     linkedRepositoryId,
     ownerAccess: {
       identity: { userId, email: `${suffix}@example.com`, sessionId: `session-${suffix}` },

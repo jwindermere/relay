@@ -153,8 +153,8 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'artifact' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
-      { table_schema: 'public', table_name: 'github_connection' },
       { table_schema: 'public', table_name: 'github_broker_decision' },
+      { table_schema: 'public', table_name: 'github_connection' },
       { table_schema: 'public', table_name: 'github_webhook_delivery' },
       { table_schema: 'public', table_name: 'linked_repository' },
       { table_schema: 'public', table_name: 'message' },
@@ -672,6 +672,12 @@ if (connectionString) {
       new Headers({ cookie: ownerCookie.split(';', 1)[0] })
     );
     const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const preservedBefore = await pool.query<{ agent_rows: number; message_rows: number }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.agent WHERE workspace_id = $1) AS agent_rows,
+         (SELECT count(*)::integer FROM public.message WHERE workspace_id = $1) AS message_rows`,
+      [ownerAccess.workspace.id]
+    );
     let finishLogin: ((completion: ManagedLoginCompletion) => Promise<void>) | undefined;
     const runtimeCalls: Array<Record<string, unknown>> = [];
     const runtime: ManagedCodexRuntime = {
@@ -789,7 +795,11 @@ if (connectionString) {
          (SELECT count(*)::integer FROM public.message WHERE workspace_id = $1) AS message_rows`,
       [ownerAccess.workspace.id]
     );
-    assert.deepEqual(preserved.rows[0], { provider_rows: 1, agent_rows: 1, message_rows: 2 });
+    assert.deepEqual(preserved.rows[0], {
+      provider_rows: 1,
+      agent_rows: preservedBefore.rows[0]?.agent_rows,
+      message_rows: preservedBefore.rows[0]?.message_rows
+    });
 
     const audit = await pool.query<{ evidence: Record<string, unknown> }>(
       `SELECT evidence FROM public.audit_event
@@ -1332,12 +1342,12 @@ if (connectionString) {
           clarificationId,
           memberAccess.workspace.id,
           active.rows[0].run_id,
-          [{
+          JSON.stringify([{
             id: 'coverage',
             header: 'Coverage',
             question: 'Should the regression cover a complete web-process restart?',
             options: null
-          }],
+          }]),
           requestMessageId
         ]
       );
@@ -1751,7 +1761,14 @@ if (connectionString) {
     });
 
     const remainingSessions = await pool.query<{ count: number }>(
-      'SELECT count(*)::integer AS count FROM auth.session'
+      `SELECT count(*)::integer AS count
+       FROM auth.session
+       WHERE id = ANY($1::text[])`,
+      [[
+        httpAccess.identity.sessionId,
+        secondAccess.identity.sessionId,
+        pilotAccess.identity.sessionId
+      ]]
     );
     assert.equal(remainingSessions.rows[0]?.count, 0);
 

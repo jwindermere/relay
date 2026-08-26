@@ -93,10 +93,12 @@ export async function processNextAgentRun(
     },
     async notification(notification) {
       if (notification.method === 'turn/completed') {
-        terminalNotification = notification;
-        terminalStatus = notification.turn
-          ? mapProviderOutcomeToAgentRunStatus(notification.turn.status)
-          : terminalStatus;
+        if (!terminalNotification) {
+          terminalNotification = notification;
+          terminalStatus = notification.turn
+            ? mapProviderOutcomeToAgentRunStatus(notification.turn.status)
+            : terminalStatus;
+        }
         return;
       }
       terminalStatus = await persistProviderNotification(pool, claim, notification)

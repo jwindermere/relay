@@ -26,4 +26,10 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
-      - run: npm test
+      - run: npm run test:unit
+      - run: npm run test:prototype
+      - run: node --import tsx --test --test-force-exit --test-isolation=none test/codex-runtime.integration.test.ts
+      - run: node --import tsx --test --test-force-exit --test-isolation=none test/database.integration.test.ts
+      - run: node --import tsx --test --test-force-exit --test-isolation=none test/operations.integration.test.ts
+      - run: node --import tsx --test --test-force-exit --test-isolation=none test/worker.integration.test.ts
+        timeout-minutes: 3
