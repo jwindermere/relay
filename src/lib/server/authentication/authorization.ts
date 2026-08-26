@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 import type { RelayAuth } from '../auth.js';
 import { publishAccessRevoked } from './access-revocation.js';
@@ -25,6 +25,33 @@ export class WorkspaceAccessError extends Error {
   constructor(message = 'authenticated active Workspace membership is required') {
     super(message);
     this.name = 'WorkspaceAccessError';
+  }
+}
+
+export async function assertCurrentWorkspaceOwner(
+  client: PoolClient,
+  access: WorkspaceAccess
+): Promise<void> {
+  const current = await client.query<{ role: 'owner' | 'member' }>(
+    `SELECT membership.role
+     FROM public.workspace_membership membership
+     JOIN auth.session session ON session."userId" = membership.user_id
+     WHERE membership.workspace_id = $1
+       AND membership.id = $2
+       AND membership.user_id = $3
+       AND membership.revoked_at IS NULL
+       AND session.id = $4
+       AND session."expiresAt" > now()
+     FOR UPDATE OF membership, session`,
+    [
+      access.workspace.id,
+      access.membership.id,
+      access.identity.userId,
+      access.identity.sessionId
+    ]
+  );
+  if (current.rows[0]?.role !== 'owner') {
+    throw new WorkspaceAccessError('current Workspace owner access is required');
   }
 }
 

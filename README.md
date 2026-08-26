@@ -96,4 +96,22 @@ only an opaque local reference and safe connection state. Disabling or disconnec
 the connection makes it unavailable for new Agent execution without deleting its row,
 the Agent, Messages, or future execution history.
 
+## Linked pilot repository
+
+Configure a dedicated GitHub App with exactly these repository permissions: Metadata
+read, Contents write, and Pull requests write. Do not grant account, organisation,
+Administration, Actions, Workflows, Deployments, or other repository permissions. Set
+`RELAY_GITHUB_APP_ID` and `RELAY_GITHUB_PRIVATE_KEY`, then install the App using
+**Only select repositories** and select the one pilot repository.
+
+The active Workspace owner links the resulting installation ID in Relay and may name
+release branches in addition to the repository's server-resolved default branch.
+Relay discovers the sole selected repository through GitHub, stores stable installation,
+repository, owner, and node identities, and verifies every configured branch. Agent
+execution remains unavailable unless active rules require a pull request with at least
+one review by someone other than the last pusher, dismiss stale approvals, require at
+least one status check, block force pushes and deletion, and do not let the Relay App
+bypass the ruleset. The owner can re-verify or disable the link from the Channel
+sidebar; other Pilot members see readiness without sensitive connection configuration.
+
 See [prototype/README.md](prototype/README.md).

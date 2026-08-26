@@ -11,6 +11,7 @@ import {
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
+import { loadLinkedRepository } from '$lib/server/github/connection.js';
 import { loadProviderConnection } from '$lib/server/provider/connection.js';
 
 export async function load({ request }) {
@@ -21,16 +22,20 @@ export async function load({ request }) {
       getRelayAuth(),
       request.headers
     );
-    const [sharedChannel, providerConnection] = await Promise.all([
+    const [sharedChannel, providerConnection, linkedRepository] = await Promise.all([
       loadSharedAgentChannel(pool, access),
-      loadProviderConnection(pool, access)
+      loadProviderConnection(pool, access),
+      loadLinkedRepository(pool, access)
     ]);
     return {
       email: access.identity.email,
       role: access.membership.role,
       workspaceName: access.workspace.name,
       sharedChannel,
-      providerConnection
+      providerConnection,
+      linkedRepository,
+      readyForAgentExecution:
+        providerConnection.readyForExecution && linkedRepository.readyForAutonomousWork
     };
   } catch (error) {
     if (error instanceof WorkspaceAccessError) redirect(303, '/sign-in');

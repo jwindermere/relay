@@ -27,6 +27,15 @@ import {
   type ManagedLoginCompletion
 } from '../src/lib/server/provider/connection.js';
 import {
+  disableLinkedRepository,
+  linkGitHubRepository,
+  loadLinkedRepository,
+  requireAutonomousLinkedRepository,
+  verifyLinkedRepository,
+  type GitHubRepositoryGateway
+} from '../src/lib/server/github/connection.js';
+import type { GitHubRepositoryEvidence } from '../src/lib/server/github/protection.js';
+import {
   acceptWorkspaceInvitation,
   issueWorkspaceInvitation,
   registerInvitedAccount
@@ -92,6 +101,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
+      { table_schema: 'public', table_name: 'github_repository_connection' },
       { table_schema: 'public', table_name: 'message' },
       { table_schema: 'public', table_name: 'project' },
       { table_schema: 'public', table_name: 'project_membership' },
@@ -107,7 +117,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 5');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 6');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -117,7 +127,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 5 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 6 WHERE version = 99');
     }
   });
 
@@ -637,6 +647,178 @@ if (connectionString) {
       JSON.stringify(audit.rows),
       /provider-login-secret-reference|codex:|OWNER-CODE|api.?key/i
     );
+  });
+
+  test('only the active owner links and verifies one stable GitHub repository identity', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const ownerSignIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const ownerCookie = ownerSignIn.headers.get('set-cookie');
+    assert.equal(ownerSignIn.status, 200);
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const inspected: GitHubRepositoryEvidence[] = [];
+    let inspectionFails = false;
+    let evidence: GitHubRepositoryEvidence = {
+      appId: 17,
+      installation: {
+        id: 101,
+        repositorySelection: 'selected',
+        permissions: { metadata: 'read', contents: 'write', pullRequests: 'write' },
+        repositoryIds: [202]
+      },
+      repository: {
+        id: 202,
+        nodeId: 'R_202',
+        ownerNodeId: 'O_303',
+        owner: 'relay-owner',
+        name: 'pilot',
+        defaultBranch: 'main',
+        branches: ['main', 'release']
+      },
+      branches: ['main', 'release'].map((name, index) => ({
+        name,
+        rules: [
+          {
+            rulesetId: 401 + index,
+            type: 'pull_request',
+            parameters: {
+              requiredApprovingReviewCount: 1,
+              dismissStaleReviewsOnPush: true,
+              requireLastPushApproval: true
+            }
+          },
+          {
+            rulesetId: 401 + index,
+            type: 'required_status_checks',
+            parameters: { requiredStatusChecks: ['test'] }
+          },
+          { rulesetId: 401 + index, type: 'non_fast_forward' },
+          { rulesetId: 401 + index, type: 'deletion' }
+        ],
+        rulesets: [{ id: 401 + index, bypassActorAppIds: [] }]
+      }))
+    };
+    const gateway: GitHubRepositoryGateway = {
+      async inspect(input) {
+        if (inspectionFails) throw new Error('GitHub fixture unavailable');
+        assert.equal(input.installationId, String(evidence.installation.id));
+        assert.equal(input.repositoryId, String(evidence.repository.id));
+        inspected.push(evidence);
+        return evidence;
+      }
+    };
+
+    await assert.rejects(
+      linkGitHubRepository(pool, memberAccess, {
+        installationId: '101',
+        repositoryId: '202',
+        releaseBranches: ['release']
+      }, gateway),
+      /current Workspace owner access is required/
+    );
+
+    evidence = structuredClone(evidence);
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [17];
+    const unsafe = await linkGitHubRepository(pool, ownerAccess, {
+      installationId: '101',
+      repositoryId: '202',
+      releaseBranches: ['release']
+    }, gateway);
+    assert.equal(unsafe.state, 'linked');
+    assert.equal(unsafe.readyForAutonomousWork, false);
+    assert.deepEqual(unsafe.configuration?.repository, {
+      owner: 'relay-owner',
+      name: 'pilot',
+      defaultBranch: 'main',
+      releaseBranches: ['release']
+    });
+    await assert.rejects(
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id),
+      /verified Linked pilot repository is required/
+    );
+
+    const memberView = await loadLinkedRepository(pool, memberAccess);
+    assert.equal(memberView.state, 'linked');
+    assert.equal(memberView.readyForAutonomousWork, false);
+    assert.equal(memberView.canManage, false);
+    assert.equal(memberView.configuration, undefined);
+
+    evidence = structuredClone(evidence);
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [];
+    const verified = await verifyLinkedRepository(pool, ownerAccess, gateway);
+    assert.equal(verified.readyForAutonomousWork, true);
+    const executionRepository = await requireAutonomousLinkedRepository(
+      pool,
+      ownerAccess.workspace.id
+    );
+    assert.deepEqual(executionRepository, {
+      connectionId: verified.configuration?.connectionId,
+      installationId: '101',
+      repositoryId: '202',
+      owner: 'relay-owner',
+      name: 'pilot',
+      defaultBranch: 'main',
+      releaseBranches: ['release']
+    });
+
+    inspectionFails = true;
+    const unverifiable = await verifyLinkedRepository(pool, ownerAccess, gateway);
+    assert.equal(unverifiable.readyForAutonomousWork, false);
+    assert.deepEqual(unverifiable.configuration?.protection.failures, [
+      'GitHub repository configuration could not be verified'
+    ]);
+    await assert.rejects(
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id),
+      /verified Linked pilot repository is required/
+    );
+    inspectionFails = false;
+
+    await assert.rejects(
+      loadLinkedRepository(pool, {
+        ...ownerAccess,
+        identity: { ...ownerAccess.identity, sessionId: 'stale-session' }
+      }),
+      /current Workspace owner access is required/
+    );
+    await assert.rejects(
+      disableLinkedRepository(pool, memberAccess),
+      /current Workspace owner access is required/
+    );
+    const disabled = await disableLinkedRepository(pool, ownerAccess);
+    assert.equal(disabled.state, 'disabled');
+    assert.equal(disabled.readyForAutonomousWork, false);
+    assert.equal(inspected.length, 2);
+
+    const stored = await pool.query<{
+      installation_id: string;
+      repository_id: string;
+      repository_node_id: string;
+      owner_node_id: string;
+    }>(
+      `SELECT installation_id, repository_id, repository_node_id, owner_node_id
+       FROM public.github_repository_connection
+       WHERE workspace_id = $1`,
+      [ownerAccess.workspace.id]
+    );
+    assert.deepEqual(stored.rows, [{
+      installation_id: '101',
+      repository_id: '202',
+      repository_node_id: 'R_202',
+      owner_node_id: 'O_303'
+    }]);
   });
 
   test('revocation immediately denies protected HTTP and realtime access', async () => {

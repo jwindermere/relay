@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import {
-  WorkspaceAccessError,
+  assertCurrentWorkspaceOwner,
   type WorkspaceAccess
 } from '../authentication/authorization.js';
 
@@ -63,33 +63,6 @@ function safeConnection(
     readyForExecution: state === 'ready',
     canManage
   };
-}
-
-async function assertCurrentOwner(
-  client: PoolClient,
-  access: WorkspaceAccess
-): Promise<void> {
-  const current = await client.query<{ role: 'owner' | 'member' }>(
-    `SELECT membership.role
-     FROM public.workspace_membership membership
-     JOIN auth.session session ON session."userId" = membership.user_id
-     WHERE membership.workspace_id = $1
-       AND membership.id = $2
-       AND membership.user_id = $3
-       AND membership.revoked_at IS NULL
-       AND session.id = $4
-       AND session."expiresAt" > now()
-     FOR UPDATE OF membership, session`,
-    [
-      access.workspace.id,
-      access.membership.id,
-      access.identity.userId,
-      access.identity.sessionId
-    ]
-  );
-  if (current.rows[0]?.role !== 'owner') {
-    throw new WorkspaceAccessError('current Workspace owner access is required');
-  }
 }
 
 async function readConnection(
@@ -211,7 +184,7 @@ export async function beginProviderConnectionLogin(
 
   try {
     await client.query('BEGIN');
-    await assertCurrentOwner(client, access);
+    await assertCurrentWorkspaceOwner(client, access);
     const existing = await readConnection(client, access.workspace.id);
     if (existing) {
       if (existing.status === 'disconnecting') {
@@ -308,7 +281,7 @@ export async function disableProviderConnection(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await assertCurrentOwner(client, access);
+    await assertCurrentWorkspaceOwner(client, access);
     const disabled = await client.query<{ id: string }>(
       `UPDATE public.provider_connection
        SET status = 'disabled', status_before_login = NULL,
@@ -346,7 +319,7 @@ export async function disconnectProviderConnection(
   let connection: ProviderConnectionRow | undefined;
   try {
     await client.query('BEGIN');
-    await assertCurrentOwner(client, access);
+    await assertCurrentWorkspaceOwner(client, access);
     connection = await readConnection(client, access.workspace.id);
     if (!connection || connection.status === 'disconnected') {
       throw new ProviderConnectionError('a Codex Provider connection is required');

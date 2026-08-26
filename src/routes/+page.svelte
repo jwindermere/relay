@@ -8,6 +8,10 @@
   let providerBusy = $state(false);
   let providerMessage = $state('');
   let managedLogin = $state<{ verificationUrl: string; userCode: string } | null>(null);
+  let githubBusy = $state(false);
+  let githubMessage = $state('');
+  let githubInstallationId = $state('');
+  let githubReleaseBranches = $state('');
   let roots = $derived(data.sharedChannel.messages.filter((message) => !message.parentMessageId));
 
   function repliesFor(rootId: string) {
@@ -51,6 +55,32 @@
       providerMessage = error instanceof Error ? error.message : String(error);
     } finally {
       providerBusy = false;
+    }
+  }
+
+  async function manageGitHub(action: 'link' | 'verify' | 'disable') {
+    githubBusy = true;
+    githubMessage = '';
+    try {
+      const response = await fetch('/api/workspace/github', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(action === 'link' ? {
+          action,
+          installationId: githubInstallationId.trim(),
+          releaseBranches: githubReleaseBranches
+            .split(',')
+            .map((branch) => branch.trim())
+            .filter(Boolean)
+        } : { action })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message ?? 'GitHub repository action failed');
+      await invalidateAll();
+    } catch (error) {
+      githubMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      githubBusy = false;
     }
   }
 </script>
@@ -114,6 +144,56 @@
       {/if}
     </section>
 
+    <div class="mt-6 text-xs font-bold uppercase tracking-wider text-base-content/45">Linked repository</div>
+    <section class="mt-2 rounded-box border-base-300 border bg-base-100 p-3" aria-label="Linked pilot repository">
+      <div class="flex items-center justify-between gap-2">
+        <strong class="text-sm">GitHub</strong>
+        <span class:badge-success={data.linkedRepository.readyForAutonomousWork} class="badge badge-sm">
+          {data.linkedRepository.state.replace('_', ' ')}
+        </span>
+      </div>
+      <p class="mt-2 text-xs leading-5 text-base-content/60">
+        {data.linkedRepository.readyForAutonomousWork
+          ? 'Human-reviewed branch controls are verified.'
+          : 'Autonomous repository work is unavailable.'}
+      </p>
+      {#if data.linkedRepository.configuration}
+        <p class="mt-2 break-all text-xs font-semibold">
+          {data.linkedRepository.configuration.repository.owner}/{data.linkedRepository.configuration.repository.name}
+        </p>
+        {#if data.linkedRepository.configuration.protection.failures.length > 0}
+          <ul class="mt-2 list-disc pl-4 text-xs text-error">
+            {#each data.linkedRepository.configuration.protection.failures as failure}
+              <li>{failure}</li>
+            {/each}
+          </ul>
+        {/if}
+        {#each data.linkedRepository.configuration.protection.branches.filter((branch) => !branch.protected) as branch}
+          <div class="mt-2 text-xs text-error">
+            <strong>{branch.name}</strong>: {branch.failures.join('; ')}
+          </div>
+        {/each}
+      {/if}
+      {#if data.linkedRepository.canManage}
+        <div class="mt-3 space-y-2">
+          <input class="input input-sm w-full" bind:value={githubInstallationId} inputmode="numeric" placeholder="Installation ID" aria-label="GitHub App installation ID" />
+          <input class="input input-sm w-full" bind:value={githubReleaseBranches} placeholder="Release branches, comma separated" aria-label="Release branches" />
+          <div class="flex flex-wrap gap-2">
+            <button class="btn btn-primary btn-xs" type="button" disabled={githubBusy || !githubInstallationId.trim()} onclick={() => void manageGitHub('link')}>
+              {data.linkedRepository.state === 'not_linked' ? 'Link selected repository' : 'Replace repository'}
+            </button>
+            {#if data.linkedRepository.state !== 'not_linked'}
+              <button class="btn btn-ghost btn-xs" type="button" disabled={githubBusy} onclick={() => void manageGitHub('verify')}>Verify controls</button>
+            {/if}
+            {#if data.linkedRepository.state === 'linked'}
+              <button class="btn btn-ghost btn-xs" type="button" disabled={githubBusy} onclick={() => void manageGitHub('disable')}>Disable</button>
+            {/if}
+          </div>
+        </div>
+        {#if githubMessage}<p class="mt-2 text-xs text-error" role="alert">{githubMessage}</p>{/if}
+      {/if}
+    </section>
+
     <div class="mt-6 text-xs font-bold uppercase tracking-wider text-base-content/45">Members</div>
     <ul class="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-3 md:grid-cols-1">
       {#each data.sharedChannel.members as member}
@@ -139,9 +219,9 @@
               <strong>{member.name} · {member.status}</strong>
               <span class="mt-1 block text-xs text-base-content/65">
                 {member.status === 'idle'
-                  ? (data.providerConnection.readyForExecution
+                  ? (data.readyForAgentExecution
                     ? 'Ready for an engineering request in this Project.'
-                    : 'A ready Codex Provider connection is required before new work.')
+                    : 'A ready Codex connection and verified Linked pilot repository are required before new work.')
                   : `${member.roleLabel} is ${member.status}.`}
               </span>
             </div>
