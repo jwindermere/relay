@@ -56,7 +56,8 @@ export type GitHubBrokerDecisionReason =
   | 'invalid_commit_content'
   | 'alternate_attempt'
   | 'alternate_actor'
-  | 'repository_not_ready';
+  | 'repository_not_ready'
+  | 'unknown_agent_run';
 
 const READ_OPERATIONS = new Set<GitHubBrokerOperation>(['clone', 'read', 'fetch']);
 const WRITE_OPERATIONS = new Set<GitHubBrokerOperation>([

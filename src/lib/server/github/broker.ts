@@ -47,6 +47,7 @@ export class GitHubBrokerDeniedError extends Error {
 interface GitHubBrokerExecutionBoundary {
   policy: Parameters<typeof decideGitHubBrokerOperation>[0];
   remote: Omit<Parameters<GitHubBrokerRemote['execute']>[0], 'request' | 'assignedBranch'>;
+  decision?: GitHubBrokerDecision;
 }
 
 export async function executeGitHubBrokerBoundary(
@@ -62,7 +63,7 @@ export async function executeGitHubBrokerBoundary(
   decision: GitHubBrokerDecision;
   result: Awaited<ReturnType<GitHubBrokerRemote['execute']>>;
 }> {
-  const decision = decideGitHubBrokerOperation(boundary.policy, request);
+  const decision = boundary.decision ?? decideGitHubBrokerOperation(boundary.policy, request);
   await record(decision, 'decision');
   if (decision.decision === 'deny') throw new GitHubBrokerDeniedError(decision.reason);
   const result = await remote.execute({
@@ -83,7 +84,17 @@ export async function executeGitHubBrokerOperation(
   result: Awaited<ReturnType<GitHubBrokerRemote['execute']>>;
 }> {
   const boundary = await loadBoundary(pool, request.agentRunId);
-  if (!boundary) throw new Error('AgentRun repository context is unavailable');
+  if (!boundary) {
+    const workspaceBoundary = await loadWorkspaceBoundary(pool, request.actorWorkspaceMemberId);
+    if (!workspaceBoundary) throw new Error('AgentRun repository context is unavailable');
+    const denied: GitHubBrokerDecision = {
+      decision: 'deny',
+      reason: 'unknown_agent_run',
+      assignedBranch: `relay/${request.agentRunId}`
+    };
+    await recordDecision(pool, workspaceBoundary, request, denied, 'decision', undefined, false);
+    throw new GitHubBrokerDeniedError(denied.reason);
+  }
 
   const policyBoundary = {
     repositoryId: boundary.repository_id,
@@ -102,6 +113,7 @@ export async function executeGitHubBrokerOperation(
 
   return executeGitHubBrokerBoundary({
     policy: policyBoundary,
+    decision,
     remote: {
       installationId: boundary.installation_id,
       repositoryId: boundary.repository_id,
@@ -138,23 +150,48 @@ async function loadBoundary(pool: Pool, agentRunId: string): Promise<BrokerBound
   return result.rows[0];
 }
 
+async function loadWorkspaceBoundary(
+  pool: Pool,
+  actorWorkspaceMemberId: string
+): Promise<BrokerBoundaryRow | undefined> {
+  const result = await pool.query<BrokerBoundaryRow>(
+    `SELECT member.workspace_id, 1 AS attempt_number,
+            member.id AS agent_workspace_member_id,
+            repository.repository_id, repository.repository_owner,
+            repository.repository_name, repository.default_branch,
+            repository.release_branches, repository.ready_for_autonomous_work,
+            connection.installation_id, connection.status AS connection_status
+     FROM public.workspace_member member
+     JOIN public.linked_repository repository
+       ON repository.workspace_id = member.workspace_id
+     JOIN public.github_connection connection
+       ON connection.id = repository.github_connection_id
+      AND connection.workspace_id = member.workspace_id
+     WHERE member.id = $1`,
+    [actorWorkspaceMemberId]
+  );
+  return result.rows[0];
+}
+
 async function recordDecision(
   pool: Pool,
   boundary: BrokerBoundaryRow,
   request: GitHubBrokerRequest,
   decision: GitHubBrokerDecision,
   phase: 'decision' | 'result',
-  result?: Awaited<ReturnType<GitHubBrokerRemote['execute']>>
+  result?: Awaited<ReturnType<GitHubBrokerRemote['execute']>>,
+  knownAgentRun = true
 ): Promise<void> {
   await pool.query(
     `INSERT INTO public.github_broker_decision (
-       workspace_id, actor_workspace_member_id, agent_run_id, attempt_number,
+       workspace_id, actor_workspace_member_id, agent_run_id, requested_agent_run_id, attempt_number,
        repository_id, repository_owner, repository_name, operation, phase, decision,
        reason, branch, commit_sha, pull_request_number, evidence
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
     [
       boundary.workspace_id,
       boundary.agent_workspace_member_id,
+      knownAgentRun ? request.agentRunId : null,
       request.agentRunId,
       request.attemptNumber,
       boundary.repository_id,

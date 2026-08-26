@@ -2,7 +2,8 @@ CREATE TABLE public.github_broker_decision (
   id bigserial PRIMARY KEY,
   workspace_id text NOT NULL REFERENCES public.workspace(id) ON DELETE RESTRICT,
   actor_workspace_member_id text NOT NULL,
-  agent_run_id text NOT NULL,
+  agent_run_id text,
+  requested_agent_run_id text NOT NULL,
   attempt_number integer NOT NULL CHECK (attempt_number > 0),
   repository_id text NOT NULL,
   repository_owner text NOT NULL,
@@ -23,7 +24,7 @@ CREATE TABLE public.github_broker_decision (
 );
 
 CREATE INDEX github_broker_decision_run_idx
-  ON public.github_broker_decision(agent_run_id, decided_at, id);
+  ON public.github_broker_decision(requested_agent_run_id, decided_at, id);
 
 CREATE TABLE public.artifact (
   id text PRIMARY KEY,

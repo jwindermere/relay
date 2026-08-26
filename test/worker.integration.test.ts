@@ -75,6 +75,22 @@ if (skipDatabaseTests) {
       }),
       GitHubBrokerDeniedError
     );
+    await assert.rejects(
+      executeGitHubBrokerOperation(pool, remote, {
+        ...common,
+        attemptNumber: 2,
+        operation: 'fetch'
+      }),
+      GitHubBrokerDeniedError
+    );
+    await assert.rejects(
+      executeGitHubBrokerOperation(pool, remote, {
+        ...common,
+        agentRunId: 'unknown-github-broker-run',
+        operation: 'read'
+      }),
+      GitHubBrokerDeniedError
+    );
     assert.deepEqual(executions, ['fetch']);
 
     const secret = 'github-webhook-contract-secret';
@@ -115,11 +131,27 @@ if (skipDatabaseTests) {
        WHERE delivery.delivery_id = 'delivery-github-broker'`,
       [ids.runId]
     );
-    assert.equal(evidence.rows[0]?.decisions, 3);
+    assert.equal(evidence.rows[0]?.decisions, 4);
     assert.equal(evidence.rows[0]?.deliveries, 1);
-    assert.equal(evidence.rows[0]?.denied, 1);
+    assert.equal(evidence.rows[0]?.denied, 2);
     assert.equal(evidence.rows[0]?.correlated, ids.runId);
     assert.doesNotMatch(JSON.stringify(evidence.rows[0]?.payload), /private-value/);
+    const unknownRun = await pool.query<{
+      agent_run_id: string | null;
+      requested_agent_run_id: string;
+      decision: string;
+      reason: string;
+    }>(
+      `SELECT agent_run_id, requested_agent_run_id, decision, reason
+       FROM public.github_broker_decision
+       WHERE requested_agent_run_id = 'unknown-github-broker-run'`
+    );
+    assert.deepEqual(unknownRun.rows[0], {
+      agent_run_id: null,
+      requested_agent_run_id: 'unknown-github-broker-run',
+      decision: 'deny',
+      reason: 'unknown_agent_run'
+    });
     await assert.rejects(
       pool.query('DELETE FROM public.github_broker_decision WHERE agent_run_id = $1', [ids.runId]),
       /append-only/
