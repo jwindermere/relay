@@ -25,7 +25,7 @@ export async function observePilotJourney(
   const workspace = workspaces.rows[0]!;
   const since = options.since ?? null;
 
-  const [members, mentions, clarifications, outcomes, artifacts, duplicates] =
+  const [members, mentions, outcomes, artifacts, duplicates] =
     await Promise.all([
       pool.query<{
         id: string;
@@ -61,23 +61,8 @@ export async function observePilotJourney(
            AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [workspace.id, since]
       ),
-      pool.query<{ cross_member_clarifications: number }>(
-        `SELECT count(*)::integer AS cross_member_clarifications
-         FROM public.agent_run_clarification clarification
-         JOIN public.agent_run run
-           ON run.id = clarification.agent_run_id
-          AND run.workspace_id = clarification.workspace_id
-         JOIN public.task task
-           ON task.id = run.task_id AND task.workspace_id = run.workspace_id
-         WHERE clarification.workspace_id = $1
-           AND clarification.status = 'answered'
-           AND ($2::timestamptz IS NULL OR clarification.answered_at >= $2)
-           AND clarification.answered_by_workspace_member_id
-             <> task.requested_by_workspace_member_id`,
-        [workspace.id, since]
-      ),
       pool.query<{
-        collaborative_runs: number;
+        cross_member_collaborative_runs: number;
         cancelled_runs_with_request: number;
         failed_runs: number;
         paused_recoveries: number;
@@ -94,7 +79,17 @@ export async function observePilotJourney(
              AND EXISTS (SELECT 1 FROM public.agent_run_event event
                WHERE event.agent_run_id = run.id
                  AND event.event_type = 'run.clarification_answered')
-           )::integer AS collaborative_runs,
+             AND EXISTS (
+               SELECT 1 FROM public.agent_run_clarification clarification
+               JOIN public.task task
+                 ON task.id = run.task_id AND task.workspace_id = run.workspace_id
+               WHERE clarification.agent_run_id = run.id
+                 AND clarification.workspace_id = run.workspace_id
+                 AND clarification.status = 'answered'
+                 AND clarification.answered_by_workspace_member_id
+                   <> task.requested_by_workspace_member_id
+             )
+           )::integer AS cross_member_collaborative_runs,
            count(*) FILTER (WHERE status = 'cancelled' AND EXISTS (
              SELECT 1 FROM public.agent_run_event event
              WHERE event.agent_run_id = run.id
@@ -206,8 +201,7 @@ export async function observePilotJourney(
     })),
     acceptedMentions: mentionCounts.accepted_mentions,
     rejectedMentions: mentionCounts.rejected_mentions,
-    collaborativeRuns: outcomeCounts.collaborative_runs,
-    crossMemberClarifications: clarifications.rows[0]!.cross_member_clarifications,
+    crossMemberCollaborativeRuns: outcomeCounts.cross_member_collaborative_runs,
     cancelledRunsWithRequest: outcomeCounts.cancelled_runs_with_request,
     failedRuns: outcomeCounts.failed_runs,
     pausedRecoveries: outcomeCounts.paused_recoveries,

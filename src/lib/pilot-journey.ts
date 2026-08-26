@@ -8,8 +8,7 @@ export interface PilotJourneyObservation {
   }>;
   acceptedMentions: number;
   rejectedMentions: number;
-  collaborativeRuns: number;
-  crossMemberClarifications: number;
+  crossMemberCollaborativeRuns: number;
   cancelledRunsWithRequest: number;
   failedRuns: number;
   pausedRecoveries: number;
@@ -66,12 +65,12 @@ export function evaluatePilotJourneyDurableEvidence(
     },
     {
       name: 'collaborative execution',
-      passed: observation.collaborativeRuns > 0,
+      passed: observation.crossMemberCollaborativeRuns > 0,
       failure: 'The pilot has not exercised queued, working, and clarification states.'
     },
     {
       name: 'cross-member clarification',
-      passed: observation.crossMemberClarifications > 0,
+      passed: observation.crossMemberCollaborativeRuns > 0,
       failure: "No Pilot member has answered another member's AgentRun clarification."
     },
     {

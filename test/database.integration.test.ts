@@ -1240,7 +1240,7 @@ if (connectionString) {
     const future = await observePilotJourney(pool, { since: new Date('2999-01-01T00:00:00Z') });
     assert.equal(future.acceptedMentions, 0);
     assert.equal(future.rejectedMentions, 0);
-    assert.equal(future.collaborativeRuns, 0);
+    assert.equal(future.crossMemberCollaborativeRuns, 0);
     assert.equal(future.cancelledRunsWithRequest, 0);
     assert.equal(future.failedRuns, 0);
     assert.equal(future.pausedRecoveries, 0);

@@ -25,8 +25,7 @@ function completeObservation(): PilotJourneyObservation {
     ],
     acceptedMentions: 2,
     rejectedMentions: 1,
-    collaborativeRuns: 1,
-    crossMemberClarifications: 1,
+    crossMemberCollaborativeRuns: 1,
     cancelledRunsWithRequest: 1,
     failedRuns: 1,
     pausedRecoveries: 1,
@@ -89,8 +88,7 @@ test('pull-request evidence must match its Linked pilot repository and AgentRun 
 test('the report requires the collaboration and recovery lifecycle exercised by the pilot', () => {
   const observation = completeObservation();
   observation.rejectedMentions = 0;
-  observation.collaborativeRuns = 0;
-  observation.crossMemberClarifications = 0;
+  observation.crossMemberCollaborativeRuns = 0;
   observation.cancelledRunsWithRequest = 0;
   observation.failedRuns = 0;
   observation.pausedRecoveries = 0;
