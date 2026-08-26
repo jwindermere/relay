@@ -32,7 +32,7 @@ export function attachAuthenticatedRealtime(
   const realtime = new WebSocketServer({ noServer: true });
   const socketsByUser = new Map<string, Set<WebSocket>>();
   const socketsBySession = new Map<string, Set<WebSocket>>();
-  const unsubscribe = subscribeToAccessRevocations(pool, (revocation) => {
+  const subscriptionReady = subscribeToAccessRevocations(pool, (revocation) => {
     const sockets = revocation.kind === 'session'
       ? socketsBySession.get(revocation.sessionId)
       : socketsByUser.get(revocation.userId);
@@ -42,7 +42,7 @@ export function attachAuthenticatedRealtime(
   });
 
   realtime.once('close', () => {
-    void unsubscribe.then((stop) => stop());
+    void subscriptionReady.then((unsubscribe) => unsubscribe());
   });
 
   server.on('upgrade', async (request, socket, head) => {
@@ -54,7 +54,7 @@ export function attachAuthenticatedRealtime(
 
     const headers = requestHeaders(request);
     try {
-      await unsubscribe;
+      await subscriptionReady;
       const access = await authorizeWorkspaceRequest(pool, auth, headers);
       realtime.handleUpgrade(request, socket, head, (websocket) => {
         realtime.emit('connection', websocket, request);
