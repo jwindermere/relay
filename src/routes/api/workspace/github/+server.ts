@@ -41,31 +41,45 @@ export async function POST({ request }) {
     if (requestInput.action === 'link') {
       if (
         Object.keys(requestInput).some((key) =>
-          !['action', 'installationId', 'releaseBranches'].includes(key)
+          !['action', 'installationId', 'releaseBranches', 'confirmNoAppBypass'].includes(key)
         )
         || typeof requestInput.installationId !== 'string'
         || !Array.isArray(requestInput.releaseBranches)
         || requestInput.releaseBranches.some((branch) => typeof branch !== 'string')
+        || typeof requestInput.confirmNoAppBypass !== 'boolean'
       ) {
         throw new LinkedRepositoryError(
-          'link requires only a GitHub installation ID and release branch names'
+          'link requires a GitHub installation ID, release branch names, and bypass confirmation'
         );
       }
       return json({
         connection: await linkGitHubRepository(pool, access, {
           installationId: requestInput.installationId,
-          releaseBranches: requestInput.releaseBranches as string[]
+          releaseBranches: requestInput.releaseBranches as string[],
+          confirmNoAppBypass: requestInput.confirmNoAppBypass
         }, getGitHubRepositoryGateway())
       });
     }
 
+    if (requestInput.action === 'verify') {
+      if (
+        Object.keys(requestInput).some((key) => !['action', 'confirmNoAppBypass'].includes(key))
+        || (requestInput.confirmNoAppBypass !== undefined
+          && typeof requestInput.confirmNoAppBypass !== 'boolean')
+      ) {
+        throw new LinkedRepositoryError('invalid GitHub repository verification request');
+      }
+      return json({
+        connection: await verifyLinkedRepository(
+          pool,
+          access,
+          getGitHubRepositoryGateway(),
+          { confirmNoAppBypass: requestInput.confirmNoAppBypass === true }
+        )
+      });
+    }
     if (Object.keys(requestInput).some((key) => key !== 'action')) {
       throw new LinkedRepositoryError('invalid GitHub repository request');
-    }
-    if (requestInput.action === 'verify') {
-      return json({
-        connection: await verifyLinkedRepository(pool, access, getGitHubRepositoryGateway())
-      });
     }
     if (requestInput.action === 'disable') {
       return json({ connection: await disableGitHubConnection(pool, access) });

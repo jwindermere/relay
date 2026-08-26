@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  createRulesetBypassAttestations,
   evaluateRepositoryProtection,
   type GitHubRepositoryEvidence
 } from '../src/lib/server/github/protection.js';
@@ -135,4 +136,47 @@ test('unknown or duplicated release branches fail closed', () => {
     'release branches must be unique',
     'configured branch missing does not exist in the linked repository'
   ]);
+});
+
+test('owner bypass attestation is bound to the inspected ruleset version', () => {
+  const evidence = structuredClone(protectedRepository);
+  const ruleset = evidence.branches[0]!.rulesets[0]! as typeof evidence.branches[0]['rulesets'][number]
+    & { updatedAt?: string };
+  ruleset.bypassActorAppIds = undefined;
+  ruleset.updatedAt = '2026-08-26T19:00:00Z';
+
+  assert.deepEqual(evaluateRepositoryProtection(evidence, []), {
+    readyForAutonomousWork: false,
+    failures: [],
+    branches: [{
+      name: 'main',
+      protected: false,
+      failures: ['ruleset bypass actors could not be verified']
+    }]
+  });
+
+  const attestation = [{ rulesetId: 401, rulesetUpdatedAt: '2026-08-26T19:00:00Z' }];
+  assert.deepEqual(createRulesetBypassAttestations(evidence), attestation);
+  assert.deepEqual(evaluateRepositoryProtection(evidence, [], attestation), {
+    readyForAutonomousWork: true,
+    failures: [],
+    branches: [{ name: 'main', protected: true, failures: [] }],
+    bypassAttestations: attestation
+  });
+
+  ruleset.updatedAt = '2026-08-26T20:00:00Z';
+  assert.equal(
+    evaluateRepositoryProtection(evidence, [], attestation).readyForAutonomousWork,
+    false
+  );
+
+  ruleset.bypassActorAppIds = [17];
+  assert.deepEqual(createRulesetBypassAttestations(evidence), []);
+  assert.equal(
+    evaluateRepositoryProtection(evidence, [], [{
+      rulesetId: 401,
+      rulesetUpdatedAt: '2026-08-26T20:00:00Z'
+    }]).readyForAutonomousWork,
+    false
+  );
 });

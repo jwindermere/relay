@@ -6,15 +6,21 @@ import {
   type WorkspaceAccess
 } from '../authentication/authorization.js';
 import {
+  createRulesetBypassAttestations,
   evaluateRepositoryProtection,
   type GitHubRepositoryEvidence,
-  type RepositoryProtectionResult
+  type RepositoryProtectionResult,
+  type RulesetBypassAttestation
 } from './protection.js';
 
 export interface RepositoryInspectionInput {
   installationId: string;
   repositoryId?: string;
   releaseBranches: string[];
+}
+
+export interface RepositoryLinkInput extends RepositoryInspectionInput {
+  confirmNoAppBypass?: boolean;
 }
 
 export interface GitHubRepositoryGateway {
@@ -167,7 +173,8 @@ async function withCurrentOwner<T>(
 
 async function inspectRepository(
   gateway: GitHubRepositoryGateway,
-  input: RepositoryInspectionInput
+  input: RepositoryInspectionInput,
+  bypassAttestations: RulesetBypassAttestation[] = []
 ): Promise<{ evidence: GitHubRepositoryEvidence; protection: RepositoryProtectionResult }> {
   let evidence: GitHubRepositoryEvidence;
   try {
@@ -183,7 +190,7 @@ async function inspectRepository(
   }
   return {
     evidence,
-    protection: evaluateRepositoryProtection(evidence, input.releaseBranches)
+    protection: evaluateRepositoryProtection(evidence, input.releaseBranches, bypassAttestations)
   };
 }
 
@@ -202,12 +209,21 @@ export async function loadLinkedRepository(
 export async function linkGitHubRepository(
   pool: Pool,
   access: WorkspaceAccess,
-  input: RepositoryInspectionInput,
+  input: RepositoryLinkInput,
   gateway: GitHubRepositoryGateway
 ): Promise<SafeLinkedRepository> {
   validateLinkInput(input);
   await withCurrentOwner(pool, access, async () => undefined);
-  const { evidence, protection } = await inspectRepository(gateway, input);
+  const initialInspection = await inspectRepository(gateway, input);
+  const bypassAttestations = input.confirmNoAppBypass
+    ? createRulesetBypassAttestations(initialInspection.evidence)
+    : [];
+  const evidence = initialInspection.evidence;
+  const protection = evaluateRepositoryProtection(
+    evidence,
+    input.releaseBranches,
+    bypassAttestations
+  );
 
   return withCurrentOwner(pool, access, async (client) => {
     const project = await client.query<{ id: string }>(
@@ -291,7 +307,8 @@ export async function linkGitHubRepository(
          jsonb_build_object(
            'installationId', $6::text,
            'repositoryId', $7::text,
-           'readyForAutonomousWork', $8::boolean
+           'readyForAutonomousWork', $8::boolean,
+           'bypassAttestations', $9::jsonb
          ))`,
       [
         access.workspace.id,
@@ -301,7 +318,8 @@ export async function linkGitHubRepository(
         linkedRepositoryId,
         input.installationId,
         String(evidence.repository.id),
-        protection.readyForAutonomousWork
+        protection.readyForAutonomousWork,
+        JSON.stringify(bypassAttestations)
       ]
     );
     return safeConnection(await readConnection(client, access.workspace.id), true);
@@ -311,7 +329,8 @@ export async function linkGitHubRepository(
 export async function verifyLinkedRepository(
   pool: Pool,
   access: WorkspaceAccess,
-  gateway: GitHubRepositoryGateway
+  gateway: GitHubRepositoryGateway,
+  options: { confirmNoAppBypass?: boolean } = {}
 ): Promise<SafeLinkedRepository> {
   const current = await withCurrentOwner(pool, access, async (client) => {
     const row = await readConnection(client, access.workspace.id);
@@ -325,7 +344,18 @@ export async function verifyLinkedRepository(
   };
   let inspected: { evidence: GitHubRepositoryEvidence; protection: RepositoryProtectionResult };
   try {
-    inspected = await inspectRepository(gateway, input);
+    const initialInspection = await inspectRepository(gateway, input);
+    const bypassAttestations = options.confirmNoAppBypass
+      ? createRulesetBypassAttestations(initialInspection.evidence)
+      : current.verification.bypassAttestations ?? [];
+    inspected = {
+      evidence: initialInspection.evidence,
+      protection: evaluateRepositoryProtection(
+        initialInspection.evidence,
+        input.releaseBranches,
+        bypassAttestations
+      )
+    };
   } catch {
     const protection: RepositoryProtectionResult = {
       readyForAutonomousWork: false,
@@ -334,7 +364,10 @@ export async function verifyLinkedRepository(
         name,
         protected: false,
         failures: ['branch controls could not be verified']
-      }))
+      })),
+      ...(current.verification.bypassAttestations
+        ? { bypassAttestations: current.verification.bypassAttestations }
+        : {})
     };
     return withCurrentOwner(pool, access, async (client) => {
       const updated = await client.query<{ id: string }>(
@@ -413,13 +446,17 @@ export async function verifyLinkedRepository(
          event_type, subject_type, subject_id, evidence
        ) VALUES ($1, $2, $3, 'github.repository.verified',
          'linked_repository', $4,
-         jsonb_build_object('readyForAutonomousWork', $5::boolean))`,
+         jsonb_build_object(
+           'readyForAutonomousWork', $5::boolean,
+           'bypassAttestations', $6::jsonb
+         ))`,
       [
         access.workspace.id,
         access.identity.userId,
         access.membership.id,
         updated.rows[0].id,
-        updated.rows[0].ready_for_autonomous_work
+        updated.rows[0].ready_for_autonomous_work,
+        JSON.stringify(protection.bypassAttestations ?? [])
       ]
     );
     return safeConnection(await readConnection(client, access.workspace.id), true);
@@ -477,7 +514,11 @@ export async function requireAutonomousLinkedRepository(
   let evidence: GitHubRepositoryEvidence | undefined;
   let protection: RepositoryProtectionResult;
   try {
-    const inspected = await inspectRepository(gateway, input);
+    const inspected = await inspectRepository(
+      gateway,
+      input,
+      row.verification.bypassAttestations ?? []
+    );
     evidence = inspected.evidence;
     protection = inspected.protection;
   } catch {

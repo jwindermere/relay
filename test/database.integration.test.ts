@@ -884,8 +884,14 @@ if (connectionString) {
     assert.equal(memberView.configuration, undefined);
 
     evidence = structuredClone(evidence);
-    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [];
-    const verified = await verifyLinkedRepository(pool, ownerAccess, gateway);
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = undefined;
+    evidence.branches[0]!.rulesets[0]!.updatedAt = '2026-08-26T19:00:00Z';
+    const verified = await verifyLinkedRepository(
+      pool,
+      ownerAccess,
+      gateway,
+      { confirmNoAppBypass: true }
+    );
     assert.equal(verified.readyForAutonomousWork, true);
     const executionRepository = await requireAutonomousLinkedRepository(
       pool,
@@ -904,6 +910,23 @@ if (connectionString) {
     });
 
     evidence = structuredClone(evidence);
+    evidence.branches[0]!.rulesets[0]!.updatedAt = '2026-08-26T20:00:00Z';
+    await assert.rejects(
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
+      /verified Linked pilot repository is required/
+    );
+    assert.equal((await loadLinkedRepository(pool, ownerAccess)).readyForAutonomousWork, false);
+    assert.equal(
+      (await verifyLinkedRepository(
+        pool,
+        ownerAccess,
+        gateway,
+        { confirmNoAppBypass: true }
+      )).readyForAutonomousWork,
+      true
+    );
+
+    evidence = structuredClone(evidence);
     evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [17];
     await assert.rejects(
       requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
@@ -911,7 +934,7 @@ if (connectionString) {
     );
     assert.equal((await loadLinkedRepository(pool, ownerAccess)).readyForAutonomousWork, false);
     evidence = structuredClone(evidence);
-    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [];
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = undefined;
     assert.equal(
       (await verifyLinkedRepository(pool, ownerAccess, gateway)).readyForAutonomousWork,
       true
@@ -948,7 +971,7 @@ if (connectionString) {
     assert.equal(disabledVerification.linkState, 'linked');
     assert.equal(disabledVerification.githubConnectionState, 'disabled');
     assert.equal(disabledVerification.readyForAutonomousWork, false);
-    assert.equal(inspected.length, 6);
+    assert.equal(inspected.length, 8);
 
     const stored = await pool.query<{
       installation_id: string;

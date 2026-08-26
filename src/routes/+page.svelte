@@ -22,6 +22,7 @@
   let githubMessage = $state('');
   let githubInstallationId = $state('');
   let githubReleaseBranches = $state('');
+  let githubNoBypassConfirmed = $state(false);
   let realtimeRuns = $state<VisibleAgentRuns>({});
   let realtimeMessages = $state<typeof data.sharedChannel.messages>([]);
   let reconciliationActive: Promise<void> | null = null;
@@ -197,14 +198,19 @@
         body: JSON.stringify(action === 'link' ? {
           action,
           installationId: githubInstallationId.trim(),
+          confirmNoAppBypass: githubNoBypassConfirmed,
           releaseBranches: githubReleaseBranches
             .split(',')
             .map((branch) => branch.trim())
             .filter(Boolean)
+        } : action === 'verify' ? {
+          action,
+          confirmNoAppBypass: githubNoBypassConfirmed
         } : { action })
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.message ?? 'GitHub repository action failed');
+      githubNoBypassConfirmed = false;
       await invalidateAll();
     } catch (error) {
       githubMessage = error instanceof Error ? error.message : String(error);
@@ -339,8 +345,12 @@
         <div class="mt-3 space-y-2">
           <input class="input input-sm w-full" bind:value={githubInstallationId} inputmode="numeric" placeholder="Installation ID" aria-label="GitHub App installation ID" />
           <input class="input input-sm w-full" bind:value={githubReleaseBranches} placeholder="Release branches, comma separated" aria-label="Release branches" />
+          <label class="flex items-start gap-2 text-xs leading-5 text-base-content/70">
+            <input class="checkbox checkbox-xs mt-1" type="checkbox" bind:checked={githubNoBypassConfirmed} />
+            <span>I confirmed in the current GitHub ruleset that the Relay App is not a bypass actor.</span>
+          </label>
           <div class="flex flex-wrap gap-2">
-            <button class="btn btn-primary btn-xs" type="button" disabled={githubBusy || !githubInstallationId.trim()} onclick={() => void manageGitHub('link')}>
+            <button class="btn btn-primary btn-xs" type="button" disabled={githubBusy || !githubInstallationId.trim() || !githubNoBypassConfirmed} onclick={() => void manageGitHub('link')}>
               {data.linkedRepository.linkState === 'not_linked' ? 'Link selected repository' : 'Replace repository'}
             </button>
             {#if data.linkedRepository.linkState === 'linked'}

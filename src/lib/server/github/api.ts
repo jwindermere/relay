@@ -212,6 +212,7 @@ export function createGitHubRepositoryGateway(
         const rulesets = await Promise.all(rulesetIds.map(async (rulesetId) => {
           const ruleset = await request<{
             id?: unknown;
+            updated_at?: unknown;
             bypass_actors?: Array<{ actor_type?: unknown; actor_id?: unknown }>;
           }>(
             `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/rulesets/${rulesetId}?includes_parents=true`,
@@ -219,6 +220,7 @@ export function createGitHubRepositoryGateway(
           );
           return {
             id: requiredNumber(ruleset.id, 'ruleset ID'),
+            updatedAt: requiredString(ruleset.updated_at, 'ruleset updated time'),
             bypassActorAppIds: Array.isArray(ruleset.bypass_actors)
               ? ruleset.bypass_actors
                 .filter(({ actor_type: actorType }) => actorType === 'Integration')

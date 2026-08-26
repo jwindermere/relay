@@ -56,11 +56,12 @@ test('GitHub gateway resolves repository identity and branch rules server-side',
     ]],
     ['/repos/relay-owner/pilot/rulesets/401?includes_parents=true', {
       id: 401,
+      updated_at: '2026-08-26T19:00:00Z',
       bypass_actors: [{ actor_type: 'Integration', actor_id: 999 }]
     }],
     ['/repos/relay-owner/pilot/rulesets/402?includes_parents=true', {
       id: 402,
-      bypass_actors: []
+      updated_at: '2026-08-26T19:05:00Z'
     }]
   ]);
   let tokenRequest = 0;
@@ -94,8 +95,16 @@ test('GitHub gateway resolves repository identity and branch rules server-side',
     requireLastPushApproval: true,
     requiredStatusChecks: undefined
   });
-  assert.deepEqual(evidence.branches[0]?.rulesets, [{ id: 401, bypassActorAppIds: [999] }]);
-  assert.deepEqual(evidence.branches[1]?.rulesets, [{ id: 402, bypassActorAppIds: [] }]);
+  assert.deepEqual(evidence.branches[0]?.rulesets, [{
+    id: 401,
+    updatedAt: '2026-08-26T19:00:00Z',
+    bypassActorAppIds: [999]
+  }]);
+  assert.deepEqual(evidence.branches[1]?.rulesets, [{
+    id: 402,
+    updatedAt: '2026-08-26T19:05:00Z',
+    bypassActorAppIds: undefined
+  }]);
 
   const tokenBodies = requests
     .filter(({ url }) => url.endsWith('/access_tokens'))
