@@ -170,9 +170,37 @@ if (connectionString) {
     const httpAccess = await authorizeWorkspaceRequest(pool, auth, requestHeaders);
     assert.equal(httpAccess.membership.role, 'owner');
     await assert.rejects(
+      revokeWorkspaceMembership(
+        pool,
+        { ...httpAccess, identity: { ...httpAccess.identity, sessionId: 'stale-session' } },
+        'browser-supplied-user-from-another-workspace'
+      ),
+      /current Workspace owner access is required/
+    );
+    await assert.rejects(
       revokeWorkspaceMembership(pool, httpAccess, 'browser-supplied-user-from-another-workspace'),
       /active Workspace membership was not found/
     );
+
+    await pool.query(
+      `INSERT INTO auth."user" (
+         id, name, email, "emailVerified", "createdAt", "updatedAt"
+       ) VALUES ('pilot-member', 'Pilot member', 'member@example.com', true, now(), now())`
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_membership (workspace_id, user_id, role)
+       VALUES ($1, 'pilot-member', 'member')`,
+      [httpAccess.workspace.id]
+    );
+    await pool.query(
+      `INSERT INTO auth.session (
+         id, "expiresAt", token, "createdAt", "updatedAt", "userId"
+       ) VALUES (
+         'pilot-member-session', now() + interval '1 day', 'member-secret-session-token',
+         now(), now(), 'pilot-member'
+       )`
+    );
+    await revokeWorkspaceMembership(pool, httpAccess, 'pilot-member');
 
     const server = createServer();
     const realtime = attachAuthenticatedRealtime(server, pool, auth);
@@ -188,6 +216,9 @@ if (connectionString) {
     });
     assert.deepEqual(JSON.parse(ready), { type: 'ready', workspaceId: httpAccess.workspace.id });
 
+    const realtimeClosed = new Promise<number>((resolve) => {
+      websocket.once('close', (code) => resolve(code));
+    });
     const signOutResponse = await auth.handler(new Request('http://relay.test/api/auth/sign-out', {
       method: 'POST',
       headers: {
@@ -202,10 +233,6 @@ if (connectionString) {
       /authenticated active Workspace membership is required/
     );
 
-    const realtimeClosed = new Promise<number>((resolve) => {
-      websocket.once('close', (code) => resolve(code));
-    });
-    websocket.send('protected follow-up');
     assert.equal(await realtimeClosed, 1008);
     realtime.close();
     await new Promise<void>((resolve, reject) => {
@@ -222,6 +249,10 @@ if (connectionString) {
     );
     assert.ok(audit.rows.some(({ event_type }) => event_type === 'authentication.session.created'));
     assert.ok(audit.rows.some(({ event_type }) => event_type === 'authentication.session.revoked'));
-    assert.doesNotMatch(JSON.stringify(audit.rows), /correct horse|better-auth\.session_token/i);
+    assert.ok(audit.rows.some(({ event_type }) => event_type === 'membership.revoked'));
+    assert.doesNotMatch(
+      JSON.stringify(audit.rows),
+      /correct horse|better-auth\.session_token|member-secret-session-token/i
+    );
   });
 }

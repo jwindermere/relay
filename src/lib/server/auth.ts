@@ -34,6 +34,10 @@ async function recordSessionAudit(
   );
 }
 
+async function notifyAccessRevoked(pool: Pool, userId: string): Promise<void> {
+  await pool.query(`SELECT pg_notify('relay_access_revoked', $1)`, [userId]);
+}
+
 export function createRelayAuth({ pool, baseURL, secret }: RelayAuthOptions) {
   return betterAuth({
     database: pool,
@@ -52,8 +56,9 @@ export function createRelayAuth({ pool, baseURL, secret }: RelayAuthOptions) {
           }
         },
         delete: {
-          before: async (session) => {
+          after: async (session) => {
             await recordSessionAudit(pool, session, 'authentication.session.revoked');
+            await notifyAccessRevoked(pool, session.userId);
           }
         }
       }

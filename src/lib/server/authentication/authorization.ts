@@ -81,6 +81,22 @@ export async function revokeWorkspaceMembership(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const currentActor = await client.query<{ role: 'owner' | 'member' }>(
+      `SELECT m.role
+       FROM public.workspace_membership m
+       JOIN auth.session s ON s."userId" = m.user_id
+       WHERE m.workspace_id = $1
+         AND m.user_id = $2
+         AND m.revoked_at IS NULL
+         AND s.id = $3
+         AND s."expiresAt" > now()
+       FOR UPDATE OF m, s`,
+      [actor.workspace.id, actor.identity.userId, actor.identity.sessionId]
+    );
+    if (currentActor.rows[0]?.role !== 'owner') {
+      throw new WorkspaceAccessError('current Workspace owner access is required');
+    }
+
     const target = await client.query<{ role: 'owner' | 'member' }>(
       `SELECT role
        FROM public.workspace_membership
@@ -110,6 +126,16 @@ export async function revokeWorkspaceMembership(
     );
     if (!revoked.rows[0]) throw new WorkspaceAccessError('active Workspace membership was not found');
 
+    await client.query(
+      `INSERT INTO public.audit_event (
+         workspace_id, actor_user_id, event_type, subject_type, subject_id, evidence
+       )
+       SELECT $1, $2, 'authentication.session.revoked', 'session', id,
+         jsonb_build_object('userId', $3::text, 'revokedByUserId', $2::text)
+       FROM auth.session
+       WHERE "userId" = $3`,
+      [actor.workspace.id, actor.identity.userId, targetUserId]
+    );
     await client.query('DELETE FROM auth.session WHERE "userId" = $1', [targetUserId]);
     await client.query(
       `INSERT INTO public.audit_event (
@@ -118,6 +144,7 @@ export async function revokeWorkspaceMembership(
          jsonb_build_object('targetUserId', $3::text, 'sessionsRevoked', true))`,
       [actor.workspace.id, actor.identity.userId, targetUserId]
     );
+    await client.query(`SELECT pg_notify('relay_access_revoked', $1)`, [targetUserId]);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
