@@ -148,9 +148,12 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'agent_run_clarification' },
       { table_schema: 'public', table_name: 'agent_run_event' },
       { table_schema: 'public', table_name: 'approval' },
+      { table_schema: 'public', table_name: 'artifact' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
       { table_schema: 'public', table_name: 'github_connection' },
+      { table_schema: 'public', table_name: 'github_broker_decision' },
+      { table_schema: 'public', table_name: 'github_webhook_delivery' },
       { table_schema: 'public', table_name: 'linked_repository' },
       { table_schema: 'public', table_name: 'message' },
       { table_schema: 'public', table_name: 'notification_outbox' },
@@ -169,7 +172,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 12');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 13');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -179,7 +182,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 12 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 13 WHERE version = 99');
     }
   });
 

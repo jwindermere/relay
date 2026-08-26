@@ -20,6 +20,10 @@ import {
   appendAgentRunEvent,
   type AgentRunEventInput
 } from '../lib/server/provider/agent-run-events.js';
+import type {
+  AgentRunGitHubWorkspaceBroker,
+  PreparedAgentRunRepository
+} from '../lib/server/github/workspace.js';
 
 export interface WorkerExecutionOptions {
   workerId: string;
@@ -28,6 +32,7 @@ export interface WorkerExecutionOptions {
   retryDelayMs?: number;
   cancellationPollMs?: number;
   now?: () => Date;
+  githubWorkspaceBroker?: AgentRunGitHubWorkspaceBroker;
 }
 
 export type WorkerCycleResult =
@@ -74,6 +79,7 @@ export async function processNextAgentRun(
   if (updated.rowCount !== 1) throw new Error('AgentRun execution lease was lost');
 
   let terminalStatus: AgentRunStatus | undefined;
+  let terminalNotification: ProviderNotification | undefined;
   const observer: AgentRunProviderObserver = {
     async threadStarted(threadId) {
       await persistProviderThread(pool, claim, threadId);
@@ -82,6 +88,13 @@ export async function processNextAgentRun(
       await persistProviderTurn(pool, claim, turnId);
     },
     async notification(notification) {
+      if (notification.method === 'turn/completed') {
+        terminalNotification = notification;
+        terminalStatus = notification.turn
+          ? mapProviderOutcomeToAgentRunStatus(notification.turn.status)
+          : terminalStatus;
+        return;
+      }
       terminalStatus = await persistProviderNotification(pool, claim, notification)
         ?? terminalStatus;
     },
@@ -123,8 +136,15 @@ export async function processNextAgentRun(
       .catch(() => executionAbort.abort());
   }, Math.max(250, Math.floor(leaseDurationMs / 3)));
   renewal.unref();
+  let preparedRepository: PreparedAgentRunRepository | undefined;
+  let repositoryPublicationFailed = false;
 
   try {
+    if (options.githubWorkspaceBroker) {
+      preparedRepository = claim.provider_thread_id
+        ? await options.githubWorkspaceBroker.resume(claim.id)
+        : await options.githubWorkspaceBroker.prepare(claim.id, workspaceDirectory);
+    }
     if (claim.resume_clarification_id) {
       await pool.query(
         `UPDATE public.agent_run_clarification
@@ -138,7 +158,9 @@ export async function processNextAgentRun(
       cancellationSignal: cancellationAbort.signal,
       credentialStoreReference: claim.credential_store_reference,
       workspaceDirectory,
-      prompt: claim.provider_input,
+      prompt: options.githubWorkspaceBroker
+        ? `${claim.provider_input}\n\nThe repository is already checked out on your assigned branch in this credential-free workspace. Make the requested changes here; Relay will publish the branch and pull request after your turn. Do not configure a Git remote or request repository credentials.`
+        : claim.provider_input,
       ...(claim.resume_clarification_id && claim.provider_thread_id
         ? { providerThreadId: claim.provider_thread_id }
         : {}),
@@ -154,6 +176,26 @@ export async function processNextAgentRun(
         networkAccess: false
       }
     }, observer);
+
+    if (terminalNotification?.turn) {
+      if (terminalNotification.turn.status === 'completed' && options.githubWorkspaceBroker) {
+        try {
+          if (!preparedRepository) {
+            throw new Error('AgentRun repository preparation boundary is unavailable');
+          }
+          await options.githubWorkspaceBroker.publish(
+            claim.id,
+            workspaceDirectory,
+            preparedRepository
+          );
+        } catch (error) {
+          repositoryPublicationFailed = true;
+          throw error;
+        }
+      }
+      terminalStatus = await persistProviderNotification(pool, claim, terminalNotification)
+        ?? terminalStatus;
+    }
 
     if (!terminalStatus) {
       if (cancellationAbort.signal.aborted) {
@@ -203,7 +245,9 @@ export async function processNextAgentRun(
       status: 'failed',
       summary: 'Codex execution failed',
       evidence: {
-        reason: error instanceof AgentRunProviderError ? error.code : 'provider_failed'
+        reason: repositoryPublicationFailed
+          ? 'github_publication_failed'
+          : error instanceof AgentRunProviderError ? error.code : 'provider_failed'
       },
       completed: true,
       clearActiveTurn: true
@@ -434,6 +478,16 @@ async function recoverAgentRun(
       });
       return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
     }
+    if (reconciliation.outcome === 'completed'
+      && await hasUnresolvedRepositoryPublication(pool, claim.id)) {
+      await appendRunEvent(pool, claim, {
+        eventType: 'run.paused',
+        status: 'paused',
+        summary: 'Repository publication outcome is uncertain; human review is required',
+        evidence: { reason: 'unresolved_github_publication' }
+      });
+      return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
+    }
 
     const status = mapProviderOutcomeToAgentRunStatus(reconciliation.outcome);
     await appendRunEvent(pool, claim, {
@@ -458,6 +512,18 @@ async function recoverAgentRun(
     });
     return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
   }
+}
+
+async function hasUnresolvedRepositoryPublication(pool: Pool, agentRunId: string): Promise<boolean> {
+  const result = await pool.query<{ broker_started: boolean; artifact_recorded: boolean }>(
+    `SELECT
+       EXISTS (SELECT 1 FROM public.github_broker_decision WHERE agent_run_id = $1)
+         AS broker_started,
+       EXISTS (SELECT 1 FROM public.artifact WHERE agent_run_id = $1)
+         AS artifact_recorded`,
+    [agentRunId]
+  );
+  return result.rows[0]?.broker_started === true && result.rows[0]?.artifact_recorded !== true;
 }
 
 async function hasDurableProviderBoundary(

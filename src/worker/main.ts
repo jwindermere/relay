@@ -2,6 +2,8 @@ import { hostname } from 'node:os';
 
 import { createDatabasePool } from '../lib/server/database/pool.js';
 import { formatError } from '../lib/server/errors.js';
+import { getGitHubBrokerRemote } from '../lib/server/github/api.js';
+import { AgentRunGitHubWorkspaceBroker } from '../lib/server/github/workspace.js';
 import { LocalCodexAgentRunProvider } from '../lib/server/provider/codex-agent-run.js';
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 import { processNextAgentRun } from './execution.js';
@@ -10,6 +12,7 @@ const HEALTH_INTERVAL_MS = 30_000;
 const POLL_INTERVAL_MS = 1_000;
 const pool = createDatabasePool();
 const provider = new LocalCodexAgentRunProvider();
+const githubWorkspaceBroker = new AgentRunGitHubWorkspaceBroker(pool, getGitHubBrokerRemote());
 const workerId = process.env.RELAY_WORKER_ID ?? `${hostname()}:${process.pid}`;
 const workspaceRoot = process.env.RELAY_AGENT_WORKSPACE_ROOT ?? '/var/lib/relay/agent-runs';
 let draining = false;
@@ -42,7 +45,9 @@ process.once('SIGTERM', shutdown);
 
 while (!draining) {
   try {
-    const result = await processNextAgentRun(pool, provider, { workerId, workspaceRoot });
+    const result = await processNextAgentRun(pool, provider, {
+      workerId, workspaceRoot, githubWorkspaceBroker
+    });
     if (result.kind !== 'idle') console.log(JSON.stringify({ event: 'worker.cycle', ...result }));
   } catch (error) {
     console.error(JSON.stringify({ event: 'worker.cycle.failed', error: formatError(error) }));

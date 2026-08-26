@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,13 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { Pool } from 'pg';
 
 import { migrateDatabase } from '../src/lib/server/database/migrations.js';
+import {
+  executeGitHubBrokerOperation,
+  GitHubBrokerDeniedError,
+  type GitHubBrokerRemote
+} from '../src/lib/server/github/broker.js';
+import { ingestGitHubWebhook } from '../src/lib/server/github/webhooks.js';
+import { AgentRunGitHubWorkspaceBroker } from '../src/lib/server/github/workspace.js';
 import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
 import {
   AgentRunProviderError,
@@ -38,6 +46,164 @@ if (skipDatabaseTests) {
   after(async () => {
     await pool.end();
     await container?.stop();
+  });
+
+  test('GitHub broker decisions and signed webhook deliveries remain append-only and correlated', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-broker');
+    const executions: string[] = [];
+    const remote: GitHubBrokerRemote = {
+      async execute(input) {
+        executions.push(input.request.operation);
+        return { commitSha: 'a'.repeat(40) };
+      }
+    };
+    const common = {
+      repositoryId: 'repo-github-broker',
+      agentRunId: ids.runId,
+      attemptNumber: 1,
+      actorWorkspaceMemberId: ids.agentMemberId
+    };
+
+    await executeGitHubBrokerOperation(pool, remote, { ...common, operation: 'fetch' });
+    await assert.rejects(
+      executeGitHubBrokerOperation(pool, remote, {
+        ...common,
+        operation: 'update_branch',
+        branch: 'main',
+        commitSha: 'b'.repeat(40),
+        force: true
+      }),
+      GitHubBrokerDeniedError
+    );
+    assert.deepEqual(executions, ['fetch']);
+
+    const secret = 'github-webhook-contract-secret';
+    const body = Buffer.from(JSON.stringify({
+      ref: `refs/heads/relay/${ids.runId}`,
+      after: 'a'.repeat(40),
+      repository: { id: 'repo-github-broker' },
+      installation: { id: 'installation-github-broker', token: 'private-value' }
+    }));
+    const signature = `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`;
+    const webhookInput = {
+      deliveryId: 'delivery-github-broker', eventName: 'push', signature, body, secret
+    };
+    assert.deepEqual(await ingestGitHubWebhook(pool, webhookInput), {
+      accepted: true, duplicate: false, agentRunId: ids.runId
+    });
+    assert.deepEqual(await ingestGitHubWebhook(pool, webhookInput), {
+      accepted: true, duplicate: true, agentRunId: ids.runId
+    });
+
+    const evidence = await pool.query<{
+      decisions: number;
+      deliveries: number;
+      denied: number;
+      correlated: string;
+      payload: Record<string, unknown>;
+    }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.github_broker_decision
+          WHERE agent_run_id = $1) AS decisions,
+         (SELECT count(*)::integer FROM public.github_webhook_delivery
+          WHERE agent_run_id = $1) AS deliveries,
+         (SELECT count(*)::integer FROM public.github_broker_decision
+          WHERE agent_run_id = $1 AND decision = 'deny') AS denied,
+         delivery.agent_run_id AS correlated,
+         delivery.payload
+       FROM public.github_webhook_delivery delivery
+       WHERE delivery.delivery_id = 'delivery-github-broker'`,
+      [ids.runId]
+    );
+    assert.equal(evidence.rows[0]?.decisions, 2);
+    assert.equal(evidence.rows[0]?.deliveries, 1);
+    assert.equal(evidence.rows[0]?.denied, 1);
+    assert.equal(evidence.rows[0]?.correlated, ids.runId);
+    assert.doesNotMatch(JSON.stringify(evidence.rows[0]?.payload), /private-value/);
+    await assert.rejects(
+      pool.query('DELETE FROM public.github_broker_decision WHERE agent_run_id = $1', [ids.runId]),
+      /append-only/
+    );
+  });
+
+  test('a completed AgentRun is published through a credential-free broker workspace as one Artifact', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-publication');
+    const operations: string[] = [];
+    const remote: GitHubBrokerRemote = {
+      async execute(input) {
+        operations.push(input.request.operation);
+        if (input.request.operation === 'clone') {
+          return {
+            commitSha: 'a'.repeat(40),
+            files: [{
+              path: 'README.md',
+              content: Buffer.from('before\n').toString('base64'),
+              encoding: 'base64'
+            }]
+          };
+        }
+        if (input.request.operation === 'create_branch') return { commitSha: 'a'.repeat(40) };
+        if (input.request.operation === 'commit') {
+          const changed = input.request.files?.find(({ path }) => path === 'README.md');
+          assert.equal(changed?.encoding, 'base64');
+          assert.equal(Buffer.from(changed?.content ?? '', 'base64').toString(), 'after\n');
+          return { commitSha: 'b'.repeat(40) };
+        }
+        if (input.request.operation === 'update_branch') return { commitSha: 'b'.repeat(40) };
+        if (input.request.operation === 'pull_request_upsert') {
+          return {
+            commitSha: 'b'.repeat(40),
+            pullRequestNumber: 25,
+            pullRequestUrl: 'https://github.test/relay-owner/pilot/pull/25'
+          };
+        }
+        throw new Error('unexpected broker operation');
+      }
+    };
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /credential-free workspace/);
+      assert.equal(await readFile(join(input.workspaceDirectory, 'README.md'), 'utf8'), 'before\n');
+      await writeFile(join(input.workspaceDirectory, 'README.md'), 'after\n');
+      await observer.threadStarted('thread-github-publication');
+      await observer.turnStarted('turn-github-publication');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-github-publication:completed',
+        turn: { id: 'turn-github-publication', status: 'completed' }
+      });
+    });
+
+    const result = await processNextAgentRun(pool, provider, {
+      workerId: 'worker-github-publication',
+      workspaceRoot,
+      leaseDurationMs: 10_000,
+      githubWorkspaceBroker: new AgentRunGitHubWorkspaceBroker(pool, remote)
+    });
+    assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+    assert.deepEqual(operations, [
+      'clone', 'create_branch', 'commit', 'update_branch', 'pull_request_upsert'
+    ]);
+    const artifact = await pool.query<{
+      kind: string;
+      branch: string;
+      commit_sha: string;
+      pull_request_number: number;
+      url: string;
+    }>('SELECT kind, branch, commit_sha, pull_request_number, url FROM public.artifact WHERE agent_run_id = $1', [ids.runId]);
+    assert.deepEqual(artifact.rows[0], {
+      kind: 'github_pull_request',
+      branch: `relay/${ids.runId}`,
+      commit_sha: 'b'.repeat(40),
+      pull_request_number: 25,
+      url: 'https://github.test/relay-owner/pilot/pull/25'
+    });
+    const decisions = await pool.query<{ decision: string; operation: string }>(
+      `SELECT decision, operation FROM public.github_broker_decision
+       WHERE agent_run_id = $1 ORDER BY id`,
+      [ids.runId]
+    );
+    assert.deepEqual(decisions.rows, operations.map((operation) => ({ decision: 'allow', operation })));
+    assert.doesNotMatch(JSON.stringify(decisions.rows), /before|after|installation/);
   });
 
   test('one leased worker executes a queued AgentRun and persists safe Provider evidence once', async () => {
@@ -1211,6 +1377,7 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     workspaceId,
     projectId,
     agentId,
+    agentMemberId,
     channelId,
     pilotMemberId,
     linkedRepositoryId,

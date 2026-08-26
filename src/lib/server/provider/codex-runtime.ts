@@ -6,6 +6,16 @@ import type {
   ManagedLoginCompletion
 } from './connection.js';
 
+const CREDENTIAL_ENVIRONMENT_NAME = /(?:SECRET|TOKEN|PASSWORD|PRIVATE.?KEY|DATABASE_URL|AUTHORIZATION|CREDENTIAL|SSH_AUTH_SOCK)/i;
+
+export function createCodexProcessEnvironment(
+  environment: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(environment).filter(
+    ([name]) => !CREDENTIAL_ENVIRONMENT_NAME.test(name)
+  ));
+}
+
 interface PendingRequest {
   method: string;
   resolve: (result: unknown) => void;
@@ -50,7 +60,7 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
   constructor(binary: string) {
     this.process = spawn(binary, ['app-server', '--stdio'], {
       cwd: process.cwd(),
-      env: process.env,
+      env: createCodexProcessEnvironment(),
       stdio: ['pipe', 'pipe', 'pipe']
     });
     this.process.stderr.resume();

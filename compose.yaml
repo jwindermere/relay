@@ -34,6 +34,7 @@ services:
       RELAY_EMAIL_DELIVERY_TOKEN: ${RELAY_EMAIL_DELIVERY_TOKEN:-}
       RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID in .env}
       RELAY_GITHUB_PRIVATE_KEY: ${RELAY_GITHUB_PRIVATE_KEY:?set RELAY_GITHUB_PRIVATE_KEY in .env}
+      RELAY_GITHUB_WEBHOOK_SECRET: ${RELAY_GITHUB_WEBHOOK_SECRET:?set RELAY_GITHUB_WEBHOOK_SECRET in .env}
       HOST: 0.0.0.0
       PORT: 3000
     command: ["npm", "run", "start:web"]
@@ -57,6 +58,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
       RELAY_CODEX_BIN: ${RELAY_CODEX_BIN:-codex}
       RELAY_AGENT_WORKSPACE_ROOT: /var/lib/relay/agent-runs
+      RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID in .env}
+      RELAY_GITHUB_PRIVATE_KEY: ${RELAY_GITHUB_PRIVATE_KEY:?set RELAY_GITHUB_PRIVATE_KEY in .env}
     command: ["npm", "run", "start:worker"]
     volumes:
       - codex-state:/home/node/.codex
