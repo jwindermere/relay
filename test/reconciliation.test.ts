@@ -101,6 +101,11 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
     runs: [{
       id: 'run-1', sourceMessageId: 'message-1', attemptNumber: 1, status: 'completed',
       summary: 'Engineering request completed', sequence: 4,
+      artifact: {
+        kind: 'github_pull_request',
+        pullRequestNumber: 26,
+        url: 'https://github.test/relay-owner/pilot/pull/26'
+      },
       events: [
         { sequence: 1, status: 'queued', summary: 'Engineering request queued' },
         { sequence: 2, status: 'working', summary: 'Working on the request' },
@@ -111,6 +116,11 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
   });
   assert.equal(fullRefresh['run-1']?.sequence, 4);
   assert.equal(fullRefresh['run-1']?.status, 'completed');
+  assert.deepEqual(fullRefresh['run-1']?.artifact, {
+    kind: 'github_pull_request',
+    pullRequestNumber: 26,
+    url: 'https://github.test/relay-owner/pilot/pull/26'
+  });
   assert.deepEqual(
     fullRefresh['run-1']?.milestones.map(({ sequence }) => sequence),
     [1, 2, 4]

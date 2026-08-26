@@ -16,6 +16,12 @@ export interface AgentRunEventUpdate {
   summary: string;
 }
 
+export interface PullRequestArtifact {
+  kind: 'github_pull_request';
+  pullRequestNumber: number;
+  url: string;
+}
+
 export interface AgentRunUpdate {
   id: string;
   sourceMessageId: string;
@@ -24,6 +30,7 @@ export interface AgentRunUpdate {
   summary: string;
   sequence: number;
   events: AgentRunEventUpdate[];
+  artifact?: PullRequestArtifact;
 }
 
 export interface ChannelReconciliationUpdate {
@@ -39,6 +46,7 @@ export interface VisibleAgentRun {
   summary: string;
   sequence: number;
   milestones: AgentRunEventUpdate[];
+  artifact?: PullRequestArtifact;
 }
 
 export type VisibleAgentRuns = Record<string, VisibleAgentRun>;
@@ -87,7 +95,10 @@ export function applyChannelReconciliation(
       status: run.status,
       summary: run.summary,
       sequence: run.sequence,
-      milestones
+      milestones,
+      ...((run.artifact ?? current[run.id]?.artifact)
+        ? { artifact: run.artifact ?? current[run.id]?.artifact }
+        : {})
     };
   }
   return next;

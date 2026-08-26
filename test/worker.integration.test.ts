@@ -17,6 +17,7 @@ import {
 import { ingestGitHubWebhook } from '../src/lib/server/github/webhooks.js';
 import { AgentRunGitHubWorkspaceBroker } from '../src/lib/server/github/workspace.js';
 import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
+import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
   type AgentRunProvider,
@@ -216,19 +217,71 @@ if (skipDatabaseTests) {
       'clone', 'create_branch', 'commit', 'update_branch', 'pull_request_upsert'
     ]);
     const artifact = await pool.query<{
+      workspace_id: string;
+      project_id: string;
+      task_id: string;
+      agent_run_id: string;
+      result_message_id: string;
       kind: string;
       branch: string;
       commit_sha: string;
       pull_request_number: number;
       url: string;
-    }>('SELECT kind, branch, commit_sha, pull_request_number, url FROM public.artifact WHERE agent_run_id = $1', [ids.runId]);
-    assert.deepEqual(artifact.rows[0], {
+    }>(
+      `SELECT workspace_id, project_id, task_id, agent_run_id, result_message_id,
+              kind, branch, commit_sha, pull_request_number, url
+       FROM public.artifact WHERE agent_run_id = $1`,
+      [ids.runId]
+    );
+    const storedArtifact = artifact.rows[0];
+    assert.ok(storedArtifact?.result_message_id);
+    assert.deepEqual(storedArtifact, {
+      workspace_id: ids.workspaceId,
+      project_id: ids.projectId,
+      task_id: `task-github-publication`,
+      agent_run_id: ids.runId,
+      result_message_id: storedArtifact.result_message_id,
       kind: 'github_pull_request',
       branch: `relay/${ids.runId}`,
       commit_sha: 'b'.repeat(40),
       pull_request_number: 25,
       url: 'https://github.test/relay-owner/pilot/pull/25'
     });
+    const resultMessage = await pool.query<{
+      parent_message_id: string;
+      author_workspace_member_id: string;
+      body: string;
+    }>(
+      `SELECT parent_message_id, author_workspace_member_id, body
+       FROM public.message WHERE id = $1`,
+      [storedArtifact.result_message_id]
+    );
+    assert.deepEqual(resultMessage.rows[0], {
+      parent_message_id: 'message-github-publication',
+      author_workspace_member_id: ids.agentMemberId,
+      body: 'Completed the engineering request. Pull request #25 is ready for human review.'
+    });
+    const ownerView = await loadChannelReconciliation(pool, ids.ownerAccess, ids.channelId, {});
+    const memberView = await loadChannelReconciliation(pool, ids.memberAccess, ids.channelId, {});
+    assert.equal(ownerView.runs[0]?.status, 'completed');
+    assert.equal(memberView.runs[0]?.status, 'completed');
+    assert.deepEqual(ownerView.runs[0]?.artifact, {
+      kind: 'github_pull_request',
+      pullRequestNumber: 25,
+      url: 'https://github.test/relay-owner/pilot/pull/25'
+    });
+    assert.deepEqual(memberView.runs[0]?.artifact, ownerView.runs[0]?.artifact);
+    assert.equal(
+      ownerView.messages.filter(({ id }) => id === storedArtifact.result_message_id).length,
+      1
+    );
+    const artifactCardinality = await pool.query<{ artifacts: number; result_messages: number }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.artifact WHERE agent_run_id = $1) AS artifacts,
+         (SELECT count(*)::integer FROM public.message WHERE id = $2) AS result_messages`,
+      [ids.runId, storedArtifact.result_message_id]
+    );
+    assert.deepEqual(artifactCardinality.rows[0], { artifacts: 1, result_messages: 1 });
     const decisions = await pool.query<{ decision: string; operation: string }>(
       `SELECT decision, operation FROM public.github_broker_decision
        WHERE agent_run_id = $1 AND phase = 'decision' ORDER BY id`,

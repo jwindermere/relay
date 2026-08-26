@@ -213,6 +213,14 @@
         <span>Engineering request queued</span>
       {/if}
     </p>
+    {#if run?.artifact}
+      <a
+        class="btn btn-outline btn-primary btn-xs mt-2"
+        href={run.artifact.url}
+        target="_blank"
+        rel="noopener noreferrer"
+      >Review pull request #{run.artifact.pullRequestNumber} in GitHub</a>
+    {/if}
     {#if run && run.milestones.length > 1}
       <ul class="mt-1 space-y-1 text-xs text-base-content/55" aria-label="Engineering request milestones">
         {#each run.milestones.slice(0, -1) as entry (`${run.id}:${entry.sequence}`)}

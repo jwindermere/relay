@@ -137,7 +137,9 @@ sidebar; other Pilot members see readiness without sensitive connection configur
 The worker checks out repository content through the server-side broker into a
 credential-free local Git workspace. It publishes only the AgentRun's `relay/<AgentRun>`
 branch and pull request after Codex completes; installation tokens remain inside the
-broker. Configure `RELAY_GITHUB_WEBHOOK_SECRET` on both Relay and the App webhook at
+broker. A completed request posts one concise Agent result Message and exposes its
+single pull-request Artifact as a GitHub review link to both Pilot members. Configure
+`RELAY_GITHUB_WEBHOOK_SECRET` on both Relay and the App webhook at
 `POST /api/github/webhooks` so signed deliveries can be deduplicated and correlated.
 
 To exercise the complete boundary against a disposable protected repository, provide

@@ -16,6 +16,8 @@ interface AgentRunRepositoryContext {
   attempt_number: number;
   repository_id: string;
   actor_workspace_member_id: string;
+  root_message_id: string;
+  channel_id: string;
 }
 
 export interface PreparedAgentRunRepository {
@@ -81,7 +83,12 @@ export class AgentRunGitHubWorkspaceBroker {
     agentRunId: string,
     workspaceDirectory: string,
     prepared: PreparedAgentRunRepository
-  ): Promise<{ commitSha: string; pullRequestNumber: number; pullRequestUrl: string }> {
+  ): Promise<{
+    commitSha: string;
+    pullRequestNumber: number;
+    pullRequestUrl: string;
+    resultMessageId: string;
+  }> {
     const context = await this.context(agentRunId);
     const common = this.commonRequest(agentRunId, context);
     const currentFiles = await readWorkspaceFiles(workspaceDirectory);
@@ -125,32 +132,100 @@ export class AgentRunGitHubWorkspaceBroker {
     if (!pullRequest.result.pullRequestNumber || !pullRequest.result.pullRequestUrl) {
       throw new Error('GitHub broker pull request response was incomplete');
     }
-    await this.pool.query(
-      `INSERT INTO public.artifact (
-         id, workspace_id, project_id, task_id, agent_run_id, kind,
-         repository_id, branch, commit_sha, pull_request_number, url
-       ) VALUES ($1, $2, $3, $4, $5, 'github_pull_request', $6, $7, $8, $9, $10)
-       ON CONFLICT (agent_run_id) DO NOTHING`,
-      [
-        randomUUID(), context.workspace_id, context.project_id, context.task_id, agentRunId,
-        context.repository_id, prepared.assignedBranch, commit.result.commitSha,
-        pullRequest.result.pullRequestNumber, pullRequest.result.pullRequestUrl
-      ]
-    );
-    return {
+    const resultMessageId = await this.persistPullRequestArtifact(context, {
+      agentRunId,
+      branch: prepared.assignedBranch,
       commitSha: commit.result.commitSha,
       pullRequestNumber: pullRequest.result.pullRequestNumber,
       pullRequestUrl: pullRequest.result.pullRequestUrl
+    });
+    return {
+      commitSha: commit.result.commitSha,
+      pullRequestNumber: pullRequest.result.pullRequestNumber,
+      pullRequestUrl: pullRequest.result.pullRequestUrl,
+      resultMessageId
     };
+  }
+
+  private async persistPullRequestArtifact(
+    context: AgentRunRepositoryContext,
+    result: {
+      agentRunId: string;
+      branch: string;
+      commitSha: string;
+      pullRequestNumber: number;
+      pullRequestUrl: string;
+    }
+  ): Promise<string> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `SELECT id FROM public.agent_run
+         WHERE id = $1 AND workspace_id = $2
+         FOR UPDATE`,
+        [result.agentRunId, context.workspace_id]
+      );
+      const existing = await client.query<{ result_message_id: string }>(
+        'SELECT result_message_id FROM public.artifact WHERE agent_run_id = $1',
+        [result.agentRunId]
+      );
+      if (existing.rows[0]) {
+        await client.query('COMMIT');
+        return existing.rows[0].result_message_id;
+      }
+
+      const resultMessageId = randomUUID();
+      await client.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          resultMessageId,
+          context.workspace_id,
+          context.channel_id,
+          context.actor_workspace_member_id,
+          context.root_message_id,
+          `Completed the engineering request. Pull request #${result.pullRequestNumber} is ready for human review.`
+        ]
+      );
+      await client.query(
+        `INSERT INTO public.notification_outbox (workspace_id, message_id, topic, payload)
+         VALUES ($1, $2, 'channel.message', $3)`,
+        [context.workspace_id, resultMessageId, { messageId: resultMessageId }]
+      );
+      await client.query(
+        `INSERT INTO public.artifact (
+           id, workspace_id, project_id, task_id, agent_run_id, result_message_id, kind,
+           repository_id, branch, commit_sha, pull_request_number, url
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'github_pull_request', $7, $8, $9, $10, $11)`,
+        [
+          randomUUID(), context.workspace_id, context.project_id, context.task_id,
+          result.agentRunId, resultMessageId, context.repository_id, result.branch,
+          result.commitSha, result.pullRequestNumber, result.pullRequestUrl
+        ]
+      );
+      await client.query('COMMIT');
+      return resultMessageId;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   private async context(agentRunId: string): Promise<AgentRunRepositoryContext> {
     const result = await this.pool.query<AgentRunRepositoryContext>(
       `SELECT run.workspace_id, run.task_id, task.project_id, run.attempt_number,
               repository.repository_id,
-              agent_member.id AS actor_workspace_member_id
+              agent_member.id AS actor_workspace_member_id,
+              COALESCE(source.parent_message_id, source.id) AS root_message_id,
+              source.channel_id
        FROM public.agent_run run
        JOIN public.task task ON task.id = run.task_id AND task.workspace_id = run.workspace_id
+       JOIN public.message source
+         ON source.id = task.source_message_id AND source.workspace_id = run.workspace_id
        JOIN public.linked_repository repository
          ON repository.id = run.linked_repository_id
         AND repository.workspace_id = run.workspace_id

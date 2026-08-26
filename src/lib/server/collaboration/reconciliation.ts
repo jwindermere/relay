@@ -1,6 +1,6 @@
 import type { Pool } from 'pg';
 
-import type { VisibleAgentRunStatus } from '../../reconciliation.js';
+import type { PullRequestArtifact, VisibleAgentRunStatus } from '../../reconciliation.js';
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import {
   loadAuthorizedChannelMessages,
@@ -23,6 +23,7 @@ export interface ReconciledAgentRun {
   summary: string;
   sequence: number;
   events: ReconciledAgentRunEvent[];
+  artifact?: PullRequestArtifact;
 }
 
 export interface ChannelReconciliation {
@@ -38,6 +39,9 @@ interface RunRow {
   status: AgentRunStatus;
   sequence: number;
   event_type: string;
+  artifact_kind: 'github_pull_request' | null;
+  pull_request_number: number | null;
+  artifact_url: string | null;
 }
 
 interface EventRow {
@@ -56,10 +60,14 @@ export async function loadChannelReconciliation(
   const messages = await loadAuthorizedChannelMessages(pool, access, channelId);
   const runs = await pool.query<RunRow>(
     `SELECT run.id, task.source_message_id, run.attempt_number, run.status,
-            latest.sequence, latest.event_type
+            latest.sequence, latest.event_type,
+            artifact.kind AS artifact_kind,
+            artifact.pull_request_number,
+            artifact.url AS artifact_url
      FROM public.message source_message
      JOIN public.task task ON task.source_message_id = source_message.id
      JOIN public.agent_run run ON run.task_id = task.id
+     LEFT JOIN public.artifact artifact ON artifact.agent_run_id = run.id
      JOIN LATERAL (
        SELECT event.sequence, event.event_type
        FROM public.agent_run_event event
@@ -106,7 +114,16 @@ export async function loadChannelReconciliation(
       status: run.status,
       summary: visibleAgentRunSummary(run.status, run.event_type),
       sequence: run.sequence,
-      events: eventsByRun.get(run.id) ?? []
+      events: eventsByRun.get(run.id) ?? [],
+      ...(run.artifact_kind && run.pull_request_number && run.artifact_url
+        ? {
+            artifact: {
+              kind: run.artifact_kind,
+              pullRequestNumber: run.pull_request_number,
+              url: run.artifact_url
+            }
+          }
+        : {})
     }))
   };
 }
