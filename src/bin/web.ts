@@ -3,7 +3,9 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { createDatabasePool } from '../lib/server/database/pool.js';
+import { getAuthDatabasePool, getRelayAuth } from '../lib/server/auth.js';
 import { formatError } from '../lib/server/errors.js';
+import { attachAuthenticatedRealtime } from '../lib/server/realtime.js';
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 
 const pool = createDatabasePool();
@@ -17,6 +19,7 @@ try {
   const host = process.env.HOST ?? '0.0.0.0';
   const port = Number(process.env.PORT ?? 3000);
   const server = createServer(handler);
+  const realtime = attachAuthenticatedRealtime(server, pool, getRelayAuth());
 
   server.listen(port, host, () => {
     console.log(JSON.stringify({ event: 'web.ready', host, port, ...readiness }));
@@ -24,8 +27,10 @@ try {
 
   const shutdown = (signal: NodeJS.Signals) => {
     console.log(JSON.stringify({ event: 'web.stopping', signal }));
+    for (const client of realtime.clients) client.close(1001, 'Server stopping');
+    realtime.close();
     server.close(async () => {
-      await pool.end();
+      await Promise.all([pool.end(), getAuthDatabasePool().end()]);
       process.exit(0);
     });
   };

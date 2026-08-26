@@ -1,8 +1,8 @@
 import type { Pool } from 'pg';
 
 export const MIGRATION_STREAMS = Object.freeze({
-  relay: Object.freeze({ postgresSchema: 'public', requiredVersion: 1 }),
-  auth: Object.freeze({ postgresSchema: 'auth', requiredVersion: 1 })
+  auth: Object.freeze({ postgresSchema: 'auth', requiredVersion: 1 }),
+  relay: Object.freeze({ postgresSchema: 'public', requiredVersion: 2 })
 });
 
 export type MigrationStreamName = keyof typeof MIGRATION_STREAMS;
@@ -13,8 +13,8 @@ export const MIGRATION_STREAM_NAMES = Object.freeze(
 );
 
 export const REQUIRED_MIGRATION_STREAM_VERSIONS: MigrationStreamVersions = Object.freeze({
-  relay: MIGRATION_STREAMS.relay.requiredVersion,
-  auth: MIGRATION_STREAMS.auth.requiredVersion
+  auth: MIGRATION_STREAMS.auth.requiredVersion,
+  relay: MIGRATION_STREAMS.relay.requiredVersion
 });
 
 export class IncompatibleSchemaError extends Error {

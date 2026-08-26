@@ -5,11 +5,13 @@
   "scripts": {
     "build": "npm run build:web && npm run build:runtime",
     "build:web": "vite build",
-    "build:runtime": "esbuild src/worker/main.ts src/bin/migrate.ts src/bin/web.ts --bundle --platform=node --format=esm --packages=external --outdir=build-runtime",
+    "build:runtime": "esbuild src/worker/main.ts src/bin/migrate.ts src/bin/web.ts src/bin/bootstrap-owner.ts --bundle --platform=node --format=esm --packages=external --outdir=build-runtime",
     "dev:web": "vite dev",
     "dev:worker": "tsx watch src/worker/main.ts",
     "db:migrate": "tsx src/bin/migrate.ts",
+    "bootstrap:owner": "tsx src/bin/bootstrap-owner.ts",
     "start:migrate": "node build-runtime/bin/migrate.js",
+    "start:bootstrap-owner": "node build-runtime/bin/bootstrap-owner.js",
     "start:web": "node build-runtime/bin/web.js",
     "start:worker": "node build-runtime/worker/main.js",
     "prototype:agent-run": "node prototype/agent-run.mjs",
@@ -29,12 +31,14 @@
     "pg": "8.16.3",
     "svelte": "5.56.9",
     "tailwindcss": "4.3.3",
-    "vite": "8.2.2"
+    "vite": "8.2.2",
+    "ws": "8.18.3"
   },
   "devDependencies": {
     "@testcontainers/postgresql": "11.7.2",
     "@types/node": "24.3.0",
     "@types/pg": "8.15.5",
+    "@types/ws": "8.18.1",
     "esbuild": "0.28.2",
     "svelte-check": "4.3.3",
     "tsx": "4.20.5",

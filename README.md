@@ -34,6 +34,27 @@ existing disposable database supplied with `TEST_DATABASE_URL`. A missing databa
 runtime fails the check; use `SKIP_DATABASE_TESTS=true` only when intentionally
 running the non-database checks.
 
+## Bootstrap and authentication
+
+Public registration is disabled. After migrations have run, bootstrap the verified
+Provider account owner and the single MVP pilot Workspace from the local terminal:
+
+```sh
+DATABASE_URL=postgres://relay:relay@localhost:5432/relay \
+RELAY_OWNER_PASSWORD='use-a-long-unique-password' \
+npm run bootstrap:owner -- \
+  --email owner@example.com \
+  --name 'Provider account owner' \
+  --workspace 'MVP pilot workspace'
+```
+
+The command is one-time and fails without changing data after Relay has already been
+bootstrapped. The password is read from the environment rather than a command-line
+argument and is stored only as Better Auth's password hash. The owner can then sign
+in at <http://localhost:3000/sign-in>. Browser sessions are opaque PostgreSQL-backed
+Better Auth sessions; protected HTTP endpoints and the `/realtime` WebSocket resolve
+the active Workspace membership on the server for each protected interaction.
+
 ## Prototypes
 
 The existing prototypes still prove persistent Codex-backed AgentRun execution
