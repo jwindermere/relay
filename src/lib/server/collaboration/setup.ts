@@ -27,14 +27,25 @@ export async function createPilotCollaborationSurface(
     [channelId, workspaceId, projectId]
   );
   await client.query(
-    `INSERT INTO public.project_membership (workspace_id, project_id, workspace_membership_id)
+    `INSERT INTO public.workspace_member (id, workspace_id, kind, pilot_membership_id)
+     VALUES ($1, $2, 'pilot', $1)`,
+    [ownerMembershipId, workspaceId]
+  );
+  const agentWorkspaceMemberId = `${agentId}:member`;
+  await client.query(
+    `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+     VALUES ($1, $2, 'agent', $3)`,
+    [agentWorkspaceMemberId, workspaceId, agentId]
+  );
+  await client.query(
+    `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
      VALUES ($1, $2, $3)`,
     [workspaceId, projectId, ownerMembershipId]
   );
   await client.query(
-    `INSERT INTO public.project_membership (workspace_id, project_id, agent_id)
+    `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
      VALUES ($1, $2, $3)`,
-    [workspaceId, projectId, agentId]
+    [workspaceId, projectId, agentWorkspaceMemberId]
   );
 }
 
@@ -45,8 +56,13 @@ export async function addPilotToCollaborationProject(
 ): Promise<void> {
   const { projectId } = pilotCollaborationIds(workspaceId);
   await client.query(
-    `INSERT INTO public.project_membership (workspace_id, project_id, workspace_membership_id)
-     VALUES ($1, $2, $3)`,
+    `WITH member AS (
+       INSERT INTO public.workspace_member (id, workspace_id, kind, pilot_membership_id)
+       VALUES ($3, $1, 'pilot', $3)
+       RETURNING id
+     )
+     INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+     SELECT $1, $2, id FROM member`,
     [workspaceId, projectId, membershipId]
   );
 }

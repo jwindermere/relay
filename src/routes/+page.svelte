@@ -101,11 +101,11 @@
           {#each roots as message}
             <article class="rounded-box border-base-300 border bg-base-100 p-4 shadow-sm">
               <div class="flex gap-3">
-                <div class="member-avatar shrink-0">{initials(message.author.name)}</div>
+                <div class:agent-avatar={message.author.kind === 'agent'} class="member-avatar shrink-0">{initials(message.author.name)}</div>
                 <div class="min-w-0 flex-1">
                   <div class="flex flex-wrap items-baseline gap-2">
                     <strong>{message.author.name}</strong>
-                    <span class="text-xs text-base-content/45">Pilot member · {formatTime(message.createdAt)}</span>
+                    <span class="text-xs text-base-content/45">{message.author.roleLabel} · {formatTime(message.createdAt)}</span>
                   </div>
                   <p class="mt-1 whitespace-pre-wrap text-sm leading-6">{message.body}</p>
                   <button class="btn btn-ghost btn-xs mt-2" type="button" onclick={() => beginReply(message.id)}>Reply</button>
@@ -116,7 +116,7 @@
                 <div class="border-base-300 ml-5 mt-3 space-y-3 border-l pl-5 sm:ml-12">
                   {#each repliesFor(message.id) as reply}
                     <div class="flex gap-3">
-                      <div class="member-avatar member-avatar-small shrink-0">{initials(reply.author.name)}</div>
+                      <div class:agent-avatar={reply.author.kind === 'agent'} class="member-avatar member-avatar-small shrink-0">{initials(reply.author.name)}</div>
                       <div class="min-w-0 flex-1">
                         <div class="flex flex-wrap items-baseline gap-2">
                           <strong class="text-sm">{reply.author.name}</strong>

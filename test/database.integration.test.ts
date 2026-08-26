@@ -80,8 +80,8 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'session' },
       { table_schema: 'auth', table_name: 'user' },
       { table_schema: 'auth', table_name: 'verification' },
-      { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'agent' },
+      { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
       { table_schema: 'public', table_name: 'message' },
       { table_schema: 'public', table_name: 'project' },
@@ -90,6 +90,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'workspace' },
       { table_schema: 'public', table_name: 'workspace_invitation' },
+      { table_schema: 'public', table_name: 'workspace_member' },
       { table_schema: 'public', table_name: 'workspace_membership' }
     ]);
     await assert.doesNotReject(assertCompatibleSchema(pool));
@@ -430,7 +431,7 @@ if (connectionString) {
       channelId: initial.channel.id,
       body: 'Can we ship the reconnect fix?'
     });
-    assert.equal(root.author.membershipId, ownerAccess.membership.id);
+    assert.equal(root.author.workspaceMemberId, ownerAccess.membership.id);
     assert.equal(root.author.name, 'Relay Owner');
     assert.equal(root.parentMessageId, null);
 
@@ -439,7 +440,7 @@ if (connectionString) {
       parentMessageId: root.id,
       body: 'Yes, after the focused checks pass.'
     });
-    assert.equal(reply.author.membershipId, memberAccess.membership.id);
+    assert.equal(reply.author.workspaceMemberId, memberAccess.membership.id);
     assert.equal(reply.author.name, 'Pilot member');
     assert.equal(reply.parentMessageId, root.id);
 

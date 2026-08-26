@@ -24,8 +24,10 @@ export interface ChannelMessage {
   body: string;
   createdAt: string;
   author: {
-    membershipId: string;
+    workspaceMemberId: string;
+    kind: 'pilot' | 'agent';
     name: string;
+    roleLabel: string;
   };
 }
 
@@ -43,8 +45,10 @@ interface MessageRow {
   parent_message_id: string | null;
   body: string;
   created_at: Date;
-  author_membership_id: string;
+  author_workspace_member_id: string;
+  author_kind: 'pilot' | 'agent';
   author_name: string;
+  author_role_label: string;
 }
 
 function toChannelMessage(row: MessageRow): ChannelMessage {
@@ -54,8 +58,10 @@ function toChannelMessage(row: MessageRow): ChannelMessage {
     body: row.body,
     createdAt: row.created_at.toISOString(),
     author: {
-      membershipId: row.author_membership_id,
-      name: row.author_name
+      workspaceMemberId: row.author_workspace_member_id,
+      kind: row.author_kind,
+      name: row.author_name,
+      roleLabel: row.author_role_label
     }
   };
 }
@@ -75,7 +81,8 @@ export async function loadSharedAgentChannel(
      FROM public.project p
      JOIN public.channel c ON c.project_id = p.id AND c.workspace_id = p.workspace_id
      JOIN public.project_membership pm ON pm.project_id = p.id
-     JOIN public.workspace_membership wm ON wm.id = pm.workspace_membership_id
+     JOIN public.workspace_member member ON member.id = pm.workspace_member_id
+     JOIN public.workspace_membership wm ON wm.id = member.pilot_membership_id
      WHERE p.workspace_id = $1
        AND wm.id = $2
        AND wm.revoked_at IS NULL
@@ -94,29 +101,33 @@ export async function loadSharedAgentChannel(
       role_label: string;
       status: SharedChannelMember['status'];
     }>(
-      `SELECT member.id, member.kind, member.name, member.role_label, member.status
-       FROM (
-         SELECT wm.id, 'pilot'::text AS kind, u.name,
-                'Pilot member'::text AS role_label, 'online'::text AS status
-         FROM public.project_membership pm
-         JOIN public.workspace_membership wm ON wm.id = pm.workspace_membership_id
-         JOIN auth."user" u ON u.id = wm.user_id
-         WHERE pm.project_id = $1 AND wm.revoked_at IS NULL
-         UNION ALL
-         SELECT a.id, 'agent'::text, a.name, a.role_label, a.status
-         FROM public.project_membership pm
-         JOIN public.agent a ON a.id = pm.agent_id
-         WHERE pm.project_id = $1
-       ) member
-       ORDER BY member.name, member.id`,
+      `SELECT member.id, member.kind,
+              COALESCE(pilot_user.name, agent.name) AS name,
+              CASE WHEN member.kind = 'pilot' THEN 'Pilot member' ELSE agent.role_label END
+                AS role_label,
+              CASE WHEN member.kind = 'pilot' THEN 'online' ELSE agent.status END AS status
+       FROM public.project_membership pm
+       JOIN public.workspace_member member ON member.id = pm.workspace_member_id
+       LEFT JOIN public.workspace_membership pilot
+         ON pilot.id = member.pilot_membership_id
+       LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+       LEFT JOIN public.agent agent ON agent.id = member.agent_id
+       WHERE pm.project_id = $1
+         AND (member.kind = 'agent' OR pilot.revoked_at IS NULL)
+       ORDER BY name, member.id`,
       [selected.project_id]
     ),
     pool.query<MessageRow>(
       `SELECT m.id, m.parent_message_id, m.body, m.created_at,
-              wm.id AS author_membership_id, u.name AS author_name
+              author.id AS author_workspace_member_id, author.kind AS author_kind,
+              COALESCE(pilot_user.name, agent.name) AS author_name,
+              CASE WHEN author.kind = 'pilot' THEN 'Pilot member' ELSE agent.role_label END
+                AS author_role_label
        FROM public.message m
-       JOIN public.workspace_membership wm ON wm.id = m.author_membership_id
-       JOIN auth."user" u ON u.id = wm.user_id
+       JOIN public.workspace_member author ON author.id = m.author_workspace_member_id
+       LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
+       LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+       LEFT JOIN public.agent agent ON agent.id = author.agent_id
        WHERE m.channel_id = $1
        ORDER BY m.created_at, m.id`,
       [selected.channel_id]
@@ -154,12 +165,13 @@ export async function postChannelMessage(
   const inserted = await pool.query<MessageRow>(
     `WITH inserted AS (
        INSERT INTO public.message (
-         id, workspace_id, channel_id, author_membership_id, parent_message_id, body
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
        )
-       SELECT $1, c.workspace_id, c.id, wm.id, $5, $6
+       SELECT $1, c.workspace_id, c.id, member.id, $5, $6
      FROM public.channel c
      JOIN public.project_membership pm ON pm.project_id = c.project_id
-     JOIN public.workspace_membership wm ON wm.id = pm.workspace_membership_id
+     JOIN public.workspace_member member ON member.id = pm.workspace_member_id
+     JOIN public.workspace_membership wm ON wm.id = member.pilot_membership_id
      LEFT JOIN public.message parent
        ON parent.id = $5 AND parent.channel_id = c.id
      WHERE c.id = $2
@@ -167,13 +179,18 @@ export async function postChannelMessage(
        AND wm.id = $4
        AND wm.revoked_at IS NULL
        AND ($5::text IS NULL OR (parent.id IS NOT NULL AND parent.parent_message_id IS NULL))
-       RETURNING id, parent_message_id, body, created_at, author_membership_id
+       RETURNING id, parent_message_id, body, created_at, author_workspace_member_id
      )
-     SELECT inserted.*, author.name AS author_name
+     SELECT inserted.*, author.kind AS author_kind,
+            COALESCE(pilot_user.name, agent.name) AS author_name,
+            CASE WHEN author.kind = 'pilot' THEN 'Pilot member' ELSE agent.role_label END
+              AS author_role_label
      FROM inserted
-     JOIN public.workspace_membership membership
-       ON membership.id = inserted.author_membership_id
-     JOIN auth."user" author ON author.id = membership.user_id`,
+     JOIN public.workspace_member author
+       ON author.id = inserted.author_workspace_member_id
+     LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
+     LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+     LEFT JOIN public.agent agent ON agent.id = author.agent_id`,
     [
       messageId,
       input.channelId,
