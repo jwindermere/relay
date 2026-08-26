@@ -20,6 +20,11 @@ versions. The worker reports readiness and database health as structured log eve
 Both processes exit before normal startup when the database is unreachable or
 incompatible.
 
+The worker exclusively leases queued AgentRuns from PostgreSQL and runs one Codex
+turn at a time through worker-local app-server stdio. Its Codex state and isolated
+per-AgentRun workspaces live on private durable volumes, so browser and web-process
+restarts do not interrupt active execution.
+
 Migrations are an explicit deployment step and run automatically as a one-shot
 Compose service before web or worker starts:
 
@@ -95,6 +100,19 @@ managed credentials in the local service account's protected state, while Relay 
 only an opaque local reference and safe connection state. Disabling or disconnecting
 the connection makes it unavailable for new Agent execution without deleting its row,
 the Agent, Messages, or future execution history.
+
+After connecting Codex and accepting a disposable engineering request, the Provider
+account owner can prove the real managed-login execution path with:
+
+```sh
+DATABASE_URL=postgres://relay:relay@localhost:5432/relay \
+RELAY_AGENT_WORKSPACE_ROOT=/tmp/relay-managed-login-smoke \
+npm run smoke:codex-worker
+```
+
+The command claims exactly one queued AgentRun and succeeds only after the run has a
+persisted `turn/completed` result. Run it with the continuously supervised worker
+stopped so the smoke command can claim the prepared request.
 
 ## Linked pilot repository
 

@@ -5,7 +5,7 @@
   "scripts": {
     "build": "npm run build:web && npm run build:runtime",
     "build:web": "vite build",
-    "build:runtime": "esbuild src/worker/main.ts src/bin/migrate.ts src/bin/web.ts src/bin/bootstrap-owner.ts --bundle --platform=node --format=esm --packages=external --outdir=build-runtime",
+    "build:runtime": "esbuild src/worker/main.ts src/bin/migrate.ts src/bin/web.ts src/bin/bootstrap-owner.ts src/bin/smoke-codex-worker.ts --bundle --platform=node --format=esm --packages=external --outdir=build-runtime",
     "dev:web": "vite dev",
     "dev:worker": "tsx watch src/worker/main.ts",
     "db:migrate": "tsx src/bin/migrate.ts",
@@ -14,6 +14,7 @@
     "start:bootstrap-owner": "node build-runtime/bin/bootstrap-owner.js",
     "start:web": "node build-runtime/bin/web.js",
     "start:worker": "node build-runtime/worker/main.js",
+    "smoke:codex-worker": "tsx src/bin/smoke-codex-worker.ts",
     "prototype:agent-run": "node prototype/agent-run.mjs",
     "prototype:realtime-agent-run": "node prototype/realtime-agent-run.mjs",
     "prototype:shared-channel-ux": "npm --prefix prototype/shared-channel-ux run dev --",

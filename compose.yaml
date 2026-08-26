@@ -53,10 +53,17 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      RELAY_CODEX_BIN: ${RELAY_CODEX_BIN:-codex}
+      RELAY_AGENT_WORKSPACE_ROOT: /var/lib/relay/agent-runs
     command: ["npm", "run", "start:worker"]
+    volumes:
+      - codex-state:/home/node/.codex
+      - agent-run-workspaces:/var/lib/relay/agent-runs
     depends_on:
       migrate:
         condition: service_completed_successfully
 
 volumes:
   postgres-data:
+  codex-state:
+  agent-run-workspaces:

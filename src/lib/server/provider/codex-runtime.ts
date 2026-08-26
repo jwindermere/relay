@@ -13,19 +13,28 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
-interface ProtocolMessage {
+export interface ProtocolMessage {
   id?: number;
   method?: string;
   result?: unknown;
-  error?: { message?: string };
+  error?: { code?: number; message?: string; data?: unknown };
   params?: Record<string, unknown>;
+}
+
+export class CodexProtocolError extends Error {
+  constructor(readonly method: string, readonly protocolError: ProtocolMessage['error']) {
+    super(`${method} failed${protocolError?.message ? `: ${protocolError.message}` : ''}`);
+    this.name = 'CodexProtocolError';
+  }
 }
 
 export interface CodexAppServerSession {
   onNotification?: (message: ProtocolMessage) => void;
+  onRequest?: (message: ProtocolMessage & { id: number; method: string }) => void;
   onFailure?: (error: Error) => void;
   initialize(): Promise<void>;
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  respond?(id: number, result: unknown): void;
   close(): void;
 }
 
@@ -35,6 +44,7 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
   private requestId = 0;
   private closed = false;
   onNotification?: (message: ProtocolMessage) => void;
+  onRequest?: (message: ProtocolMessage & { id: number; method: string }) => void;
   onFailure?: (error: Error) => void;
 
   constructor(binary: string) {
@@ -56,11 +66,16 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
       }
       if (message.id !== undefined) {
         const request = this.pending.get(message.id);
-        if (!request) return;
+        if (!request) {
+          if (message.method) {
+            this.onRequest?.(message as ProtocolMessage & { id: number; method: string });
+          }
+          return;
+        }
         clearTimeout(request.timer);
         this.pending.delete(message.id);
         if (message.error) {
-          request.reject(new Error(`${request.method} failed`));
+          request.reject(new CodexProtocolError(request.method, message.error));
         } else {
           request.resolve(message.result);
         }
@@ -75,6 +90,7 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
       clientInfo: { name: 'relay-provider-connection', version: '0.1.0' },
       capabilities: {}
     });
+    this.process.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`);
   }
 
   send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -95,6 +111,11 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
     });
   }
 
+  respond(id: number, result: unknown): void {
+    if (this.closed) return;
+    this.process.stdin.write(`${JSON.stringify({ id, result })}\n`);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -111,6 +132,12 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
     this.pending.clear();
     this.onFailure?.(error);
   }
+}
+
+export function createCodexAppServerSession(
+  binary = process.env.RELAY_CODEX_BIN ?? 'codex'
+): CodexAppServerSession {
+  return new ChildProcessCodexAppServerSession(binary);
 }
 
 function isLoginResult(value: unknown): value is {

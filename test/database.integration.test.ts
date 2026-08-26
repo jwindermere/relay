@@ -165,7 +165,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 7');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 8');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -175,7 +175,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 7 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 8 WHERE version = 99');
     }
   });
 
