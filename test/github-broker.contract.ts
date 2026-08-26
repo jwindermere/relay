@@ -16,11 +16,19 @@ const requiredEnvironment = [
   'RELAY_GITHUB_CONTRACT_DEFAULT_BRANCH'
 ] as const;
 const missingEnvironment = requiredEnvironment.filter((name) => !process.env[name]);
+const configurationRequired = process.env.RELAY_GITHUB_CONTRACT_REQUIRED === 'true';
 
 test('disposable protected repository enforces the complete broker contract', {
-  skip: missingEnvironment.length ? `missing contract environment: ${missingEnvironment.join(', ')}` : false,
+  skip: missingEnvironment.length && !configurationRequired
+    ? `missing contract environment: ${missingEnvironment.join(', ')}`
+    : false,
   timeout: 120_000
 }, async () => {
+  assert.deepEqual(
+    missingEnvironment,
+    [],
+    `missing required contract environment: ${missingEnvironment.join(', ')}`
+  );
   const runId = `contract-${Date.now()}`;
   const repositoryId = process.env.RELAY_GITHUB_CONTRACT_REPOSITORY_ID!;
   const boundary = {

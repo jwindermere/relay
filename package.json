@@ -24,6 +24,7 @@
     "test": "npm run test:unit && npm run test:prototype && npm run test:integration",
     "test:unit": "node --import tsx --test test/reconciliation.test.ts test/pilot-journey.test.ts test/approval-policy.test.ts test/codex-environment.test.ts test/runtime-config.test.ts test/realtime-ticket.test.ts test/deployment.test.ts test/github-api.test.ts test/github-protection.test.ts test/github-broker.test.ts test/github-broker-remote.test.ts test/github-webhook.test.ts",
     "test:github-contract": "node --import tsx --test test/github-broker.contract.ts",
+    "test:github-contract:required": "RELAY_GITHUB_CONTRACT_REQUIRED=true npm run test:github-contract",
     "test:prototype": "node --test prototype/*.test.mjs",
     "test:integration": "node --import tsx --test --test-isolation=none test/*.integration.test.ts",
     "test:operations": "node --import tsx --test --test-isolation=none test/operations.integration.test.ts"

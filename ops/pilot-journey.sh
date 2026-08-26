@@ -204,24 +204,9 @@ if [[ "${SKIP_DATABASE_TESTS:-false}" == "true" ]]; then
   warn "SKIP_DATABASE_TESTS cannot be used for pilot proof."
   exit 1
 fi
-CONTRACT_ENVIRONMENT=(
-  RELAY_GITHUB_APP_ID
-  RELAY_GITHUB_PRIVATE_KEY
-  RELAY_GITHUB_CONTRACT_INSTALLATION_ID
-  RELAY_GITHUB_CONTRACT_REPOSITORY_ID
-  RELAY_GITHUB_CONTRACT_REPOSITORY_OWNER
-  RELAY_GITHUB_CONTRACT_REPOSITORY_NAME
-  RELAY_GITHUB_CONTRACT_DEFAULT_BRANCH
-)
-for name in "${CONTRACT_ENVIRONMENT[@]}"; do
-  if [[ -z "${!name:-}" ]]; then
-    warn "$name is required; the live GitHub contract may not be skipped."
-    exit 1
-  fi
-done
 npm run check
 npm test
-npm run test:github-contract
+npm run test:github-contract:required
 require_confirmation "The complete test output is retained as pilot evidence?"
 
 stage "Two authenticated Pilot members"
