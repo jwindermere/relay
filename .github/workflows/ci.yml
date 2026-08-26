@@ -32,3 +32,4 @@ jobs:
       - run: node --import tsx --test --test-force-exit --test-isolation=none test/database.integration.test.ts
       - run: node --import tsx --test --test-force-exit --test-isolation=none test/operations.integration.test.ts
       - run: node --import tsx --test --test-force-exit --test-isolation=none test/worker.integration.test.ts
+        timeout-minutes: 3

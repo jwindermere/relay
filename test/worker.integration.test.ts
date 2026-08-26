@@ -4,7 +4,7 @@ import { createHmac } from 'node:crypto';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, test } from 'node:test';
+import { after, afterEach, test } from 'node:test';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { Pool } from 'pg';
 
@@ -43,6 +43,16 @@ if (skipDatabaseTests) {
   const pool = new Pool({ connectionString });
   const workspaceRoot = await mkdtemp(join(tmpdir(), 'relay-worker-test-'));
   await migrateDatabase(pool);
+
+  afterEach(async () => {
+    // A few tests deliberately leave work queued after asserting its state. Keep those fixtures
+    // from being claimed by a later test, since the production worker selects globally by age.
+    await pool.query(
+      `UPDATE public.agent_run
+       SET available_at = 'infinity'
+       WHERE status = 'queued'`
+    );
+  });
 
   after(async () => {
     await pool.end();
