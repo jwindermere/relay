@@ -33,7 +33,7 @@ async function recordSessionAudit(
        workspace_id, actor_user_id, actor_membership_id,
        event_type, subject_type, subject_id, evidence
      )
-     SELECT workspace_id, $1, id, $2, 'session', $3,
+     SELECT workspace_id, $1, id AS actor_membership_id, $2, 'session', $3,
        jsonb_build_object('userId', $1::text)
      FROM public.workspace_membership
      WHERE user_id = $1
