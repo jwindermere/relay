@@ -2,8 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
-
-const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'] as const;
+import {
+  AgentRunProviderError,
+  mapProviderOutcomeToAgentRunStatus,
+  readSafeCodexErrorCode,
+  type AgentRunProvider,
+  type AgentRunProviderInput,
+  type AgentRunProviderObserver,
+  type ProviderNotification
+} from '../lib/server/provider/agent-run.js';
 
 type AgentRunStatus =
   | 'queued'
@@ -16,59 +23,6 @@ type AgentRunStatus =
   | 'completed'
   | 'failed'
   | 'cancelled';
-
-export interface ProviderNotification {
-  method: 'item/started' | 'item/completed' | 'turn/completed';
-  providerEventId: string;
-  item?: { id?: string; type?: string; [key: string]: unknown };
-  turn?: {
-    id: string;
-    status: 'completed' | 'interrupted' | 'failed';
-    error?: { message?: string; codexErrorInfo?: unknown };
-  };
-}
-
-export interface AgentRunProviderInput {
-  signal: AbortSignal;
-  workspaceDirectory: string;
-  prompt: string;
-  approvalPolicy: 'onRequest';
-  sandboxPolicy: {
-    type: 'workspaceWrite';
-    writableRoots: string[];
-    readOnlyAccess: {
-      type: 'restricted';
-      includePlatformDefaults: boolean;
-      readableRoots: string[];
-    };
-    networkAccess: false;
-  };
-}
-
-export interface AgentRunProviderObserver {
-  threadStarted(threadId: string): Promise<void>;
-  turnStarted(turnId: string): Promise<void>;
-  notification(notification: ProviderNotification): Promise<void>;
-}
-
-export type ProviderReconciliation =
-  | { outcome: 'completed' | 'failed' | 'interrupted'; errorCode?: string }
-  | { outcome: 'indeterminate' };
-
-export interface AgentRunProvider {
-  execute(input: AgentRunProviderInput, observer: AgentRunProviderObserver): Promise<void>;
-  reconcile(input: { threadId: string; turnId: string }): Promise<ProviderReconciliation>;
-}
-
-export class AgentRunProviderError extends Error {
-  constructor(
-    readonly code: 'provider_limit' | 'provider_unavailable' | 'provider_failed',
-    message: string
-  ) {
-    super(message);
-    this.name = 'AgentRunProviderError';
-  }
-}
 
 export interface WorkerExecutionOptions {
   workerId: string;
@@ -87,11 +41,10 @@ export type WorkerCycleResult =
 interface ClaimedAgentRun {
   id: string;
   workspace_id: string;
-  provider_connection_id: string;
   request_snapshot: string;
+  credential_store_reference: string;
   provider_thread_id: string | null;
   active_turn_id: string | null;
-  prior_status: AgentRunStatus;
   lease_token: string;
   recovering: boolean;
 }
@@ -131,6 +84,7 @@ export async function processNextAgentRun(
      WHERE id = $1 AND lease_owner = $2 AND lease_token = $3`,
     [claim.id, options.workerId, claim.lease_token, workspaceDirectory]
   );
+  if (updated.rowCount !== 1) throw new Error('AgentRun execution lease was lost');
 
   let terminalStatus: AgentRunStatus | undefined;
   const observer: AgentRunProviderObserver = {
@@ -157,6 +111,7 @@ export async function processNextAgentRun(
   try {
     await provider.execute({
       signal: executionAbort.signal,
+      credentialStoreReference: claim.credential_store_reference,
       workspaceDirectory,
       prompt: claim.request_snapshot,
       approvalPolicy: 'onRequest',
@@ -187,6 +142,10 @@ export async function processNextAgentRun(
   } catch (error) {
     if (error instanceof AgentRunProviderError
       && (error.code === 'provider_limit' || error.code === 'provider_unavailable')) {
+      if (claim.provider_thread_id) {
+        await pauseUncertainAgentRun(pool, claim, error);
+        return { kind: 'executed', agentRunId: claim.id, status: 'paused' };
+      }
       await deferAgentRun(pool, claim, error, retryDelayMs);
       return { kind: 'deferred', agentRunId: claim.id, reason: error.code };
     }
@@ -223,11 +182,13 @@ async function claimNextAgentRun(
       request_snapshot: string;
       provider_thread_id: string | null;
       active_turn_id: string | null;
+      credential_store_reference: string;
       status: AgentRunStatus;
       recovering: boolean;
     }>(
       `SELECT run.id, run.workspace_id, run.provider_connection_id,
               task.request_snapshot, run.provider_thread_id, run.active_turn_id,
+              connection.credential_store_reference,
               run.status,
               (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1) AS recovering
        FROM public.agent_run run
@@ -295,11 +256,10 @@ async function claimNextAgentRun(
     return {
       id: row.id,
       workspace_id: row.workspace_id,
-      provider_connection_id: row.provider_connection_id,
       request_snapshot: row.request_snapshot,
+      credential_store_reference: row.credential_store_reference,
       provider_thread_id: row.provider_thread_id,
       active_turn_id: row.active_turn_id,
-      prior_status: row.status,
       lease_token: leaseToken,
       recovering: row.recovering
     };
@@ -341,9 +301,7 @@ async function recoverAgentRun(
       return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
     }
 
-    const status: AgentRunStatus = reconciliation.outcome === 'completed'
-      ? 'completed'
-      : reconciliation.outcome === 'interrupted' ? 'cancelled' : 'failed';
+    const status = mapProviderOutcomeToAgentRunStatus(reconciliation.outcome);
     await appendRunEvent(pool, claim, {
       eventType: 'provider.turn.reconciled',
       status,
@@ -427,10 +385,8 @@ async function persistProviderNotification(
   notification: ProviderNotification
 ): Promise<AgentRunStatus | undefined> {
   if (notification.method === 'turn/completed' && notification.turn) {
-    const errorCode = safeCodexErrorCode(notification.turn.error?.codexErrorInfo);
-    const status: AgentRunStatus = notification.turn.status === 'completed'
-      ? 'completed'
-      : notification.turn.status === 'interrupted' ? 'cancelled' : 'failed';
+    const errorCode = readSafeCodexErrorCode(notification.turn.error?.codexErrorInfo);
+    const status = mapProviderOutcomeToAgentRunStatus(notification.turn.status);
     await appendRunEvent(pool, claim, {
       eventType: 'provider.turn.completed',
       status,
@@ -481,15 +437,6 @@ function safeItemType(value: unknown): string {
     reasoning: 'Planning'
   };
   return summaries[value] ?? 'Codex activity';
-}
-
-function safeCodexErrorCode(value: unknown): string | undefined {
-  if (typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(value)) return value;
-  if (value && typeof value === 'object') {
-    const type = (value as Record<string, unknown>).type;
-    if (typeof type === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(type)) return type;
-  }
-  return undefined;
 }
 
 async function appendRunEvent(pool: Pool, claim: ClaimedAgentRun, event: RunEvent): Promise<void> {
@@ -623,4 +570,19 @@ async function deferAgentRun(
   } finally {
     client.release();
   }
+}
+
+async function pauseUncertainAgentRun(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  error: AgentRunProviderError
+): Promise<void> {
+  await appendRunEvent(pool, claim, {
+    eventType: 'run.paused',
+    status: 'paused',
+    summary: error.code === 'provider_limit'
+      ? 'Codex usage limit interrupted execution; human review is required'
+      : 'Codex became unavailable; human review is required',
+    evidence: { reason: error.code, providerOutcome: 'indeterminate' }
+  });
 }

@@ -102,6 +102,7 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
 
   await provider.execute({
     signal: new AbortController().signal,
+    credentialStoreReference: 'codex:test-reference',
     workspaceDirectory: '/tmp/relay-run-1',
     prompt: 'Inspect the test',
     approvalPolicy: 'onRequest',

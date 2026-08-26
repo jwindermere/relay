@@ -14,5 +14,7 @@ RUN npm ci --omit=dev
 COPY --from=build /app/build ./build
 COPY --from=build /app/build-runtime ./build-runtime
 COPY --from=build /app/migrations ./migrations
+RUN mkdir -p /home/node/.codex /var/lib/relay/agent-runs \
+  && chown -R node:node /home/node/.codex /var/lib/relay
 USER node
 CMD ["npm", "run", "start:web"]

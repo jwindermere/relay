@@ -6,12 +6,13 @@ import {
 } from './codex-runtime.js';
 import {
   AgentRunProviderError,
+  readSafeCodexErrorCode,
   type AgentRunProvider,
   type AgentRunProviderInput,
   type AgentRunProviderObserver,
   type ProviderNotification,
   type ProviderReconciliation
-} from '../../../worker/execution.js';
+} from './agent-run.js';
 
 export class LocalCodexAgentRunProvider implements AgentRunProvider {
   constructor(
@@ -110,7 +111,7 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       const outcome = turn.status as 'completed' | 'failed' | 'interrupted';
       return {
         outcome,
-        errorCode: readSafeErrorCode(asRecord(turn.error).codexErrorInfo)
+        errorCode: readSafeCodexErrorCode(asRecord(turn.error).codexErrorInfo)
       };
     } catch (error) {
       throw classifyProviderError(error);
@@ -125,10 +126,11 @@ function parseNotification(message: ProtocolMessage): ProviderNotification | und
   if (message.method === 'item/started' || message.method === 'item/completed') {
     const item = asRecord(message.params.item);
     const itemId = typeof item.id === 'string' ? item.id : undefined;
-    const turnId = typeof message.params.turnId === 'string' ? message.params.turnId : 'unknown';
+    const turnId = typeof message.params.turnId === 'string' ? message.params.turnId : undefined;
+    if (!itemId || !turnId) return undefined;
     return {
       method: message.method,
-      providerEventId: `${turnId}:${itemId ?? 'unknown'}:${message.method}`,
+      providerEventId: `${turnId}:${itemId}:${message.method}`,
       item
     };
   }
@@ -149,7 +151,7 @@ function parseNotification(message: ProtocolMessage): ProviderNotification | und
   return undefined;
 }
 
-function asRecord(value: unknown): Record<string, any> {
+function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 }
 
@@ -172,11 +174,4 @@ function classifyProviderError(error: unknown): AgentRunProviderError {
     return new AgentRunProviderError('provider_unavailable', 'Codex is unavailable');
   }
   return new AgentRunProviderError('provider_failed', 'Codex execution failed');
-}
-
-function readSafeErrorCode(value: unknown): string | undefined {
-  if (typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(value)) return value;
-  if (!value || typeof value !== 'object') return undefined;
-  const type = (value as Record<string, unknown>).type;
-  return typeof type === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(type) ? type : undefined;
 }

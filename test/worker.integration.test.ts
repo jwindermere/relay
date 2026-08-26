@@ -9,12 +9,12 @@ import { Pool } from 'pg';
 import { migrateDatabase } from '../src/lib/server/database/migrations.js';
 import {
   AgentRunProviderError,
-  processNextAgentRun,
   type AgentRunProvider,
   type AgentRunProviderInput,
   type AgentRunProviderObserver,
   type ProviderReconciliation
-} from '../src/worker/execution.js';
+} from '../src/lib/server/provider/agent-run.js';
+import { processNextAgentRun } from '../src/worker/execution.js';
 
 let container: StartedPostgreSqlContainer | undefined;
 let connectionString = process.env.TEST_DATABASE_URL;
@@ -41,6 +41,7 @@ if (skipDatabaseTests) {
     const ids = await seedQueuedAgentRun(pool, 'complete');
     const provider = new FixtureProvider(async (input, observer) => {
       assert.equal(input.prompt, '@Alex inspect the failing test.');
+      assert.equal(input.credentialStoreReference, 'credentials-complete');
       assert.equal(input.sandboxPolicy.type, 'workspaceWrite');
       assert.deepEqual(input.sandboxPolicy.writableRoots, [input.workspaceDirectory]);
       assert.equal(input.sandboxPolicy.networkAccess, false);
@@ -196,6 +197,41 @@ if (skipDatabaseTests) {
     assert.deepEqual(event.rows[0], {
       event_type: 'run.deferred',
       summary: 'Codex usage limit reached; execution remains queued'
+    });
+  });
+
+  test('Provider loss after a thread starts pauses the AgentRun instead of replaying it', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'provider-loss');
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-provider-loss');
+      await observer.turnStarted('turn-provider-loss');
+      throw new AgentRunProviderError('provider_unavailable', 'Codex became unavailable');
+    });
+
+    const result = await processNextAgentRun(pool, provider, {
+      workerId: 'worker-provider-loss', workspaceRoot, leaseDurationMs: 10_000
+    });
+    assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'paused' });
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-provider-loss', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'idle' });
+    assert.equal(provider.executions.length, 1);
+
+    const run = await pool.query<{
+      status: string;
+      provider_thread_id: string;
+      active_turn_id: string;
+      lease_owner: string | null;
+    }>(
+      `SELECT status, provider_thread_id, active_turn_id, lease_owner
+       FROM public.agent_run WHERE id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(run.rows[0], {
+      status: 'paused',
+      provider_thread_id: 'thread-provider-loss',
+      active_turn_id: 'turn-provider-loss',
+      lease_owner: null
     });
   });
 
