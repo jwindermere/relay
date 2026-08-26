@@ -2,7 +2,7 @@ import type { Pool } from 'pg';
 
 export const MIGRATION_STREAMS = Object.freeze({
   auth: Object.freeze({ postgresSchema: 'auth', requiredVersion: 1 }),
-  relay: Object.freeze({ postgresSchema: 'public', requiredVersion: 6 })
+  relay: Object.freeze({ postgresSchema: 'public', requiredVersion: 7 })
 });
 
 export type MigrationStreamName = keyof typeof MIGRATION_STREAMS;

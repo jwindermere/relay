@@ -86,6 +86,14 @@
   }
 </script>
 
+{#snippet agentMentionStatus(agentMention: (typeof data.sharedChannel.messages)[number]['agentMention'])}
+  {#if agentMention?.status === 'accepted'}
+    <p class="mt-2 text-xs font-semibold text-success">Engineering request queued</p>
+  {:else if agentMention?.status === 'rejected'}
+    <p class="mt-2 text-xs text-warning" role="status">{agentMention.reason}</p>
+  {/if}
+{/snippet}
+
 <svelte:head>
   <title>#{data.sharedChannel.channel.name} · Relay</title>
   <meta name="description" content="Relay shared engineering agent workspace" />
@@ -257,6 +265,7 @@
                     <span class="text-xs text-base-content/45">{message.author.roleLabel} · {formatTime(message.createdAt)}</span>
                   </div>
                   <p class="mt-1 whitespace-pre-wrap text-sm leading-6">{message.body}</p>
+                  {@render agentMentionStatus(message.agentMention)}
                   <button class="btn btn-ghost btn-xs mt-2" type="button" onclick={() => beginReply(message.id)}>Reply</button>
                 </div>
               </div>
@@ -272,6 +281,7 @@
                           <span class="text-xs text-base-content/45">{formatTime(reply.createdAt)}</span>
                         </div>
                         <p class="mt-1 whitespace-pre-wrap text-sm leading-6">{reply.body}</p>
+                        {@render agentMentionStatus(reply.agentMention)}
                       </div>
                     </div>
                   {/each}
@@ -288,14 +298,17 @@
         method="POST"
         action="?/send"
         class="mx-auto max-w-3xl"
-        use:enhance={() => async ({ update }) => {
+        use:enhance={() => async ({ result, update }) => {
           await update({ reset: true });
-          replyToId = null;
+          if (result.type === 'success') {
+            replyToId = null;
+          }
           await invalidateAll();
         }}
       >
         <input type="hidden" name="channelId" value={data.sharedChannel.channel.id} />
         <input type="hidden" name="parentMessageId" value={replyToId ?? ''} />
+        <input type="hidden" name="submissionId" value={data.messageSubmissionId} />
         {#if replyToId}
           <div class="mb-2 flex items-center justify-between rounded-lg bg-base-200 px-3 py-2 text-xs">
             <span>Replying to a channel Message</span>

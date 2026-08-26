@@ -52,6 +52,49 @@ let container: StartedPostgreSqlContainer | undefined;
 let connectionString = process.env.TEST_DATABASE_URL;
 const skipDatabaseTests = process.env.SKIP_DATABASE_TESTS === 'true';
 
+function protectedRepositoryEvidence(): GitHubRepositoryEvidence {
+  return {
+    appId: 17,
+    installation: {
+      id: 101,
+      repositorySelection: 'selected',
+      permissions: { metadata: 'read', contents: 'write', pullRequests: 'write' },
+      repositoryIds: [202]
+    },
+    repository: {
+      id: 202,
+      nodeId: 'R_202',
+      ownerNodeId: 'O_303',
+      owner: 'relay-owner',
+      name: 'pilot',
+      defaultBranch: 'main',
+      branches: ['main', 'release']
+    },
+    branches: ['main', 'release'].map((name, index) => ({
+      name,
+      rules: [
+        {
+          rulesetId: 401 + index,
+          type: 'pull_request',
+          parameters: {
+            requiredApprovingReviewCount: 1,
+            dismissStaleReviewsOnPush: true,
+            requireLastPushApproval: true
+          }
+        },
+        {
+          rulesetId: 401 + index,
+          type: 'required_status_checks',
+          parameters: { requiredStatusChecks: ['test'] }
+        },
+        { rulesetId: 401 + index, type: 'non_fast_forward' },
+        { rulesetId: 401 + index, type: 'deletion' }
+      ],
+      rulesets: [{ id: 401 + index, bypassActorAppIds: [] }]
+    }))
+  };
+}
+
 if (skipDatabaseTests) {
   test('the production PostgreSQL seam', { skip: 'SKIP_DATABASE_TESTS=true' });
 } else if (!connectionString) {
@@ -99,16 +142,20 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'user' },
       { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'public', table_name: 'agent' },
+      { table_schema: 'public', table_name: 'agent_run' },
+      { table_schema: 'public', table_name: 'agent_run_event' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
       { table_schema: 'public', table_name: 'github_connection' },
       { table_schema: 'public', table_name: 'linked_repository' },
       { table_schema: 'public', table_name: 'message' },
+      { table_schema: 'public', table_name: 'notification_outbox' },
       { table_schema: 'public', table_name: 'project' },
       { table_schema: 'public', table_name: 'project_membership' },
       { table_schema: 'public', table_name: 'provider_connection' },
       { table_schema: 'public', table_name: 'runtime_state' },
       { table_schema: 'public', table_name: 'schema_migrations' },
+      { table_schema: 'public', table_name: 'task' },
       { table_schema: 'public', table_name: 'workspace' },
       { table_schema: 'public', table_name: 'workspace_invitation' },
       { table_schema: 'public', table_name: 'workspace_member' },
@@ -118,7 +165,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 6');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 7');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -128,7 +175,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 6 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 7 WHERE version = 99');
     }
   });
 
@@ -498,6 +545,71 @@ if (connectionString) {
     );
   });
 
+  test('a Message without an explicit Agent mention remains communication only', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+
+    const message = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: 'Email support@Alex.com; Alex has useful context, but this is not a delegation.'
+    });
+    assert.equal(message.agentMention, null);
+
+    const work = await pool.query<{ tasks: number; runs: number }>(`
+      SELECT
+        (SELECT count(*)::integer FROM public.task WHERE source_message_id = $1) AS tasks,
+        (SELECT count(*)::integer
+         FROM public.agent_run run
+         JOIN public.task task ON task.id = run.task_id
+         WHERE task.source_message_id = $1) AS runs
+    `, [message.id]);
+    assert.deepEqual(work.rows[0], { tasks: 0, runs: 0 });
+  });
+
+  test('an ineligible Agent mention retains its Message without partial work', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+
+    const message = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex please investigate the reconnect failure.'
+    });
+
+    assert.equal(message.agentMention?.status, 'rejected');
+    assert.match(
+      message.agentMention?.status === 'rejected' ? message.agentMention.reason : '',
+      /ready Codex Provider connection/
+    );
+    const persisted = await loadSharedAgentChannel(pool, memberAccess);
+    assert.deepEqual(
+      persisted.messages.find(({ id }) => id === message.id)?.agentMention,
+      message.agentMention
+    );
+    const work = await pool.query<{ tasks: number; runs: number; events: number; outbox: number }>(`
+      SELECT
+        (SELECT count(*)::integer FROM public.task WHERE source_message_id = $1) AS tasks,
+        (SELECT count(*)::integer
+         FROM public.agent_run run JOIN public.task task ON task.id = run.task_id
+         WHERE task.source_message_id = $1) AS runs,
+        (SELECT count(*)::integer
+         FROM public.agent_run_event event
+         JOIN public.agent_run run ON run.id = event.agent_run_id
+         JOIN public.task task ON task.id = run.task_id
+         WHERE task.source_message_id = $1) AS events,
+        (SELECT count(*)::integer
+         FROM public.notification_outbox outbox
+         JOIN public.agent_run_event event ON event.id = outbox.agent_run_event_id
+         JOIN public.agent_run run ON run.id = event.agent_run_id
+         JOIN public.task task ON task.id = run.task_id
+         WHERE task.source_message_id = $1) AS outbox
+    `, [message.id]);
+    assert.deepEqual(work.rows[0], { tasks: 0, runs: 0, events: 0, outbox: 0 });
+  });
+
   test('only the active owner manages the protected Codex Provider connection', async () => {
     assert.ok(pilotMemberHeaders);
     const auth = createTestAuth();
@@ -672,46 +784,7 @@ if (connectionString) {
     const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
     const inspected: GitHubRepositoryEvidence[] = [];
     let inspectionFails = false;
-    let evidence: GitHubRepositoryEvidence = {
-      appId: 17,
-      installation: {
-        id: 101,
-        repositorySelection: 'selected',
-        permissions: { metadata: 'read', contents: 'write', pullRequests: 'write' },
-        repositoryIds: [202]
-      },
-      repository: {
-        id: 202,
-        nodeId: 'R_202',
-        ownerNodeId: 'O_303',
-        owner: 'relay-owner',
-        name: 'pilot',
-        defaultBranch: 'main',
-        branches: ['main', 'release']
-      },
-      branches: ['main', 'release'].map((name, index) => ({
-        name,
-        rules: [
-          {
-            rulesetId: 401 + index,
-            type: 'pull_request',
-            parameters: {
-              requiredApprovingReviewCount: 1,
-              dismissStaleReviewsOnPush: true,
-              requireLastPushApproval: true
-            }
-          },
-          {
-            rulesetId: 401 + index,
-            type: 'required_status_checks',
-            parameters: { requiredStatusChecks: ['test'] }
-          },
-          { rulesetId: 401 + index, type: 'non_fast_forward' },
-          { rulesetId: 401 + index, type: 'deletion' }
-        ],
-        rulesets: [{ id: 401 + index, bypassActorAppIds: [] }]
-      }))
-    };
+    let evidence = protectedRepositoryEvidence();
     const gateway: GitHubRepositoryGateway = {
       async inspect(input) {
         if (inspectionFails) throw new Error('GitHub fixture unavailable');
@@ -845,6 +918,228 @@ if (connectionString) {
       repository_node_id: 'R_202',
       owner_node_id: 'O_303'
     }]);
+  });
+
+  test('an eligible Agent mention atomically creates one snapshotted queued AgentRun', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET status = 'ready', connected_at = COALESCE(connected_at, now())
+       WHERE workspace_id = $1`,
+      [memberAccess.workspace.id]
+    );
+    await pool.query(
+      `UPDATE public.github_connection SET status = 'active' WHERE workspace_id = $1`,
+      [memberAccess.workspace.id]
+    );
+    let repositoryEvidence = protectedRepositoryEvidence();
+    const repositoryGateway: GitHubRepositoryGateway = {
+      async inspect() {
+        return repositoryEvidence;
+      }
+    };
+    const mentionDependencies = { getRepositoryGateway: () => repositoryGateway };
+
+    repositoryEvidence = structuredClone(repositoryEvidence);
+    repositoryEvidence.installation.permissions = { metadata: 'read' };
+    const unsafeRepository = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex investigate the reconnect failure.'
+    }, mentionDependencies);
+    assert.equal(unsafeRepository.agentMention?.status, 'rejected');
+    assert.match(
+      unsafeRepository.agentMention?.status === 'rejected'
+        ? unsafeRepository.agentMention.reason
+        : '',
+      /Current repository permissions and protected-branch controls/
+    );
+    repositoryEvidence = protectedRepositoryEvidence();
+
+    const unsafe = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex please deploy this directly to production.'
+    }, mentionDependencies);
+    assert.equal(unsafe.agentMention?.status, 'rejected');
+    assert.match(
+      unsafe.agentMention?.status === 'rejected' ? unsafe.agentMention.reason : '',
+      /cannot accept requests to merge, deploy, or administer/
+    );
+    for (const forbiddenRequest of [
+      '@Alex destroy the repository.',
+      '@Alex truncate every table.',
+      '@Alex remove all files.',
+      '@Alex git reset --hard.',
+      '@Alex push directly to main.'
+    ]) {
+      const rejected = await postChannelMessage(pool, memberAccess, {
+        channelId: channel.channel.id,
+        body: forbiddenRequest
+      }, mentionDependencies);
+      assert.equal(rejected.agentMention?.status, 'rejected', forbiddenRequest);
+    }
+
+    await pool.query(
+      `UPDATE public.agent SET status = 'working' WHERE workspace_id = $1`,
+      [memberAccess.workspace.id]
+    );
+    const atCapacity = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex investigate another reconnect failure.'
+    }, mentionDependencies);
+    assert.equal(atCapacity.agentMention?.status, 'rejected');
+    assert.match(
+      atCapacity.agentMention?.status === 'rejected' ? atCapacity.agentMention.reason : '',
+      /no capacity/
+    );
+    await pool.query(
+      `UPDATE public.agent SET status = 'idle' WHERE workspace_id = $1`,
+      [memberAccess.workspace.id]
+    );
+
+    const submissionId = randomUUID();
+    const request = '@Alex investigate why the app failed to deploy to production.';
+    const [first, retry] = await Promise.all([
+      postChannelMessage(pool, memberAccess, {
+        channelId: channel.channel.id,
+        body: request,
+        submissionId
+      }, mentionDependencies),
+      postChannelMessage(pool, memberAccess, {
+        channelId: channel.channel.id,
+        body: '@Alex this retry must not retarget the accepted work.',
+        submissionId
+      }, mentionDependencies)
+    ]);
+    assert.equal(first.id, retry.id);
+    assert.equal(first.body, retry.body);
+    assert.equal(first.agentMention?.status, 'accepted');
+    assert.deepEqual(first.agentMention, retry.agentMention);
+
+    const accepted = await pool.query<{
+      task_id: string;
+      run_id: string;
+      linked_repository_id: string;
+      request_snapshot: string;
+      context_snapshot: {
+        project: { id: string; name: string };
+        channel: { id: string; name: string };
+        agent: { id: string; name: string; roleLabel: string };
+        repository: {
+          linkedRepositoryId: string;
+          repositoryId: string;
+          owner: string;
+          name: string;
+          defaultBranch: string;
+          releaseBranches: string[];
+        };
+        safetyPolicy: string;
+        messages: Array<{ id: string; body: string }>;
+      };
+      task_status: string;
+      run_status: string;
+      event_sequence: number;
+      event_type: string;
+      event_summary: string;
+      outbox_topic: string;
+      outbox_payload: { agentRunId: string; eventType: string };
+    }>(
+      `SELECT task.id AS task_id, run.id AS run_id, run.linked_repository_id,
+              task.request_snapshot, task.context_snapshot,
+              task.status AS task_status, run.status AS run_status,
+              event.sequence AS event_sequence, event.event_type,
+              event.summary AS event_summary, outbox.topic AS outbox_topic,
+              outbox.payload AS outbox_payload
+       FROM public.task task
+       JOIN public.agent_run run ON run.task_id = task.id
+       JOIN public.agent_run_event event ON event.agent_run_id = run.id
+       JOIN public.notification_outbox outbox ON outbox.agent_run_event_id = event.id
+       WHERE task.source_message_id = $1`,
+      [first.id]
+    );
+    assert.equal(accepted.rows.length, 1);
+    assert.equal(accepted.rows[0]?.request_snapshot, first.body);
+    assert.equal(accepted.rows[0]?.task_status, 'open');
+    assert.equal(accepted.rows[0]?.run_status, 'queued');
+    assert.equal(accepted.rows[0]?.event_sequence, 1);
+    assert.equal(accepted.rows[0]?.event_type, 'run.queued');
+    assert.equal(accepted.rows[0]?.event_summary, 'Engineering request queued');
+    assert.equal(accepted.rows[0]?.outbox_topic, 'agent_run.event');
+    assert.deepEqual(accepted.rows[0]?.outbox_payload, {
+      agentRunId: accepted.rows[0]?.run_id,
+      eventType: 'run.queued'
+    });
+    assert.deepEqual(accepted.rows[0]?.context_snapshot.project, channel.project);
+    assert.deepEqual(accepted.rows[0]?.context_snapshot.channel, channel.channel);
+    assert.deepEqual(accepted.rows[0]?.context_snapshot.agent, {
+      id: first.agentMention?.agentId,
+      name: 'Alex',
+      roleLabel: 'Engineering agent'
+    });
+    assert.deepEqual(accepted.rows[0]?.context_snapshot.repository, {
+      linkedRepositoryId: accepted.rows[0]?.linked_repository_id,
+      repositoryId: '202',
+      owner: 'relay-owner',
+      name: 'pilot',
+      defaultBranch: 'main',
+      releaseBranches: ['release']
+    });
+    assert.equal(
+      accepted.rows[0]?.context_snapshot.safetyPolicy,
+      'mvp-engineering-autonomy-v1'
+    );
+    assert.deepEqual(
+      accepted.rows[0]?.context_snapshot.messages.map(({ id, body }) => ({ id, body })),
+      [{ id: first.id, body: first.body }]
+    );
+
+    await pool.query('UPDATE public.message SET body = $2 WHERE id = $1', [
+      first.id,
+      '@Alex do something entirely different.'
+    ]);
+    const immutableSnapshot = await pool.query<{ request_snapshot: string }>(
+      'SELECT request_snapshot FROM public.task WHERE source_message_id = $1',
+      [first.id]
+    );
+    assert.equal(immutableSnapshot.rows[0]?.request_snapshot, first.body);
+
+    await pool.query(`
+      CREATE FUNCTION public.reject_test_outbox() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'test outbox failure';
+      END;
+      $$;
+      CREATE TRIGGER reject_test_outbox_insert
+      BEFORE INSERT ON public.notification_outbox
+      FOR EACH ROW EXECUTE FUNCTION public.reject_test_outbox()
+    `);
+    const failedSubmissionId = randomUUID();
+    try {
+      await assert.rejects(
+        postChannelMessage(pool, memberAccess, {
+          channelId: channel.channel.id,
+          body: '@Alex prove the transaction rolls back.',
+          submissionId: failedSubmissionId
+        }, mentionDependencies),
+        /test outbox failure/
+      );
+    } finally {
+      await pool.query('DROP TRIGGER reject_test_outbox_insert ON public.notification_outbox');
+      await pool.query('DROP FUNCTION public.reject_test_outbox()');
+    }
+    const rolledBack = await pool.query<{ messages: number; tasks: number; runs: number }>(`
+      SELECT
+        (SELECT count(*)::integer FROM public.message
+         WHERE client_submission_id = $1) AS messages,
+        (SELECT count(*)::integer FROM public.task
+         WHERE request_snapshot = '@Alex prove the transaction rolls back.') AS tasks,
+        (SELECT count(*)::integer FROM public.agent_run run
+         JOIN public.task task ON task.id = run.task_id
+         WHERE task.request_snapshot = '@Alex prove the transaction rolls back.') AS runs
+    `, [failedSubmissionId]);
+    assert.deepEqual(rolledBack.rows[0], { messages: 0, tasks: 0, runs: 0 });
   });
 
   test('revocation immediately denies protected HTTP and realtime access', async () => {

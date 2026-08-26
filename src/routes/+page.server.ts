@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { fail, redirect } from '@sveltejs/kit';
 
 import { getRelayAuth } from '$lib/server/auth.js';
@@ -11,6 +12,7 @@ import {
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
+import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 import { loadLinkedRepository } from '$lib/server/github/connection.js';
 import { loadProviderConnection } from '$lib/server/provider/connection.js';
 
@@ -34,6 +36,7 @@ export async function load({ request }) {
       sharedChannel,
       providerConnection,
       linkedRepository,
+      messageSubmissionId: randomUUID(),
       readyForAgentExecution:
         providerConnection.readyForExecution && linkedRepository.readyForAutonomousWork
     };
@@ -52,14 +55,26 @@ export const actions = {
       const channelId = form.get('channelId');
       const body = form.get('body');
       const parentMessageId = form.get('parentMessageId');
-      if (typeof channelId !== 'string' || typeof body !== 'string') {
+      const submissionId = form.get('submissionId');
+      if (
+        typeof channelId !== 'string'
+        || typeof body !== 'string'
+        || typeof submissionId !== 'string'
+        || !submissionId.trim()
+      ) {
         return fail(400, { message: 'invalid Message request' });
       }
-      await postChannelMessage(pool, access, {
-        channelId,
-        body,
-        ...(typeof parentMessageId === 'string' && parentMessageId ? { parentMessageId } : {})
-      });
+      await postChannelMessage(
+        pool,
+        access,
+        {
+          channelId,
+          body,
+          submissionId,
+          ...(typeof parentMessageId === 'string' && parentMessageId ? { parentMessageId } : {})
+        },
+        { getRepositoryGateway: getGitHubRepositoryGateway }
+      );
       return { sent: true };
     } catch (error) {
       if (error instanceof ChannelMessageError) {
