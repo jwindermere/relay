@@ -27,7 +27,7 @@ import {
   type ManagedLoginCompletion
 } from '../src/lib/server/provider/connection.js';
 import {
-  disableLinkedRepository,
+  disableGitHubConnection,
   linkGitHubRepository,
   loadLinkedRepository,
   requireAutonomousLinkedRepository,
@@ -738,7 +738,8 @@ if (connectionString) {
       repositoryId: '202',
       releaseBranches: ['release']
     }, gateway);
-    assert.equal(unsafe.state, 'linked');
+    assert.equal(unsafe.linkState, 'linked');
+    assert.equal(unsafe.githubConnectionState, 'active');
     assert.equal(unsafe.readyForAutonomousWork, false);
     assert.deepEqual(unsafe.configuration?.repository, {
       owner: 'relay-owner',
@@ -752,7 +753,8 @@ if (connectionString) {
     );
 
     const memberView = await loadLinkedRepository(pool, memberAccess);
-    assert.equal(memberView.state, 'linked');
+    assert.equal(memberView.linkState, 'linked');
+    assert.equal(memberView.githubConnectionState, 'active');
     assert.equal(memberView.readyForAutonomousWork, false);
     assert.equal(memberView.canManage, false);
     assert.equal(memberView.configuration, undefined);
@@ -811,14 +813,16 @@ if (connectionString) {
       /current Workspace owner access is required/
     );
     await assert.rejects(
-      disableLinkedRepository(pool, memberAccess),
+      disableGitHubConnection(pool, memberAccess),
       /current Workspace owner access is required/
     );
-    const disabled = await disableLinkedRepository(pool, ownerAccess);
-    assert.equal(disabled.state, 'disabled');
+    const disabled = await disableGitHubConnection(pool, ownerAccess);
+    assert.equal(disabled.linkState, 'linked');
+    assert.equal(disabled.githubConnectionState, 'disabled');
     assert.equal(disabled.readyForAutonomousWork, false);
     const disabledVerification = await verifyLinkedRepository(pool, ownerAccess, gateway);
-    assert.equal(disabledVerification.state, 'disabled');
+    assert.equal(disabledVerification.linkState, 'linked');
+    assert.equal(disabledVerification.githubConnectionState, 'disabled');
     assert.equal(disabledVerification.readyForAutonomousWork, false);
     assert.equal(inspected.length, 6);
 

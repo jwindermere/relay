@@ -150,7 +150,7 @@
       <div class="flex items-center justify-between gap-2">
         <strong class="text-sm">GitHub</strong>
         <span class:badge-success={data.linkedRepository.readyForAutonomousWork} class="badge badge-sm">
-          {data.linkedRepository.state.replace('_', ' ')}
+          {data.linkedRepository.githubConnectionState.replace('_', ' ')}
         </span>
       </div>
       <p class="mt-2 text-xs leading-5 text-base-content/60">
@@ -181,12 +181,12 @@
           <input class="input input-sm w-full" bind:value={githubReleaseBranches} placeholder="Release branches, comma separated" aria-label="Release branches" />
           <div class="flex flex-wrap gap-2">
             <button class="btn btn-primary btn-xs" type="button" disabled={githubBusy || !githubInstallationId.trim()} onclick={() => void manageGitHub('link')}>
-              {data.linkedRepository.state === 'not_linked' ? 'Link selected repository' : 'Replace repository'}
+              {data.linkedRepository.linkState === 'not_linked' ? 'Link selected repository' : 'Replace repository'}
             </button>
-            {#if data.linkedRepository.state !== 'not_linked'}
+            {#if data.linkedRepository.linkState === 'linked'}
               <button class="btn btn-ghost btn-xs" type="button" disabled={githubBusy} onclick={() => void manageGitHub('verify')}>Verify controls</button>
             {/if}
-            {#if data.linkedRepository.state === 'linked'}
+            {#if data.linkedRepository.githubConnectionState === 'active'}
               <button class="btn btn-ghost btn-xs" type="button" disabled={githubBusy} onclick={() => void manageGitHub('disable')}>Disable</button>
             {/if}
           </div>

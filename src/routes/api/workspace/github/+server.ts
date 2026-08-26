@@ -8,7 +8,7 @@ import {
 import { getDatabasePool } from '$lib/server/database/pool.js';
 import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 import {
-  disableLinkedRepository,
+  disableGitHubConnection,
   linkGitHubRepository,
   loadLinkedRepository,
   LinkedRepositoryError,
@@ -68,7 +68,7 @@ export async function POST({ request }) {
       });
     }
     if (requestInput.action === 'disable') {
-      return json({ connection: await disableLinkedRepository(pool, access) });
+      return json({ connection: await disableGitHubConnection(pool, access) });
     }
     throw new LinkedRepositoryError('invalid GitHub repository action');
   } catch (error) {

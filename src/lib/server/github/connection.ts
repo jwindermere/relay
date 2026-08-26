@@ -22,7 +22,8 @@ export interface GitHubRepositoryGateway {
 }
 
 export interface SafeLinkedRepository {
-  state: 'not_linked' | 'linked' | 'disabled';
+  linkState: 'not_linked' | 'linked';
+  githubConnectionState: 'not_connected' | 'active' | 'disabled';
   readyForAutonomousWork: boolean;
   canManage: boolean;
   configuration?: {
@@ -98,10 +99,16 @@ function safeConnection(
   canManage: boolean
 ): SafeLinkedRepository {
   if (!row) {
-    return { state: 'not_linked', readyForAutonomousWork: false, canManage };
+    return {
+      linkState: 'not_linked',
+      githubConnectionState: 'not_connected',
+      readyForAutonomousWork: false,
+      canManage
+    };
   }
   return {
-    state: row.connection_status === 'active' ? 'linked' : 'disabled',
+    linkState: 'linked',
+    githubConnectionState: row.connection_status,
     readyForAutonomousWork:
       row.connection_status === 'active' && row.ready_for_autonomous_work,
     canManage,
@@ -419,7 +426,7 @@ export async function verifyLinkedRepository(
   });
 }
 
-export async function disableLinkedRepository(
+export async function disableGitHubConnection(
   pool: Pool,
   access: WorkspaceAccess
 ): Promise<SafeLinkedRepository> {
