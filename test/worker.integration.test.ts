@@ -672,7 +672,7 @@ if (skipDatabaseTests) {
     assert.equal(stored.rows[0]?.decision_message_id, decision.id);
     assert.equal(
       stored.rows[0]?.decided_by_workspace_member_id,
-      ids.memberAccess.membership.id
+      ids.memberWorkspaceMemberId
     );
     await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -1304,8 +1304,10 @@ if (skipDatabaseTests) {
       [
         ids.workspaceId,
         ids.runId,
-        [{ id: 'recovery', header: 'Recovery', question: 'Include restart recovery?', options: null }],
-        { recovery: ['Yes, include restart recovery.'] },
+        JSON.stringify([
+          { id: 'recovery', header: 'Recovery', question: 'Include restart recovery?', options: null }
+        ]),
+        JSON.stringify({ recovery: ['Yes, include restart recovery.'] }),
         ids.pilotMemberId
       ]
     );
@@ -1566,6 +1568,7 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     agentMemberId,
     channelId,
     pilotMemberId,
+    memberWorkspaceMemberId: secondPilotMemberId,
     linkedRepositoryId,
     ownerAccess: {
       identity: { userId, email: `${suffix}@example.com`, sessionId: `session-${suffix}` },
