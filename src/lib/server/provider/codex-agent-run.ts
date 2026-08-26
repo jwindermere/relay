@@ -12,6 +12,7 @@ import {
   type AgentRunProviderObserver,
   type ProviderClarificationRequest,
   type ProviderNotification,
+  type ProviderInterruptionInput,
   type ProviderReconciliation
 } from './agent-run.js';
 import {
@@ -33,6 +34,9 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
     const referencesPersisted = new Promise<void>((resolve) => { releaseNotifications = resolve; });
     let notificationChain = Promise.resolve();
     let requestChain = Promise.resolve();
+    let providerThreadId: string | undefined;
+    let providerTurnId: string | undefined;
+    let interruptSent = false;
     let resolveTerminal!: () => void;
     let rejectTerminal!: (error: Error) => void;
     const terminal = new Promise<void>((resolve, reject) => {
@@ -46,7 +50,16 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
         'Codex execution stopped after its AgentRun lease was lost'
       ));
     };
+    const interrupt = () => {
+      if (interruptSent || !providerThreadId || !providerTurnId) return;
+      interruptSent = true;
+      void session.send('turn/interrupt', {
+        threadId: providerThreadId,
+        turnId: providerTurnId
+      }).catch((error) => rejectTerminal(classifyProviderError(error)));
+    };
     input.signal.addEventListener('abort', abort, { once: true });
+    input.cancellationSignal?.addEventListener('abort', interrupt, { once: true });
 
     session.onNotification = (message) => {
       const notification = parseNotification(message);
@@ -71,7 +84,9 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
             ]))
           });
           await observer.clarificationDelivered(request.providerRequestId);
-        }).catch((error) => rejectTerminal(classifyProviderError(error)));
+        }).catch((error) => {
+          if (!input.cancellationSignal?.aborted) rejectTerminal(classifyProviderError(error));
+        });
         return;
       }
       if (message.method === 'item/commandExecution/requestApproval'
@@ -105,7 +120,9 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
             message.id,
             decision === 'approved' ? action.providerResponse : deniedResponse(action.actionKind)
           );
-        }).catch((error) => rejectTerminal(classifyProviderError(error)));
+        }).catch((error) => {
+          if (!input.cancellationSignal?.aborted) rejectTerminal(classifyProviderError(error));
+        });
       }
     };
     session.onFailure = (error) => rejectTerminal(classifyProviderError(error));
@@ -124,6 +141,7 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
             }
       ));
       const threadId = readId(asRecord(threadResult.thread), 'Codex thread');
+      providerThreadId = threadId;
       if (input.providerThreadId && threadId !== input.providerThreadId) {
         throw new Error('Codex resumed a different Provider thread');
       }
@@ -137,7 +155,9 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
         sandboxPolicy: input.sandboxPolicy
       }));
       const turnId = readId(asRecord(turnResult.turn), 'Codex turn');
+      providerTurnId = turnId;
       await observer.turnStarted(turnId);
+      if (input.cancellationSignal?.aborted) interrupt();
       releaseNotifications();
       await terminal;
       await notificationChain;
@@ -147,6 +167,22 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       throw classifyProviderError(error);
     } finally {
       input.signal.removeEventListener('abort', abort);
+      input.cancellationSignal?.removeEventListener('abort', interrupt);
+      session.close();
+    }
+  }
+
+  async interrupt(input: ProviderInterruptionInput): Promise<void> {
+    const session = this.createSession(this.binary);
+    try {
+      await session.initialize();
+      await session.send('turn/interrupt', {
+        threadId: input.threadId,
+        turnId: input.turnId
+      });
+    } catch (error) {
+      throw classifyProviderError(error);
+    } finally {
       session.close();
     }
   }

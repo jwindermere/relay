@@ -18,6 +18,7 @@ export interface ReconciledAgentRunEvent {
 export interface ReconciledAgentRun {
   id: string;
   sourceMessageId: string;
+  attemptNumber: number;
   status: AgentRunStatus;
   summary: string;
   sequence: number;
@@ -33,14 +34,17 @@ export interface ChannelReconciliation {
 interface RunRow {
   id: string;
   source_message_id: string;
+  attempt_number: number;
   status: AgentRunStatus;
   sequence: number;
+  event_type: string;
 }
 
 interface EventRow {
   agent_run_id: string;
   sequence: number;
   status: AgentRunStatus;
+  event_type: string;
 }
 
 export async function loadChannelReconciliation(
@@ -51,13 +55,13 @@ export async function loadChannelReconciliation(
 ): Promise<ChannelReconciliation> {
   const messages = await loadAuthorizedChannelMessages(pool, access, channelId);
   const runs = await pool.query<RunRow>(
-    `SELECT run.id, task.source_message_id, run.status,
-            latest.sequence
+    `SELECT run.id, task.source_message_id, run.attempt_number, run.status,
+            latest.sequence, latest.event_type
      FROM public.message source_message
      JOIN public.task task ON task.source_message_id = source_message.id
      JOIN public.agent_run run ON run.task_id = task.id
      JOIN LATERAL (
-       SELECT event.sequence
+       SELECT event.sequence, event.event_type
        FROM public.agent_run_event event
        WHERE event.agent_run_id = run.id
        ORDER BY event.sequence DESC
@@ -73,7 +77,7 @@ export async function loadChannelReconciliation(
   const events = runIds.length === 0
     ? { rows: [] as EventRow[] }
     : await pool.query<EventRow>(
-        `SELECT event.agent_run_id, event.sequence, event.status
+        `SELECT event.agent_run_id, event.sequence, event.status, event.event_type
          FROM public.agent_run_event event
          WHERE event.agent_run_id = ANY($1::text[])
          ORDER BY event.agent_run_id, event.sequence`,
@@ -87,7 +91,7 @@ export async function loadChannelReconciliation(
     runEvents.push({
       sequence: event.sequence,
       status: event.status,
-      summary: visibleAgentRunSummary(event.status)
+      summary: visibleAgentRunSummary(event.status, event.event_type)
     });
     eventsByRun.set(event.agent_run_id, runEvents);
   }
@@ -98,15 +102,17 @@ export async function loadChannelReconciliation(
     runs: runs.rows.map((run) => ({
       id: run.id,
       sourceMessageId: run.source_message_id,
+      attemptNumber: run.attempt_number,
       status: run.status,
-      summary: visibleAgentRunSummary(run.status),
+      summary: visibleAgentRunSummary(run.status, run.event_type),
       sequence: run.sequence,
       events: eventsByRun.get(run.id) ?? []
     }))
   };
 }
 
-function visibleAgentRunSummary(status: AgentRunStatus): string {
+function visibleAgentRunSummary(status: AgentRunStatus, eventType?: string): string {
+  if (eventType === 'run.cancellation_requested') return 'Cancellation requested';
   const summaries: Record<AgentRunStatus, string> = {
     queued: 'Engineering request queued',
     planning: 'Planning the request',

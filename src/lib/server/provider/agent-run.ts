@@ -27,6 +27,7 @@ export type AgentRunEventType =
   | 'run.approval_denied'
   | 'run.approval_consumed'
   | 'run.action_rejected'
+  | 'run.cancellation_requested'
   | 'provider.thread.started'
   | 'provider.turn.started'
   | 'provider.turn.completed'
@@ -47,6 +48,7 @@ export interface ProviderNotification {
 
 export interface AgentRunProviderInput {
   signal: AbortSignal;
+  cancellationSignal?: AbortSignal;
   credentialStoreReference: string;
   workspaceDirectory: string;
   prompt: string;
@@ -104,8 +106,15 @@ export type ProviderReconciliation =
   | { outcome: ProviderTerminalOutcome; errorCode?: string }
   | { outcome: 'indeterminate' };
 
+export interface ProviderInterruptionInput {
+  threadId: string;
+  turnId: string;
+  credentialStoreReference: string;
+}
+
 export interface AgentRunProvider {
   execute(input: AgentRunProviderInput, observer: AgentRunProviderObserver): Promise<void>;
+  interrupt(input: ProviderInterruptionInput): Promise<void>;
   reconcile(input: { threadId: string; turnId: string }): Promise<ProviderReconciliation>;
 }
 
@@ -125,6 +134,10 @@ export function mapProviderOutcomeToAgentRunStatus(
   if (outcome === 'completed') return 'completed';
   if (outcome === 'interrupted') return 'cancelled';
   return 'failed';
+}
+
+export function isTerminalAgentRunStatus(status: AgentRunStatus): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
 export function readSafeCodexErrorCode(value: unknown): string | undefined {

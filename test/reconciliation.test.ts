@@ -5,6 +5,7 @@ import {
   applyChannelReconciliation,
   decodeAgentRunCursors,
   encodeAgentRunCursors,
+  latestVisibleAgentRunForSource,
   mergeChannelMessages
 } from '../src/lib/reconciliation.js';
 
@@ -14,6 +15,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
     runs: [{
       id: 'run-1',
       sourceMessageId: 'message-1',
+      attemptNumber: 1,
       status: 'queued',
       summary: 'Engineering request queued',
       sequence: 1,
@@ -28,6 +30,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
     'run-1': {
       id: 'run-1',
       sourceMessageId: 'message-1',
+      attemptNumber: 1,
       status: 'queued',
       summary: 'Engineering request queued',
       sequence: 1,
@@ -44,6 +47,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
     runs: [{
       id: 'run-1',
       sourceMessageId: 'message-1',
+      attemptNumber: 1,
       status: 'working',
       summary: 'File change completed',
       sequence: 3,
@@ -63,7 +67,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
   const duplicate = applyChannelReconciliation(afterDroppedWakeup, {
     channelId: 'channel-1',
     runs: [{
-      id: 'run-1', sourceMessageId: 'message-1', status: 'working',
+      id: 'run-1', sourceMessageId: 'message-1', attemptNumber: 1, status: 'working',
       summary: 'File change completed', sequence: 3, events: []
     }]
   });
@@ -72,7 +76,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
   const outOfOrder = applyChannelReconciliation(duplicate, {
     channelId: 'channel-1',
     runs: [{
-      id: 'run-1', sourceMessageId: 'message-1', status: 'planning',
+      id: 'run-1', sourceMessageId: 'message-1', attemptNumber: 1, status: 'planning',
       summary: 'Codex thread started', sequence: 2, events: []
     }]
   });
@@ -81,7 +85,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
   const gap = applyChannelReconciliation(outOfOrder, {
     channelId: 'channel-1',
     runs: [{
-      id: 'run-1', sourceMessageId: 'message-1', status: 'completed',
+      id: 'run-1', sourceMessageId: 'message-1', attemptNumber: 1, status: 'completed',
       summary: 'Engineering request completed', sequence: 5,
       events: [{
         sequence: 5,
@@ -95,7 +99,7 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
   const fullRefresh = applyChannelReconciliation(afterDroppedWakeup, {
     channelId: 'channel-1',
     runs: [{
-      id: 'run-1', sourceMessageId: 'message-1', status: 'completed',
+      id: 'run-1', sourceMessageId: 'message-1', attemptNumber: 1, status: 'completed',
       summary: 'Engineering request completed', sequence: 4,
       events: [
         { sequence: 1, status: 'queued', summary: 'Engineering request queued' },
@@ -111,6 +115,26 @@ test('Channel reconciliation advances only through ordered unseen AgentRun event
     fullRefresh['run-1']?.milestones.map(({ sequence }) => sequence),
     [1, 2, 4]
   );
+});
+
+test('the latest sequential AgentRun is selected for a Task Message', () => {
+  const runs = applyChannelReconciliation({}, {
+    channelId: 'channel-1',
+    runs: [
+      {
+        id: 'run-1', sourceMessageId: 'message-1', attemptNumber: 1,
+        status: 'failed', summary: 'Engineering request failed', sequence: 1,
+        events: [{ sequence: 1, status: 'failed', summary: 'Engineering request failed' }]
+      },
+      {
+        id: 'run-2', sourceMessageId: 'message-1', attemptNumber: 2,
+        status: 'queued', summary: 'Engineering request queued', sequence: 1,
+        events: [{ sequence: 1, status: 'queued', summary: 'Engineering request queued' }]
+      }
+    ]
+  });
+
+  assert.equal(latestVisibleAgentRunForSource(runs, 'message-1')?.id, 'run-2');
 });
 
 test('Channel reconciliation merges committed Messages once in durable order', () => {

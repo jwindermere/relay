@@ -188,6 +188,73 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
   ]);
 });
 
+test('the AgentRun adapter interrupts a started turn and still waits for terminal evidence', async () => {
+  const requests: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  const cancellation = new AbortController();
+  let session!: CodexAppServerSession;
+  const provider = new LocalCodexAgentRunProvider('codex-fixture', () => {
+    session = {
+      async initialize() {},
+      async send(method, params) {
+        requests.push({ method, params });
+        if (method === 'thread/start') return { thread: { id: 'thread-cancel' } };
+        if (method === 'turn/start') {
+          setTimeout(() => cancellation.abort(), 0);
+          return { turn: { id: 'turn-cancel', status: 'inProgress' } };
+        }
+        if (method === 'turn/interrupt') {
+          setTimeout(() => session.onNotification?.({
+            method: 'turn/completed',
+            params: { turn: { id: 'turn-cancel', status: 'interrupted' } }
+          }), 0);
+          return {};
+        }
+        return {};
+      },
+      close() {}
+    };
+    return session;
+  });
+  const outcomes: string[] = [];
+
+  await provider.execute({
+    signal: new AbortController().signal,
+    cancellationSignal: cancellation.signal,
+    credentialStoreReference: 'codex:test-reference',
+    workspaceDirectory: '/tmp/relay-run-cancel',
+    prompt: 'Inspect the test',
+    approvalPolicy: 'onRequest',
+    sandboxPolicy: {
+      type: 'workspaceWrite',
+      writableRoots: ['/tmp/relay-run-cancel'],
+      readOnlyAccess: {
+        type: 'restricted',
+        includePlatformDefaults: true,
+        readableRoots: ['/tmp/relay-run-cancel']
+      },
+      networkAccess: false
+    }
+  }, {
+    async threadStarted() {},
+    async turnStarted() {},
+    async notification(notification) {
+      if (notification.turn) outcomes.push(notification.turn.status);
+    },
+    async clarificationRequested() { assert.fail('no clarification was requested'); },
+    async clarificationDelivered() { assert.fail('no clarification was delivered'); },
+    async approvalRequested() { assert.fail('no approval was requested'); },
+    async actionRejected() { assert.fail('no action was rejected'); }
+  });
+
+  assert.deepEqual(requests.map(({ method }) => method), [
+    'thread/start', 'turn/start', 'turn/interrupt'
+  ]);
+  assert.deepEqual(requests[2]?.params, {
+    threadId: 'thread-cancel', turnId: 'turn-cancel'
+  });
+  assert.deepEqual(outcomes, ['interrupted']);
+});
+
 test('the AgentRun adapter keeps a clarification on the same Provider turn', async () => {
   const responses: Array<{ id: string | number; result: unknown }> = [];
   let session!: CodexAppServerSession;

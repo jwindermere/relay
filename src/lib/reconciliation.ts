@@ -19,6 +19,7 @@ export interface AgentRunEventUpdate {
 export interface AgentRunUpdate {
   id: string;
   sourceMessageId: string;
+  attemptNumber: number;
   status: VisibleAgentRunStatus;
   summary: string;
   sequence: number;
@@ -33,6 +34,7 @@ export interface ChannelReconciliationUpdate {
 export interface VisibleAgentRun {
   id: string;
   sourceMessageId: string;
+  attemptNumber: number;
   status: VisibleAgentRunStatus;
   summary: string;
   sequence: number;
@@ -81,6 +83,7 @@ export function applyChannelReconciliation(
     next[run.id] = {
       id: run.id,
       sourceMessageId: run.sourceMessageId,
+      attemptNumber: run.attemptNumber,
       status: run.status,
       summary: run.summary,
       sequence: run.sequence,
@@ -88,6 +91,15 @@ export function applyChannelReconciliation(
     };
   }
   return next;
+}
+
+export function latestVisibleAgentRunForSource(
+  runs: Readonly<VisibleAgentRuns>,
+  sourceMessageId: string
+): VisibleAgentRun | undefined {
+  return Object.values(runs)
+    .filter((run) => run.sourceMessageId === sourceMessageId)
+    .sort((left, right) => right.attemptNumber - left.attemptNumber)[0];
 }
 
 export function mergeChannelMessages<T extends { id: string; createdAt: string }>(

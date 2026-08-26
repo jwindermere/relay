@@ -144,6 +144,7 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'agent_run' },
+      { table_schema: 'public', table_name: 'agent_run_cancellation_request' },
       { table_schema: 'public', table_name: 'agent_run_clarification' },
       { table_schema: 'public', table_name: 'agent_run_event' },
       { table_schema: 'public', table_name: 'approval' },
@@ -168,7 +169,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 11');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 12');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -178,7 +179,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 11 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 12 WHERE version = 99');
     }
   });
 
@@ -1085,6 +1086,7 @@ if (connectionString) {
     assert.deepEqual(initialReconciliation.runs, [{
       id: accepted.rows[0]?.run_id,
       sourceMessageId: first.id,
+      attemptNumber: 1,
       status: 'queued',
       summary: 'Engineering request queued',
       sequence: 1,

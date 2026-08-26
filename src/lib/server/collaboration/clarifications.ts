@@ -79,8 +79,8 @@ async function findThreadClarification(
        AND source.channel_id = $3
        AND COALESCE(source.parent_message_id, source.id) = $4
        AND (reply.created_at, reply.id) > (request.created_at, request.id)
-       AND (clarification.status = 'pending'
-         OR run.status NOT IN ('completed', 'failed', 'cancelled'))
+       AND clarification.status = 'pending'
+       AND run.status NOT IN ('completed', 'failed', 'cancelled')
      ORDER BY (clarification.status = 'pending') DESC,
               clarification.created_at DESC, clarification.id DESC
      LIMIT 1

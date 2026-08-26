@@ -1,6 +1,10 @@
 import type { PoolClient } from 'pg';
 
-import type { AgentRunEventType, AgentRunStatus } from './agent-run.js';
+import {
+  isTerminalAgentRunStatus,
+  type AgentRunEventType,
+  type AgentRunStatus
+} from './agent-run.js';
 
 export interface AgentRunEventInput {
   eventType: AgentRunEventType;
@@ -26,14 +30,17 @@ export async function appendAgentRunEvent(
   target: AgentRunEventTarget,
   event: AgentRunEventInput
 ): Promise<number | undefined> {
-  const run = await client.query(
-    `SELECT id FROM public.agent_run
+  const run = await client.query<{ id: string; status: AgentRunStatus; lease_token: string | null }>(
+    `SELECT id, status, lease_token FROM public.agent_run
      WHERE id = $1 AND workspace_id = $2
-       AND ($3::text IS NULL OR lease_token = $3)
      FOR UPDATE`,
-    [target.id, target.workspaceId, target.requiredLeaseToken ?? null]
+    [target.id, target.workspaceId]
   );
   if (!run.rowCount) throw new Error('AgentRun execution lease was lost');
+  if (isTerminalAgentRunStatus(run.rows[0]!.status)) return undefined;
+  if (target.requiredLeaseToken && run.rows[0]!.lease_token !== target.requiredLeaseToken) {
+    throw new Error('AgentRun execution lease was lost');
+  }
   if (event.providerEventId) {
     const duplicate = await client.query(
       `SELECT 1 FROM public.agent_run_event
@@ -75,6 +82,23 @@ export async function appendAgentRunEvent(
       sequence
     }]
   );
+  if (event.completed && (event.status === 'completed' || event.status === 'cancelled')) {
+    await client.query(
+      `UPDATE public.task
+       SET status = $2, updated_at = now()
+       WHERE id = (SELECT task_id FROM public.agent_run WHERE id = $1)
+         AND status = 'open'`,
+      [target.id, event.status]
+    );
+  }
+  if (event.completed) {
+    await client.query(
+      `UPDATE public.approval
+       SET state = 'expired'
+       WHERE agent_run_id = $1 AND state IN ('pending', 'approved')`,
+      [target.id]
+    );
+  }
   await client.query(
     `UPDATE public.agent_run
      SET status = $3,

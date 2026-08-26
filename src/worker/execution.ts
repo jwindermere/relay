@@ -26,6 +26,7 @@ export interface WorkerExecutionOptions {
   workspaceRoot: string;
   leaseDurationMs?: number;
   retryDelayMs?: number;
+  cancellationPollMs?: number;
   now?: () => Date;
 }
 
@@ -45,6 +46,7 @@ interface ClaimedAgentRun {
   resume_clarification_id: string | null;
   lease_token: string;
   recovering: boolean;
+  cancellation_requested: boolean;
 }
 
 export async function processNextAgentRun(
@@ -84,13 +86,23 @@ export async function processNextAgentRun(
         ?? terminalStatus;
     },
     async clarificationRequested(request) {
-      return requestClarificationAndWait(pool, claim, request, executionAbort.signal);
+      return requestClarificationAndWait(
+        pool,
+        claim,
+        request,
+        AbortSignal.any([executionAbort.signal, cancellationAbort.signal])
+      );
     },
     async clarificationDelivered(providerRequestId) {
       await markClarificationDelivered(pool, claim, providerRequestId);
     },
     async approvalRequested(request) {
-      return requestApprovalAndWait(pool, claim, request, executionAbort.signal);
+      return requestApprovalAndWait(
+        pool,
+        claim,
+        request,
+        AbortSignal.any([executionAbort.signal, cancellationAbort.signal])
+      );
     },
     async actionRejected(request) {
       await recordRejectedAction(pool, claim, request);
@@ -98,6 +110,13 @@ export async function processNextAgentRun(
   };
 
   const executionAbort = new AbortController();
+  const cancellationAbort = new AbortController();
+  const cancellationMonitor = monitorCancellation(
+    pool,
+    claim.id,
+    cancellationAbort,
+    options.cancellationPollMs ?? 250
+  );
   const renewal = setInterval(() => {
     void renewLease(pool, claim, leaseDurationMs)
       .then((renewed) => { if (!renewed) executionAbort.abort(); })
@@ -116,6 +135,7 @@ export async function processNextAgentRun(
     }
     await provider.execute({
       signal: executionAbort.signal,
+      cancellationSignal: cancellationAbort.signal,
       credentialStoreReference: claim.credential_store_reference,
       workspaceDirectory,
       prompt: claim.provider_input,
@@ -136,6 +156,16 @@ export async function processNextAgentRun(
     }, observer);
 
     if (!terminalStatus) {
+      if (cancellationAbort.signal.aborted) {
+        await appendRunEvent(pool, claim, {
+          eventType: 'run.paused',
+          status: 'paused',
+          summary: 'Codex interruption outcome is uncertain; human review is required',
+          evidence: { reason: 'missing_cancellation_terminal_event' },
+          releaseLease: true
+        });
+        return { kind: 'executed', agentRunId: claim.id, status: 'paused' };
+      }
       await appendRunEvent(pool, claim, {
         eventType: 'run.failed',
         status: 'failed',
@@ -148,6 +178,16 @@ export async function processNextAgentRun(
     }
     return { kind: 'executed', agentRunId: claim.id, status: terminalStatus };
   } catch (error) {
+    if (cancellationAbort.signal.aborted) {
+      await appendRunEvent(pool, claim, {
+        eventType: 'run.paused',
+        status: 'paused',
+        summary: 'Codex interruption outcome is uncertain; human review is required',
+        evidence: { reason: 'cancellation_provider_boundary_lost' },
+        releaseLease: true
+      });
+      return { kind: 'executed', agentRunId: claim.id, status: 'paused' };
+    }
     if (error instanceof AgentRunProviderError
       && (error.code === 'provider_limit' || error.code === 'provider_unavailable')) {
       if (claim.provider_thread_id) {
@@ -171,7 +211,39 @@ export async function processNextAgentRun(
     return { kind: 'executed', agentRunId: claim.id, status: 'failed' };
   } finally {
     clearInterval(renewal);
+    clearInterval(cancellationMonitor);
   }
+}
+
+function monitorCancellation(
+  pool: Pool,
+  agentRunId: string,
+  controller: AbortController,
+  pollMs: number
+): NodeJS.Timeout {
+  let checking = false;
+  const check = async () => {
+    if (checking || controller.signal.aborted) return;
+    checking = true;
+    try {
+      const result = await pool.query<{ requested: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM public.agent_run_cancellation_request
+           WHERE agent_run_id = $1
+         ) AS requested`,
+        [agentRunId]
+      );
+      if (result.rows[0]?.requested) controller.abort();
+    } catch {
+      // A later poll retries; lease renewal independently protects execution ownership.
+    } finally {
+      checking = false;
+    }
+  };
+  void check();
+  const timer = setInterval(() => void check(), Math.max(25, pollMs));
+  timer.unref();
+  return timer;
 }
 
 async function claimNextAgentRun(
@@ -193,6 +265,7 @@ async function claimNextAgentRun(
       credential_store_reference: string;
       status: AgentRunStatus;
       recovering: boolean;
+      cancellation_requested: boolean;
       resume_clarification_id: string | null;
     }>(
       `SELECT run.id, run.workspace_id, run.provider_connection_id,
@@ -200,7 +273,15 @@ async function claimNextAgentRun(
               run.provider_thread_id, run.active_turn_id,
               connection.credential_store_reference,
               run.status,
-              (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1) AS recovering,
+              ((run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1)
+                OR EXISTS (
+                  SELECT 1 FROM public.agent_run_cancellation_request cancellation
+                  WHERE cancellation.agent_run_id = run.id
+                )) AS recovering,
+              EXISTS (
+                SELECT 1 FROM public.agent_run_cancellation_request cancellation
+                WHERE cancellation.agent_run_id = run.id
+              ) AS cancellation_requested,
               clarification.id AS resume_clarification_id
        FROM public.agent_run run
        JOIN public.task task ON task.id = run.task_id
@@ -218,6 +299,12 @@ async function claimNextAgentRun(
          AND (
            (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1
              AND run.status NOT IN ('completed', 'failed', 'cancelled'))
+           OR (run.lease_expires_at IS NULL
+             AND run.status NOT IN ('completed', 'failed', 'cancelled')
+             AND EXISTS (
+               SELECT 1 FROM public.agent_run_cancellation_request cancellation
+               WHERE cancellation.agent_run_id = run.id
+             ))
            OR (run.status = 'queued' AND run.available_at <= $1 AND run.lease_expires_at IS NULL)
          )
        ORDER BY
@@ -282,7 +369,8 @@ async function claimNextAgentRun(
       active_turn_id: row.active_turn_id,
       resume_clarification_id: row.resume_clarification_id,
       lease_token: leaseToken,
-      recovering: row.recovering
+      recovering: row.recovering,
+      cancellation_requested: row.cancellation_requested
     };
   } catch (error) {
     await client.query('ROLLBACK');
@@ -297,13 +385,32 @@ async function recoverAgentRun(
   provider: AgentRunProvider,
   claim: ClaimedAgentRun
 ): Promise<WorkerCycleResult> {
-  const approvalStatus = await recoverApprovalBoundary(pool, claim);
-  if (approvalStatus) {
-    return { kind: 'recovered', agentRunId: claim.id, status: approvalStatus };
+  if (claim.cancellation_requested && claim.provider_thread_id && claim.active_turn_id) {
+    try {
+      await provider.interrupt({
+        threadId: claim.provider_thread_id,
+        turnId: claim.active_turn_id,
+        credentialStoreReference: claim.credential_store_reference
+      });
+    } catch {
+      await appendRunEvent(pool, claim, {
+        eventType: 'run.paused',
+        status: 'paused',
+        summary: 'Cancellation could not reach Codex; human review is required',
+        evidence: { reason: 'provider_unavailable_during_cancellation' }
+      });
+      return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
+    }
   }
-  const clarificationStatus = await recoverClarificationBoundary(pool, claim);
-  if (clarificationStatus) {
-    return { kind: 'recovered', agentRunId: claim.id, status: clarificationStatus };
+  if (!claim.cancellation_requested) {
+    const approvalStatus = await recoverApprovalBoundary(pool, claim);
+    if (approvalStatus) {
+      return { kind: 'recovered', agentRunId: claim.id, status: approvalStatus };
+    }
+    const clarificationStatus = await recoverClarificationBoundary(pool, claim);
+    if (clarificationStatus) {
+      return { kind: 'recovered', agentRunId: claim.id, status: clarificationStatus };
+    }
   }
   if (!claim.provider_thread_id || !claim.active_turn_id) {
     await appendRunEvent(pool, claim, {
@@ -546,7 +653,11 @@ async function persistProviderNotification(
       completed: true,
       clearActiveTurn: true
     });
-    return status;
+    const stored = await pool.query<{ status: AgentRunStatus }>(
+      'SELECT status FROM public.agent_run WHERE id = $1',
+      [claim.id]
+    );
+    return stored.rows[0]?.status ?? status;
   }
 
   const itemId = notification.item?.id;

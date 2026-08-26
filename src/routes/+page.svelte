@@ -6,6 +6,7 @@
     applyChannelReconciliation,
     encodeAgentRunCursors,
     mergeChannelMessages,
+    latestVisibleAgentRunForSource,
     type ChannelReconciliationUpdate,
     type VisibleAgentRuns,
     type VisibleAgentRunStatus
@@ -200,12 +201,13 @@
   }
 </script>
 
-{#snippet agentMentionStatus(agentMention: (typeof data.sharedChannel.messages)[number]['agentMention'])}
-  {#if agentMention?.status === 'accepted'}
-    {@const run = agentRuns[agentMention.agentRunId]}
+{#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
+  {#if message.agentMention?.status === 'accepted'}
+    {@const run = latestVisibleAgentRunForSource(agentRuns, message.id)}
     <p class="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-success" role="status">
       {#if run}
         <span class="badge badge-sm badge-success">{statusLabel(run.status)}</span>
+        {#if run.attemptNumber > 1}<span>Attempt {run.attemptNumber}</span>{/if}
         <span>{run.summary}</span>
       {:else}
         <span>Engineering request queued</span>
@@ -218,8 +220,8 @@
         {/each}
       </ul>
     {/if}
-  {:else if agentMention?.status === 'rejected'}
-    <p class="mt-2 text-xs text-warning" role="status">{agentMention.reason}</p>
+  {:else if message.agentMention?.status === 'rejected'}
+    <p class="mt-2 text-xs text-warning" role="status">{message.agentMention.reason}</p>
   {/if}
 {/snippet}
 
@@ -394,7 +396,7 @@
                     <span class="text-xs text-base-content/45">{message.author.roleLabel} · {formatTime(message.createdAt)}</span>
                   </div>
                   <p class="mt-1 whitespace-pre-wrap text-sm leading-6">{message.body}</p>
-                  {@render agentMentionStatus(message.agentMention)}
+                  {@render agentMentionStatus(message)}
                   <button class="btn btn-ghost btn-xs mt-2" type="button" onclick={() => beginReply(message.id)}>Reply</button>
                 </div>
               </div>
@@ -410,7 +412,7 @@
                           <span class="text-xs text-base-content/45">{formatTime(reply.createdAt)}</span>
                         </div>
                         <p class="mt-1 whitespace-pre-wrap text-sm leading-6">{reply.body}</p>
-                        {@render agentMentionStatus(reply.agentMention)}
+                        {@render agentMentionStatus(reply)}
                       </div>
                     </div>
                   {/each}

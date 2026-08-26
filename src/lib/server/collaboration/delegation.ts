@@ -357,15 +357,18 @@ export async function acceptEligibleAgentMention(
   await client.query(
     `INSERT INTO public.agent_run (
        id, workspace_id, task_id, agent_id, provider_connection_id,
-       linked_repository_id, attempt_number, status
-     ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'queued')`,
+       linked_repository_id, attempt_number, status,
+       requested_by_workspace_member_id, request_message_id
+     ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'queued', $7, $8)`,
     [
       agentRunId,
       context.workspaceId,
       taskId,
       agent.id,
       provider.rows[0]!.id,
-      linkedRepository.id
+      linkedRepository.id,
+      requestMessage.author_workspace_member_id,
+      context.messageId
     ]
   );
   const event = await client.query<{ id: number }>(

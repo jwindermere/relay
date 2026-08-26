@@ -13,6 +13,7 @@ import {
   type AgentRunProvider,
   type AgentRunProviderInput,
   type AgentRunProviderObserver,
+  type ProviderInterruptionInput,
   type ProviderReconciliation
 } from '../src/lib/server/provider/agent-run.js';
 import { processNextAgentRun } from '../src/worker/execution.js';
@@ -408,6 +409,221 @@ if (skipDatabaseTests) {
     });
   });
 
+  test('either Pilot member records visible cancellation intent before an active run stops', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'cancel-intent');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'working', lease_owner = 'worker-cancel-intent',
+           lease_token = 'lease-cancel-intent', lease_expires_at = now() + interval '1 minute'
+       WHERE id = $1`,
+      [ids.runId]
+    );
+
+    const cancellation = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-cancel-intent',
+      body: 'cancel this work'
+    });
+
+    const stored = await pool.query<{
+      status: string;
+      event_type: string;
+      event_status: string;
+      requested_by: string;
+      request_message_id: string;
+    }>(
+      `SELECT run.status, event.event_type, event.status AS event_status,
+              event.evidence->>'requestedByWorkspaceMemberId' AS requested_by,
+              event.evidence->>'requestMessageId' AS request_message_id
+       FROM public.agent_run run
+       JOIN public.agent_run_event event ON event.agent_run_id = run.id
+       WHERE run.id = $1
+       ORDER BY event.sequence DESC
+       LIMIT 1`,
+      [ids.runId]
+    );
+    assert.deepEqual(stored.rows[0], {
+      status: 'working',
+      event_type: 'run.cancellation_requested',
+      event_status: 'working',
+      requested_by: 'second-pilot-cancel-intent',
+      request_message_id: cancellation.id
+    });
+  });
+
+  test('the worker interrupts only after durable intent and accepts one terminal outcome', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'cancel-active');
+    let executionStarted!: () => void;
+    const started = new Promise<void>((resolve) => { executionStarted = resolve; });
+    const provider = new FixtureProvider(async (input, observer) => {
+      await observer.threadStarted('thread-cancel-active');
+      await observer.turnStarted('turn-cancel-active');
+      executionStarted();
+      await new Promise<void>((resolve) => {
+        input.cancellationSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      const intent = await pool.query<{ count: number }>(
+        `SELECT count(*)::integer AS count
+         FROM public.agent_run_event
+         WHERE agent_run_id = $1 AND event_type = 'run.cancellation_requested'`,
+        [ids.runId]
+      );
+      assert.equal(intent.rows[0]?.count, 1);
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-cancel-active:first-terminal',
+        turn: { id: 'turn-cancel-active', status: 'interrupted' }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-cancel-active:duplicate-terminal',
+        turn: { id: 'turn-cancel-active', status: 'completed' }
+      });
+    });
+
+    const execution = processNextAgentRun(pool, provider, {
+      workerId: 'worker-cancel-active',
+      workspaceRoot,
+      leaseDurationMs: 10_000,
+      cancellationPollMs: 25
+    });
+    await started;
+    await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-cancel-active',
+      body: 'cancel this work'
+    });
+
+    assert.deepEqual(await execution, {
+      kind: 'executed', agentRunId: ids.runId, status: 'cancelled'
+    });
+    const outcome = await pool.query<{
+      run_status: string;
+      task_status: string;
+      terminal_events: number;
+    }>(
+      `SELECT run.status AS run_status, task.status AS task_status,
+              count(event.id) FILTER (
+                WHERE event.status IN ('completed', 'failed', 'cancelled')
+              )::integer AS terminal_events
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id
+       JOIN public.agent_run_event event ON event.agent_run_id = run.id
+       WHERE run.id = $1
+       GROUP BY run.status, task.status`,
+      [ids.runId]
+    );
+    assert.deepEqual(outcome.rows[0], {
+      run_status: 'cancelled', task_status: 'cancelled', terminal_events: 1
+    });
+  });
+
+  test('a failed Task receives one attributable sequential attempt without changing its snapshot', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'retry-failed');
+    const failedProvider = new FixtureProvider(async () => {
+      throw new AgentRunProviderError('provider_failed', 'fixture failure');
+    });
+    assert.deepEqual(await processNextAgentRun(pool, failedProvider, {
+      workerId: 'worker-retry-failed', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'executed', agentRunId: ids.runId, status: 'failed' });
+
+    const retry = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-retry-failed',
+      body: 'retry this work'
+    });
+    await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-retry-failed',
+      body: 'retry this work'
+    });
+
+    const attempts = await pool.query<{
+      attempt_number: number;
+      status: string;
+      request_snapshot: string;
+      requested_by_workspace_member_id: string;
+      request_message_id: string;
+    }>(
+      `SELECT run.attempt_number, run.status, task.request_snapshot,
+              run.requested_by_workspace_member_id, run.request_message_id
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id
+       WHERE task.id = 'task-retry-failed'
+       ORDER BY run.attempt_number`,
+      []
+    );
+    assert.deepEqual(attempts.rows, [
+      {
+        attempt_number: 1,
+        status: 'failed',
+        request_snapshot: '@Alex inspect the failing test.',
+        requested_by_workspace_member_id: 'pilot-retry-failed',
+        request_message_id: 'message-retry-failed'
+      },
+      {
+        attempt_number: 2,
+        status: 'queued',
+        request_snapshot: '@Alex inspect the failing test.',
+        requested_by_workspace_member_id: 'second-pilot-retry-failed',
+        request_message_id: retry.id
+      }
+    ]);
+  });
+
+  test('a safely cancelled Task can be reopened as a later sequential attempt', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'retry-cancelled');
+    await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-retry-cancelled',
+      body: 'cancel this work'
+    });
+    const duplicateCancellation = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-retry-cancelled',
+      body: 'cancel this work'
+    });
+    await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-retry-cancelled',
+      body: 'retry this work'
+    });
+
+    const stored = await pool.query<{
+      task_status: string;
+      attempts: number;
+      cancellation_requests: number;
+      duplicate_requested_by: string;
+      terminal_events: number;
+    }>(
+      `SELECT task.status AS task_status,
+              count(DISTINCT run.id)::integer AS attempts,
+              count(DISTINCT cancellation.id)::integer AS cancellation_requests,
+              max(cancellation.requested_by_workspace_member_id) FILTER (
+                WHERE cancellation.request_message_id = $2
+              ) AS duplicate_requested_by,
+              count(DISTINCT event.id) FILTER (
+                WHERE event.status IN ('completed', 'failed', 'cancelled')
+              )::integer AS terminal_events
+       FROM public.task task
+       JOIN public.agent_run run ON run.task_id = task.id
+       LEFT JOIN public.agent_run_cancellation_request cancellation
+         ON cancellation.agent_run_id = 'run-retry-cancelled'
+       LEFT JOIN public.agent_run_event event
+         ON event.agent_run_id = 'run-retry-cancelled'
+       WHERE task.id = $1
+       GROUP BY task.status`,
+      ['task-retry-cancelled', duplicateCancellation.id]
+    );
+    assert.deepEqual(stored.rows[0], {
+      task_status: 'open',
+      attempts: 2,
+      cancellation_requests: 2,
+      duplicate_requested_by: 'pilot-retry-cancelled',
+      terminal_events: 1
+    });
+  });
+
   test('Provider loss after a thread starts pauses the AgentRun instead of replaying it', async () => {
     const ids = await seedQueuedAgentRun(pool, 'provider-loss');
     const provider = new FixtureProvider(async (_input, observer) => {
@@ -476,6 +692,40 @@ if (skipDatabaseTests) {
       { event_type: 'run.recovering' },
       { event_type: 'run.paused' }
     ]);
+  });
+
+  test('cancellation after worker loss interrupts the stored turn before reconciliation', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'cancel-recovery');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'working', provider_thread_id = 'thread-cancel-recovery',
+           active_turn_id = 'turn-cancel-recovery', lease_owner = 'dead-worker',
+           lease_token = 'dead-token', lease_expires_at = now() - interval '1 minute'
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-cancel-recovery',
+      body: 'cancel this work'
+    });
+    const provider = new FixtureProvider(
+      async () => assert.fail('recovery must not replay the request'),
+      async () => ({ outcome: 'interrupted' }),
+      async () => {}
+    );
+
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-cancel-recovery', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'recovered', agentRunId: ids.runId, status: 'cancelled' });
+    assert.deepEqual(provider.interruptions, [{
+      threadId: 'thread-cancel-recovery',
+      turnId: 'turn-cancel-recovery',
+      credentialStoreReference: 'credentials-cancel-recovery'
+    }]);
+    assert.deepEqual(provider.reconciliations, [{
+      threadId: 'thread-cancel-recovery', turnId: 'turn-cancel-recovery'
+    }]);
   });
 
   test('an answered clarification survives worker loss and resumes the same Provider thread', async () => {
@@ -565,6 +815,11 @@ if (skipDatabaseTests) {
 class FixtureProvider implements AgentRunProvider {
   readonly executions: AgentRunProviderInput[] = [];
   readonly reconciliations: Array<{ threadId: string; turnId: string }> = [];
+  readonly interruptions: Array<{
+    threadId: string;
+    turnId: string;
+    credentialStoreReference: string;
+  }> = [];
 
   constructor(
     private readonly executeFixture: (
@@ -573,7 +828,8 @@ class FixtureProvider implements AgentRunProvider {
     ) => Promise<void>,
     private readonly reconcileFixture: (
       input: { threadId: string; turnId: string }
-    ) => Promise<ProviderReconciliation> = async () => ({ outcome: 'indeterminate' })
+    ) => Promise<ProviderReconciliation> = async () => ({ outcome: 'indeterminate' }),
+    private readonly interruptFixture: () => Promise<void> = async () => {}
   ) {}
 
   async execute(input: AgentRunProviderInput, observer: AgentRunProviderObserver): Promise<void> {
@@ -584,6 +840,11 @@ class FixtureProvider implements AgentRunProvider {
   async reconcile(input: { threadId: string; turnId: string }): Promise<ProviderReconciliation> {
     this.reconciliations.push(input);
     return this.reconcileFixture(input);
+  }
+
+  async interrupt(input: ProviderInterruptionInput): Promise<void> {
+    this.interruptions.push(input);
+    await this.interruptFixture();
   }
 }
 
@@ -702,9 +963,13 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
   await pool.query(
     `INSERT INTO public.agent_run (
        id, workspace_id, task_id, agent_id, provider_connection_id,
-       linked_repository_id, attempt_number, status
-     ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'queued')`,
-    [runId, workspaceId, taskId, agentId, effectiveProviderConnectionId, linkedRepositoryId]
+       linked_repository_id, attempt_number, status,
+       requested_by_workspace_member_id, request_message_id
+     ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'queued', $7, $8)`,
+    [
+      runId, workspaceId, taskId, agentId, effectiveProviderConnectionId, linkedRepositoryId,
+      pilotMemberId, messageId
+    ]
   );
   await insertQueuedEvent(pool, workspaceId, runId);
 
@@ -763,11 +1028,13 @@ async function seedAdditionalQueuedAgentRun(
   await pool.query(
     `INSERT INTO public.agent_run (
        id, workspace_id, task_id, agent_id, provider_connection_id,
-       linked_repository_id, attempt_number, status
-     ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'queued')`,
+       linked_repository_id, attempt_number, status,
+       requested_by_workspace_member_id, request_message_id
+     ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'queued', $7, $8)`,
     [
       runId, context.workspaceId, taskId, context.agentId,
-      context.providerConnectionId, context.linkedRepositoryId
+      context.providerConnectionId, context.linkedRepositoryId,
+      context.pilotMemberId, messageId
     ]
   );
   await insertQueuedEvent(pool, context.workspaceId, runId);
