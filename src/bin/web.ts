@@ -29,9 +29,12 @@ try {
   const host = process.env.HOST ?? '0.0.0.0';
   const port = Number(process.env.PORT ?? 3000);
   const server = createServer(handler);
-  const realtime = attachAuthenticatedRealtime(server, pool, getRelayAuth(), {
-    ticketSecret: requireRealtimeSecret()
-  });
+  const realtime = attachAuthenticatedRealtime(
+    server,
+    pool,
+    getRelayAuth(),
+    requireRealtimeSecret()
+  );
 
   server.listen(port, host, () => {
     console.log(JSON.stringify({ event: 'web.ready', host, port, ...readiness }));

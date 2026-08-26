@@ -1,7 +1,10 @@
 import { hostname } from 'node:os';
 
 import { createDatabasePool } from '../lib/server/database/pool.js';
-import { loadFileBackedEnvironment } from '../lib/server/configuration.js';
+import {
+  loadFileBackedEnvironment,
+  WORKER_SECRET_ENVIRONMENT
+} from '../lib/server/configuration.js';
 import { formatError } from '../lib/server/errors.js';
 import { getGitHubBrokerRemote } from '../lib/server/github/api.js';
 import { AgentRunGitHubWorkspaceBroker } from '../lib/server/github/workspace.js';
@@ -9,7 +12,7 @@ import { LocalCodexAgentRunProvider } from '../lib/server/provider/codex-agent-r
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 import { processNextAgentRun } from './execution.js';
 
-await loadFileBackedEnvironment(['DATABASE_URL', 'RELAY_GITHUB_PRIVATE_KEY']);
+await loadFileBackedEnvironment(WORKER_SECRET_ENVIRONMENT);
 
 const HEALTH_INTERVAL_MS = 30_000;
 const POLL_INTERVAL_MS = 1_000;

@@ -23,7 +23,7 @@ pg_dump \
   --no-acl \
   --file "$temporary"
 pg_restore --list "$temporary" >/dev/null
-sha256sum "$temporary" >"$temporary.sha256"
+(cd "$BACKUP_DIRECTORY" && sha256sum "$(basename "$temporary")") >"$temporary.sha256"
 mv "$temporary" "$backup"
 sed "s|$(basename "$temporary")|$(basename "$backup")|" \
   "$temporary.sha256" >"$backup.sha256"

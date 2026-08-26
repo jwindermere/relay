@@ -18,9 +18,15 @@ in `.env`; Compose mounts each file only into its listed consumers.
 The TLS certificate must cover `RELAY_HOSTNAME`. Port 443 must be the only ingress
 allowed by the host firewall. Start the stack with:
 
+For first-time bootstrap only:
+
 ```sh
 docker compose up --build --detach
 ```
+
+After bootstrap, never use a generic `compose up` as an upgrade command because it
+does not establish the drain and migration-compatibility boundaries below. Use only
+the deployment commands for upgrades.
 
 The backup service immediately writes a verified custom-format dump and then repeats
 at `RELAY_BACKUP_INTERVAL_SECONDS`. A completed backup consists of a `.dump` and its
@@ -35,14 +41,17 @@ Use the deployment commands instead of replacing both application services toget
 ```sh
 ops/deploy.sh web
 ops/deploy.sh worker
+ops/deploy.sh contract
 ```
 
-A web replacement builds the release, takes a verified database backup, migrates,
+A web replacement builds the release and its matching migrator, takes a verified
+database backup, applies only migrations declared compatible with the running worker,
 and replaces only `web`; the active worker and Codex child process remain running.
-A worker replacement sends `SIGTERM`, and Compose waits up to 30 minutes while the
-worker stops claiming new runs and finishes its current cycle. Only after it drains
+A worker replacement builds the release and matching migrator, sends `SIGTERM`, and
+Compose waits up to 30 minutes while the worker stops claiming new AgentRuns and
+finishes its current cycle. Only after it drains
 does the command back up, migrate, and start the replacement. If the host or process
-is forcibly lost, do not manually requeue the run: its expired lease follows Relay's
+is forcibly lost, do not manually requeue the AgentRun: its expired lease follows Relay's
 durable `recovering` and potentially `paused` reconciliation path.
 
 Migration files are append-only and versioned. A migration that only expands the
@@ -56,7 +65,10 @@ Without the marker, the migration requires its own schema interface version. Run
 startup accepts a newer schema only when every applied migration declares it safe;
 it refuses an older schema or a contract migration requiring a newer runtime. Remove
 old columns or behavior only in a later contract release after every old web and
-worker process has been replaced.
+worker process has been replaced. The ordinary `web` and `worker` commands accept
+expand-compatible migrations only. Use `contract` for a later removal: it drains the
+worker, stops the old web runtime, backs up, applies the contract migration with no
+old runtime active, and then starts both replacements.
 
 ## Isolated restore drill
 
@@ -74,8 +86,10 @@ docker run --rm --network host \
   postgres:17-alpine sh /ops/restore-drill.sh
 ```
 
-The drill verifies the checksum, restores with `--exit-on-error`, and writes a
-`.restore-report.json` containing Message, AgentRun, and AgentRun-event counts. Sign
+The drill verifies that source and target have different PostgreSQL system identities,
+refuses a target containing user tables, verifies the checksum, restores with
+`--exit-on-error`, and writes a `.restore-report.json` containing Message, AgentRun,
+and AgentRun-event counts. Sign
 in to an isolated Relay instance using the restored database and inspect at least one
 real Shared agent channel lifecycle before recording the drill as successful. The
 database role itself is host provisioning state and must be recreated separately.
@@ -96,6 +110,6 @@ immediate revocation.
 | WebSocket | Realtime ticket secret file | Replace it and restart `web`. | Outstanding one-minute socket tickets are rejected; browsers fetch a new ticket and reconcile durable events. Sessions and worker execution remain valid. |
 | TLS | Certificate and private-key files | Replace them and restart only `proxy`. | Existing HTTP/WebSocket connections reconnect; application processes continue. |
 
-Codex state and Agent workspaces are operationally sensitive even though they are
+Codex state and per-AgentRun workspaces are operationally sensitive even though they are
 volumes rather than environment secrets. Back up Codex state only with encryption;
 do not expose either volume to the browser, `web`, or the proxy.

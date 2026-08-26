@@ -1,5 +1,10 @@
 import { readFile } from 'node:fs/promises';
 
+export const WORKER_SECRET_ENVIRONMENT = Object.freeze([
+  'DATABASE_URL',
+  'RELAY_GITHUB_PRIVATE_KEY'
+]);
+
 export async function loadFileBackedEnvironment(
   names: readonly string[],
   environment: NodeJS.ProcessEnv = process.env

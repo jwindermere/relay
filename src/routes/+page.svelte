@@ -96,6 +96,10 @@
     const connect = async () => {
       if (stopped) return;
       const ticketResponse = await fetch('/api/realtime-ticket', { method: 'POST' });
+      if (ticketResponse.status === 401) {
+        window.location.assign('/sign-in');
+        return;
+      }
       if (!ticketResponse.ok) {
         reconnectTimer = setTimeout(connect, 1_000);
         return;

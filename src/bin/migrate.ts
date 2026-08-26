@@ -8,7 +8,9 @@ await loadFileBackedEnvironment(['DATABASE_URL']);
 const pool = createDatabasePool();
 
 try {
-  await migrateDatabase(pool);
+  await migrateDatabase(pool, {
+    expandOnly: process.env.RELAY_REQUIRE_EXPAND_ONLY === 'true'
+  });
   const schemas = await getMigrationStreamVersions(pool);
   console.log(JSON.stringify({ event: 'database.migrated', schemas }));
 } catch (error) {

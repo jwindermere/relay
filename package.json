@@ -47,7 +47,8 @@
     "esbuild": "0.28.2",
     "svelte-check": "4.3.3",
     "tsx": "4.20.5",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
   },
   "engines": {
     "node": ">=22"

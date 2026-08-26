@@ -48,6 +48,7 @@ import {
   REQUIRED_MIGRATION_STREAM_VERSIONS
 } from '../src/lib/server/database/schema.js';
 import { attachAuthenticatedRealtime } from '../src/lib/server/realtime.js';
+import { issueRealtimeTicket } from '../src/lib/server/realtime-ticket.js';
 
 let container: StartedPostgreSqlContainer | undefined;
 let connectionString = process.env.TEST_DATABASE_URL;
@@ -192,6 +193,29 @@ if (connectionString) {
       });
     } finally {
       await pool.query('DELETE FROM public.schema_migrations WHERE version IN (15, 16)');
+    }
+  });
+
+  test('the migrator refuses renamed or modified applied migrations', async () => {
+    const original = await pool.query<{ checksum: string; name: string }>(
+      'SELECT name, checksum FROM public.schema_migrations WHERE version = 14'
+    );
+    assert.ok(original.rows[0]);
+    try {
+      await pool.query(
+        `UPDATE public.schema_migrations SET name = '0014_renamed.sql' WHERE version = 14`
+      );
+      await assert.rejects(migrateDatabase(pool), /does not match the versioned migration set/);
+      await pool.query(
+        'UPDATE public.schema_migrations SET name = $1, checksum = $2 WHERE version = 14',
+        [original.rows[0].name, '0'.repeat(64)]
+      );
+      await assert.rejects(migrateDatabase(pool), /has been modified/);
+    } finally {
+      await pool.query(
+        'UPDATE public.schema_migrations SET name = $1, checksum = $2 WHERE version = 14',
+        [original.rows[0].name, original.rows[0].checksum]
+      );
     }
   });
 
@@ -1486,24 +1510,34 @@ if (connectionString) {
       /active Workspace membership was not found/
     );
 
+    const ticketSecret = 'database-integration-realtime-secret';
     const server = createServer();
-    const realtime = attachAuthenticatedRealtime(server, pool, auth);
+    const realtime = attachAuthenticatedRealtime(server, pool, auth, ticketSecret);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
-    const websocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
-      origin: `http://127.0.0.1:${address.port}`,
-      headers: { cookie: sessionCookie.split(';', 1)[0] }
-    });
+    const openRealtime = (sessionId: string, cookie: string, origin?: string) => new WebSocket(
+      `ws://127.0.0.1:${address.port}/realtime?ticket=${issueRealtimeTicket(sessionId, ticketSecret)}`,
+      {
+        origin: origin ?? `http://127.0.0.1:${address.port}`,
+        headers: { cookie }
+      }
+    );
+    const websocket = openRealtime(
+      httpAccess.identity.sessionId,
+      sessionCookie.split(';', 1)[0]
+    );
     const ready = await new Promise<string>((resolve, reject) => {
       websocket.once('message', (data) => resolve(data.toString()));
       websocket.once('error', reject);
     });
     assert.deepEqual(JSON.parse(ready), { type: 'ready', workspaceId: httpAccess.workspace.id });
-    const secondWebsocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
-      origin: `http://127.0.0.1:${address.port}`,
-      headers: { cookie: secondSessionCookie.split(';', 1)[0] }
-    });
+    const secondHeaders = new Headers({ cookie: secondSessionCookie.split(';', 1)[0] });
+    const secondAccess = await authorizeWorkspaceRequest(pool, auth, secondHeaders);
+    const secondWebsocket = openRealtime(
+      secondAccess.identity.sessionId,
+      secondSessionCookie.split(';', 1)[0]
+    );
     const secondReady = await new Promise<string>((resolve, reject) => {
       secondWebsocket.once('message', (data) => resolve(data.toString()));
       secondWebsocket.once('error', reject);
@@ -1515,10 +1549,11 @@ if (connectionString) {
 
     assert.ok(pilotMemberHeaders);
     assert.ok(pilotMemberUserId);
-    const memberWebsocket = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
-      origin: `http://127.0.0.1:${address.port}`,
-      headers: { cookie: pilotMemberHeaders.get('cookie') ?? '' }
-    });
+    const pilotAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const memberWebsocket = openRealtime(
+      pilotAccess.identity.sessionId,
+      pilotMemberHeaders.get('cookie') ?? ''
+    );
     const memberReady = await new Promise<string>((resolve, reject) => {
       memberWebsocket.once('message', (data) => resolve(data.toString()));
       memberWebsocket.once('error', reject);
@@ -1601,10 +1636,11 @@ if (connectionString) {
       channelId: channel.channel.id
     });
 
-    const crossOrigin = new WebSocket(`ws://127.0.0.1:${address.port}/realtime`, {
-      origin: 'https://attacker.example',
-      headers: { cookie: sessionCookie.split(';', 1)[0] }
-    });
+    const crossOrigin = openRealtime(
+      httpAccess.identity.sessionId,
+      sessionCookie.split(';', 1)[0],
+      'https://attacker.example'
+    );
     const rejectedCrossOrigin = await new Promise<number>((resolve) => {
       crossOrigin.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0));
     });

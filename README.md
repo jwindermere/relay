@@ -8,11 +8,14 @@ worker, and PostgreSQL. The disposable product and execution prototypes remain u
 ## Local production stack
 
 Copy `.env.example` to `.env`, provision the referenced secret files and off-host
-backup mount, then start the production-shaped stack:
+backup mount, then bootstrap the production-shaped stack once:
 
 ```sh
 docker compose up --build
 ```
+
+For every later upgrade, use the drain- and compatibility-aware commands in
+[`ops/README.md`](ops/README.md); do not repeat generic `docker compose up`.
 
 Only the TLS proxy publishes a host port; the web service is available at the
 configured `https://RELAY_HOSTNAME`. Its `GET /health` endpoint

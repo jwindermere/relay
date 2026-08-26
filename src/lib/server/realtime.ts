@@ -56,7 +56,7 @@ export function attachAuthenticatedRealtime(
   server: HttpServer,
   pool: Pool,
   auth: RelayAuth,
-  options: { ticketSecret?: string } = {}
+  ticketSecret: string
 ): WebSocketServer {
   const realtime = new WebSocketServer({ noServer: true });
   const clients = new Set<RealtimeClient>();
@@ -109,10 +109,10 @@ export function attachAuthenticatedRealtime(
     try {
       await Promise.all([subscriptionReady, wakeupsReady]);
       const access = await authorizeWorkspaceRequest(pool, auth, headers);
-      if (options.ticketSecret && !verifyRealtimeTicket(
+      if (!verifyRealtimeTicket(
         url.searchParams.get('ticket') ?? '',
         access.identity.sessionId,
-        options.ticketSecret
+        ticketSecret
       )) {
         rejectUpgrade(socket);
         return;
