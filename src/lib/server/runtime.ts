@@ -1,10 +1,10 @@
 import type { Pool } from 'pg';
 
-import { assertCompatibleSchema, type SchemaVersions } from './database/schema.js';
+import { assertCompatibleSchema, type MigrationStreamVersions } from './database/schema.js';
 
 export interface RuntimeReadiness {
   database: 'ready';
-  schemas: SchemaVersions;
+  schemas: MigrationStreamVersions;
 }
 
 export async function checkRuntimeReadiness(pool: Pool): Promise<RuntimeReadiness> {

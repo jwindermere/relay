@@ -14,10 +14,11 @@ docker compose up --build
 ```
 
 The web service is available at <http://localhost:3000>. Its `GET /health` endpoint
-returns `200` only when PostgreSQL is reachable and both the `relay` and `auth`
-schemas match the binary's required versions. The worker reports readiness and
-database health as structured log events. Both processes exit before normal startup
-when the database is unreachable or incompatible.
+returns `200` only when PostgreSQL is reachable and both the Relay migration stream
+in `public` and the Better Auth migration stream in `auth` match the binary's required
+versions. The worker reports readiness and database health as structured log events.
+Both processes exit before normal startup when the database is unreachable or
+incompatible.
 
 Migrations are an explicit deployment step and run automatically as a one-shot
 Compose service before web or worker starts:

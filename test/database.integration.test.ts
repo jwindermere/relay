@@ -7,7 +7,7 @@ import { migrateDatabase } from '../src/lib/server/database/migrations.js';
 import {
   assertCompatibleSchema,
   IncompatibleSchemaError,
-  REQUIRED_SCHEMA_VERSIONS
+  REQUIRED_MIGRATION_STREAM_VERSIONS
 } from '../src/lib/server/database/schema.js';
 
 let container: StartedPostgreSqlContainer | undefined;
@@ -28,13 +28,13 @@ if (connectionString) {
     await container?.stop();
   });
 
-  test('migrations isolate and version Relay and authentication data', async () => {
+  test('migrations isolate Relay domain data in public and authentication data in auth', async () => {
     await migrateDatabase(pool);
 
     const result = await pool.query<{ table_schema: string; table_name: string }>(`
       SELECT table_schema, table_name
       FROM information_schema.tables
-      WHERE table_schema IN ('relay', 'auth')
+      WHERE table_schema IN ('public', 'auth')
       ORDER BY table_schema, table_name
     `);
 
@@ -44,24 +44,24 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'session' },
       { table_schema: 'auth', table_name: 'user' },
       { table_schema: 'auth', table_name: 'verification' },
-      { table_schema: 'relay', table_name: 'runtime_state' },
-      { table_schema: 'relay', table_name: 'schema_migrations' }
+      { table_schema: 'public', table_name: 'runtime_state' },
+      { table_schema: 'public', table_name: 'schema_migrations' }
     ]);
     await assert.doesNotReject(assertCompatibleSchema(pool));
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE relay.schema_migrations SET version = 99');
+    await pool.query('UPDATE public.schema_migrations SET version = 99');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
         assert.ok(error instanceof IncompatibleSchemaError);
         assert.match(error.message, /relay schema version 99 is incompatible/);
-        assert.deepEqual(error.requiredVersions, REQUIRED_SCHEMA_VERSIONS);
+        assert.deepEqual(error.requiredVersions, REQUIRED_MIGRATION_STREAM_VERSIONS);
         return true;
       });
     } finally {
-      await pool.query('UPDATE relay.schema_migrations SET version = 1');
+      await pool.query('UPDATE public.schema_migrations SET version = 1');
     }
   });
 }
