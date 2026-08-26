@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, afterEach, test } from 'node:test';
@@ -299,6 +299,68 @@ if (skipDatabaseTests) {
     );
     assert.deepEqual(decisions.rows, operations.map((operation) => ({ decision: 'allow', operation })));
     assert.doesNotMatch(JSON.stringify(decisions.rows), /before|after|installation/);
+  });
+
+  test('a mode-only executable change is published through the GitHub broker', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-mode-publication');
+    const operations: string[] = [];
+    const remote: GitHubBrokerRemote = {
+      async execute(input) {
+        operations.push(input.request.operation);
+        if (input.request.operation === 'clone') {
+          return {
+            commitSha: 'e'.repeat(40),
+            files: [{
+              path: 'script.sh',
+              content: Buffer.from('#!/bin/sh\n').toString('base64'),
+              encoding: 'base64',
+              mode: '100644'
+            }]
+          };
+        }
+        if (input.request.operation === 'create_branch') return { commitSha: 'e'.repeat(40) };
+        if (input.request.operation === 'commit') {
+          assert.deepEqual(input.request.files, [{
+            path: 'script.sh',
+            content: Buffer.from('#!/bin/sh\n').toString('base64'),
+            encoding: 'base64',
+            mode: '100755'
+          }]);
+          return { commitSha: 'f'.repeat(40) };
+        }
+        if (input.request.operation === 'update_branch') return { commitSha: 'f'.repeat(40) };
+        if (input.request.operation === 'pull_request_upsert') {
+          return {
+            commitSha: 'f'.repeat(40),
+            pullRequestNumber: 27,
+            pullRequestUrl: 'https://github.test/relay-owner/pilot/pull/27'
+          };
+        }
+        throw new Error('unexpected broker operation');
+      }
+    };
+    const provider = new FixtureProvider(async (input, observer) => {
+      await chmod(join(input.workspaceDirectory, 'script.sh'), 0o700);
+      await observer.threadStarted('thread-github-mode-publication');
+      await observer.turnStarted('turn-github-mode-publication');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-github-mode-publication:completed',
+        turn: { id: 'turn-github-mode-publication', status: 'completed' }
+      });
+    });
+
+    const result = await processNextAgentRun(pool, provider, {
+      workerId: 'worker-github-mode-publication',
+      workspaceRoot,
+      leaseDurationMs: 10_000,
+      githubWorkspaceBroker: new AgentRunGitHubWorkspaceBroker(pool, remote)
+    });
+
+    assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+    assert.deepEqual(operations, [
+      'clone', 'create_branch', 'commit', 'update_branch', 'pull_request_upsert'
+    ]);
   });
 
   test('a pull-request result is not exposed unless AgentRun completion is durable', async () => {

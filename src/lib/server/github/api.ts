@@ -66,6 +66,13 @@ function requiredNumber(value: unknown, field: string): number {
   return value;
 }
 
+function requiredFileMode(value: unknown): '100644' | '100755' {
+  if (value !== '100644' && value !== '100755') {
+    throw new Error('GitHub clone contains an unsupported file mode');
+  }
+  return value;
+}
+
 export function createGitHubRepositoryGateway(
   configuration: GitHubGatewayConfiguration
 ): GitHubRepositoryGateway {
@@ -335,13 +342,20 @@ export function createGitHubBrokerRemote(
         if (brokerRequest.operation !== 'clone') return { commitSha };
         const tree = await request<{
           truncated?: unknown;
-          tree?: Array<{ path?: unknown; type?: unknown; sha?: unknown; size?: unknown }>;
+          tree?: Array<{
+            path?: unknown;
+            mode?: unknown;
+            type?: unknown;
+            sha?: unknown;
+            size?: unknown;
+          }>;
         }>(`/repos/${owner}/${repository}/git/trees/${commitSha}?recursive=1`, token);
         if (tree.truncated === true || !Array.isArray(tree.tree)) {
           throw new Error('GitHub clone tree is too large or incomplete');
         }
         const blobs = tree.tree.filter((entry) => entry.type === 'blob').map((entry) => ({
           path: requiredString(entry.path, 'blob path'),
+          mode: requiredFileMode(entry.mode),
           sha: requiredString(entry.sha, 'blob SHA'),
           size: requiredNumber(entry.size, 'blob size')
         }));
@@ -358,7 +372,8 @@ export function createGitHubBrokerRemote(
           return {
             path: blob.path,
             content: requiredString(response.content, 'blob content').replace(/\s/g, ''),
-            encoding: 'base64' as const
+            encoding: 'base64' as const,
+            mode: blob.mode
           };
         }));
         return { commitSha, files };
@@ -391,7 +406,7 @@ export function createGitHubBrokerRemote(
         );
         const blobs = await Promise.all((brokerRequest.files ?? []).map(async (file) => {
           if (file.content === null) {
-            return { path: file.path, mode: '100644', type: 'blob', sha: null };
+            return { path: file.path, mode: file.mode ?? '100644', type: 'blob', sha: null };
           }
           const blob = await request<{ sha?: unknown }>(
             `/repos/${owner}/${repository}/git/blobs`,
@@ -401,7 +416,12 @@ export function createGitHubBrokerRemote(
               body: { content: file.content, encoding: file.encoding ?? 'utf-8' }
             }
           );
-          return { path: file.path, mode: '100644', type: 'blob', sha: requiredString(blob.sha, 'blob SHA') };
+          return {
+            path: file.path,
+            mode: file.mode ?? '100644',
+            type: 'blob',
+            sha: requiredString(blob.sha, 'blob SHA')
+          };
         }));
         const tree = await request<{ sha?: unknown }>(
           `/repos/${owner}/${repository}/git/trees`,

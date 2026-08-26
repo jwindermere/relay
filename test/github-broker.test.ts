@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -10,6 +13,7 @@ import {
   GitHubBrokerDeniedError,
   type GitHubBrokerRemote
 } from '../src/lib/server/github/broker.js';
+import { collectWorkspaceChanges } from '../src/lib/server/github/workspace.js';
 
 const boundary = {
   repositoryId: '202',
@@ -28,6 +32,22 @@ function request(overrides: Partial<GitHubBrokerRequest> = {}): GitHubBrokerRequ
     ...overrides
   };
 }
+
+test('workspace changes include executable mode changes without content changes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'relay-workspace-mode-'));
+  try {
+    const content = Buffer.from('#!/bin/sh\n').toString('base64');
+    const path = join(directory, 'script.sh');
+    await writeFile(path, Buffer.from(content, 'base64'), { mode: 0o600 });
+    await chmod(path, 0o700);
+
+    assert.deepEqual(await collectWorkspaceChanges(directory, new Map([
+      ['script.sh', { content, mode: '100644' }]
+    ])), [{ path: 'script.sh', content, encoding: 'base64', mode: '100755' }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test('broker allows only the AgentRun repository and assigned branch workflow', () => {
   const assignedBranch = 'relay/run-25';
