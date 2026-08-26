@@ -7,6 +7,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import { Pool } from 'pg';
 
 import { migrateDatabase } from '../src/lib/server/database/migrations.js';
+import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
 import {
   AgentRunProviderError,
   type AgentRunProvider,
@@ -233,6 +234,111 @@ if (skipDatabaseTests) {
     assert.equal(stored.rows[0]?.provider_thread_id, 'thread-clarification');
     assert.ok(stored.rows[0]?.delivery_attempted_at);
     assert.ok(stored.rows[0]?.delivered_at);
+  });
+
+  test('one attributable Approval is consumed once before its action continues', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'approval');
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-approval');
+      await observer.turnStarted('turn-approval');
+      const decision = await observer.approvalRequested({
+        providerRequestId: 'request-approval',
+        threadId: 'thread-approval',
+        turnId: 'turn-approval',
+        itemId: 'item-approval',
+        actionKind: 'command',
+        scopeHash: 'a'.repeat(64),
+        summary: 'Run one elevated command'
+      });
+      assert.equal(decision, 'approved');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-approval:completed',
+        turn: { id: 'turn-approval', status: 'completed' }
+      });
+    });
+
+    const execution = processNextAgentRun(pool, provider, {
+      workerId: 'worker-approval', workspaceRoot, leaseDurationMs: 10_000
+    });
+    const approval = await waitForRow<{
+      id: string;
+      request_message_id: string;
+      state: string;
+      scope_hash: string;
+      decision_code: string;
+    }>(pool, `SELECT id, request_message_id, state, scope_hash, decision_code
+              FROM public.approval WHERE agent_run_id = $1`, [ids.runId]);
+    assert.equal(approval.state, 'pending');
+    assert.equal(approval.scope_hash, 'a'.repeat(64));
+    const visible = await pool.query<{ body: string }>(
+      'SELECT body FROM public.message WHERE id = $1', [approval.request_message_id]
+    );
+    assert.equal(
+      visible.rows[0]?.body,
+      `Approval ${approval.decision_code} needed: Run one elevated command. `
+        + `Reply “approve ${approval.decision_code}” or “deny ${approval.decision_code}” in this thread.`
+    );
+    assert.doesNotMatch(JSON.stringify(visible.rows), /token|secret|Authorization|curl/i);
+
+    await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-approval',
+      body: 'approve this and every future command'
+    });
+    assert.equal((await pool.query<{ state: string }>(
+      'SELECT state FROM public.approval WHERE id = $1', [approval.id]
+    )).rows[0]?.state, 'pending');
+    const decision = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-approval',
+      body: `approve ${approval.decision_code}`
+    });
+
+    assert.deepEqual(await execution, {
+      kind: 'executed', agentRunId: ids.runId, status: 'completed'
+    });
+    const stored = await pool.query<{
+      state: string;
+      consumed_at: Date;
+      decisions: number;
+      decision_message_id: string;
+      decided_by_workspace_member_id: string;
+    }>(
+      `SELECT approval.state, approval.consumed_at, approval.decision_message_id,
+              approval.decided_by_workspace_member_id,
+              (SELECT count(*)::integer FROM public.approval
+               WHERE agent_run_id = $2) AS decisions
+       FROM public.approval approval WHERE approval.id = $1`,
+      [approval.id, ids.runId]
+    );
+    assert.equal(stored.rows[0]?.state, 'consumed');
+    assert.ok(stored.rows[0]?.consumed_at);
+    assert.equal(stored.rows[0]?.decisions, 1);
+    assert.equal(stored.rows[0]?.decision_message_id, decision.id);
+    assert.equal(
+      stored.rows[0]?.decided_by_workspace_member_id,
+      ids.memberAccess.membership.id
+    );
+    await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-approval',
+      body: `approve ${approval.decision_code}`
+    });
+    assert.equal((await pool.query<{ state: string }>(
+      'SELECT state FROM public.approval WHERE id = $1', [approval.id]
+    )).rows[0]?.state, 'consumed');
+    const resolution = await pool.query<{ body: string }>(
+      `SELECT message.body
+       FROM public.message message
+       JOIN public.workspace_member author
+         ON author.id = message.author_workspace_member_id
+       WHERE message.parent_message_id = 'message-approval'
+         AND author.kind = 'agent'
+         AND message.body = $1`,
+      [`Approval ${approval.decision_code} was used once.`]
+    );
+    assert.equal(resolution.rows.length, 1);
   });
 
   test('the Provider connection admits at most one executing AgentRun', async () => {
@@ -485,7 +591,10 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
   const workspaceId = `workspace-${suffix}`;
   const userId = `user-${suffix}`;
   const membershipId = `membership-${suffix}`;
+  const memberUserId = `member-user-${suffix}`;
+  const memberMembershipId = `member-membership-${suffix}`;
   const pilotMemberId = `pilot-${suffix}`;
+  const secondPilotMemberId = `second-pilot-${suffix}`;
   const projectId = `project-${suffix}`;
   const agentId = `agent-${suffix}`;
   const agentMemberId = `agent-member-${suffix}`;
@@ -501,6 +610,11 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     `INSERT INTO auth."user" (id, name, email, "emailVerified") VALUES ($1, 'Owner', $2, true)`,
     [userId, `${suffix}@example.com`]
   );
+  await pool.query(
+    `INSERT INTO auth."user" (id, name, email, "emailVerified")
+     VALUES ($1, 'Pilot member', $2, true)`,
+    [memberUserId, `member-${suffix}@example.com`]
+  );
   await pool.query('INSERT INTO public.workspace (id, name) VALUES ($1, $2)', [
     workspaceId, `Workspace ${suffix}`
   ]);
@@ -508,6 +622,11 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     `INSERT INTO public.workspace_membership (workspace_id, user_id, role, id)
      VALUES ($1, $2, 'owner', $3)`,
     [workspaceId, userId, membershipId]
+  );
+  await pool.query(
+    `INSERT INTO public.workspace_membership (workspace_id, user_id, role, id)
+     VALUES ($1, $2, 'member', $3)`,
+    [workspaceId, memberUserId, memberMembershipId]
   );
   await pool.query('INSERT INTO public.project (id, workspace_id, name) VALUES ($1, $2, $3)', [
     projectId, workspaceId, 'Project'
@@ -527,14 +646,19 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     [pilotMemberId, workspaceId, membershipId]
   );
   await pool.query(
+    `INSERT INTO public.workspace_member (id, workspace_id, kind, pilot_membership_id)
+     VALUES ($1, $2, 'pilot', $3)`,
+    [secondPilotMemberId, workspaceId, memberMembershipId]
+  );
+  await pool.query(
     `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
      VALUES ($1, $2, 'agent', $3)`,
     [agentMemberId, workspaceId, agentId]
   );
   await pool.query(
     `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
-     VALUES ($1, $2, $3), ($1, $2, $4)`,
-    [workspaceId, projectId, pilotMemberId, agentMemberId]
+     VALUES ($1, $2, $3), ($1, $2, $4), ($1, $2, $5)`,
+    [workspaceId, projectId, pilotMemberId, secondPilotMemberId, agentMemberId]
   );
   await pool.query(
     `INSERT INTO public.message (
@@ -592,7 +716,25 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
     agentId,
     channelId,
     pilotMemberId,
-    linkedRepositoryId
+    linkedRepositoryId,
+    ownerAccess: {
+      identity: { userId, email: `${suffix}@example.com`, sessionId: `session-${suffix}` },
+      workspace: { id: workspaceId, name: `Workspace ${suffix}` },
+      membership: {
+        id: membershipId, userId, role: 'owner' as const, joinedAt: new Date()
+      }
+    },
+    memberAccess: {
+      identity: {
+        userId: memberUserId,
+        email: `member-${suffix}@example.com`,
+        sessionId: `member-session-${suffix}`
+      },
+      workspace: { id: workspaceId, name: `Workspace ${suffix}` },
+      membership: {
+        id: memberMembershipId, userId: memberUserId, role: 'member' as const, joinedAt: new Date()
+      }
+    }
   };
 }
 

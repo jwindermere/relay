@@ -22,6 +22,11 @@ export type AgentRunEventType =
   | 'run.clarification_answered'
   | 'run.clarification_requeued'
   | 'run.clarification_wait_recovered'
+  | 'run.approval_requested'
+  | 'run.approval_approved'
+  | 'run.approval_denied'
+  | 'run.approval_consumed'
+  | 'run.action_rejected'
   | 'provider.thread.started'
   | 'provider.turn.started'
   | 'provider.turn.completed'
@@ -65,6 +70,21 @@ export interface AgentRunProviderObserver {
   notification(notification: ProviderNotification): Promise<void>;
   clarificationRequested(request: ProviderClarificationRequest): Promise<ProviderClarificationAnswers>;
   clarificationDelivered(providerRequestId: string): Promise<void>;
+  approvalRequested(request: ProviderApprovalRequest): Promise<'approved' | 'denied'>;
+  actionRejected(request: ProviderApprovalRequest): Promise<void>;
+}
+
+export interface ProviderRequestBoundary {
+  providerRequestId: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+}
+
+export interface ProviderApprovalRequest extends ProviderRequestBoundary {
+  actionKind: 'command' | 'file_change' | 'permissions';
+  scopeHash: string;
+  summary: string;
 }
 
 export interface ProviderClarificationQuestion {
@@ -74,11 +94,7 @@ export interface ProviderClarificationQuestion {
   options: Array<{ label: string; description: string }> | null;
 }
 
-export interface ProviderClarificationRequest {
-  providerRequestId: string;
-  threadId: string;
-  turnId: string;
-  itemId: string;
+export interface ProviderClarificationRequest extends ProviderRequestBoundary {
   questions: ProviderClarificationQuestion[];
 }
 

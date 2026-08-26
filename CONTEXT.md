@@ -62,7 +62,7 @@ One persistent execution attempt by an Agent toward exactly one Task; a Task beg
 
 ## AgentRun lifecycle
 
-The durable progression through `queued`, `planning`, `working`, waiting for input or approval, recovery or pause, and exactly one immutable terminal outcome of completed, failed, or cancelled. A waiting run re-enters the queue when answered; an unknown execution outcome passes through recovery into pause and is never replayed automatically.
+The durable progression through `queued`, `planning`, `working`, waiting for input or approval, recovery or pause, and exactly one immutable terminal outcome of completed, failed, or cancelled. A clarification answered after execution has yielded re-enters the queue. An Approval waiting on one action in an active execution boundary continues only within that same boundary; losing the boundary expires the Approval and pauses the run. An unknown execution outcome passes through recovery into pause and is never replayed automatically.
 
 ## Artifact
 

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
+import { postApprovalResolutionMessage } from '../lib/server/collaboration/approvals.js';
 import {
   AgentRunProviderError,
   mapProviderOutcomeToAgentRunStatus,
@@ -12,6 +13,7 @@ import {
   type AgentRunProviderObserver,
   type ProviderClarificationAnswers,
   type ProviderClarificationRequest,
+  type ProviderApprovalRequest,
   type ProviderNotification
 } from '../lib/server/provider/agent-run.js';
 import {
@@ -86,6 +88,12 @@ export async function processNextAgentRun(
     },
     async clarificationDelivered(providerRequestId) {
       await markClarificationDelivered(pool, claim, providerRequestId);
+    },
+    async approvalRequested(request) {
+      return requestApprovalAndWait(pool, claim, request, executionAbort.signal);
+    },
+    async actionRejected(request) {
+      await recordRejectedAction(pool, claim, request);
     }
   };
 
@@ -289,6 +297,10 @@ async function recoverAgentRun(
   provider: AgentRunProvider,
   claim: ClaimedAgentRun
 ): Promise<WorkerCycleResult> {
+  const approvalStatus = await recoverApprovalBoundary(pool, claim);
+  if (approvalStatus) {
+    return { kind: 'recovered', agentRunId: claim.id, status: approvalStatus };
+  }
   const clarificationStatus = await recoverClarificationBoundary(pool, claim);
   if (clarificationStatus) {
     return { kind: 'recovered', agentRunId: claim.id, status: clarificationStatus };
@@ -338,6 +350,54 @@ async function recoverAgentRun(
       evidence: { reason: 'provider_unavailable_during_recovery' }
     });
     return { kind: 'recovered', agentRunId: claim.id, status: 'paused' };
+  }
+}
+
+async function recoverApprovalBoundary(
+  pool: Pool,
+  claim: ClaimedAgentRun
+): Promise<'paused' | undefined> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const approval = await client.query<{ id: string }>(
+      `SELECT approval.id
+       FROM public.approval approval
+       JOIN public.agent_run run ON run.id = approval.agent_run_id
+       WHERE approval.agent_run_id = $1
+         AND approval.state IN ('pending', 'approved')
+       ORDER BY approval.created_at DESC, approval.id DESC
+       LIMIT 1
+       FOR UPDATE OF approval, run`,
+      [claim.id]
+    );
+    if (!approval.rows[0]) {
+      await client.query('COMMIT');
+      return undefined;
+    }
+    await client.query(
+      `UPDATE public.approval SET state = 'expired'
+       WHERE id = $1 AND state IN ('pending', 'approved')`,
+      [approval.rows[0].id]
+    );
+    await postApprovalResolutionMessage(
+      client,
+      approval.rows[0].id,
+      'recovery_expired'
+    );
+    await appendRunEventWithClient(client, claim, {
+      eventType: 'run.paused',
+      status: 'paused',
+      summary: 'Approval expired after execution recovery; human review is required',
+      evidence: { approvalId: approval.rows[0].id, reason: 'approval_worker_loss' }
+    });
+    await client.query('COMMIT');
+    return 'paused';
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -647,6 +707,207 @@ async function markClarificationDelivered(
   );
   if (updated.rowCount !== 1) {
     throw new Error('AgentRun clarification delivery boundary changed');
+  }
+}
+
+async function requestApprovalAndWait(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  request: ProviderApprovalRequest,
+  signal: AbortSignal
+): Promise<'approved' | 'denied'> {
+  assertActiveProviderRequest(claim, request);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const run = await client.query<{
+      root_message_id: string;
+      agent_member_id: string;
+      channel_id: string;
+    }>(
+      `SELECT COALESCE(source.parent_message_id, source.id) AS root_message_id,
+              agent_member.id AS agent_member_id, source.channel_id
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id
+       JOIN public.message source ON source.id = task.source_message_id
+       JOIN public.workspace_member agent_member
+         ON agent_member.agent_id = run.agent_id
+        AND agent_member.workspace_id = run.workspace_id
+       WHERE run.id = $1 AND run.workspace_id = $2 AND run.lease_token = $3
+       FOR UPDATE OF run`,
+      [claim.id, claim.workspace_id, claim.lease_token]
+    );
+    const context = run.rows[0];
+    if (!context) throw new Error('AgentRun execution lease was lost');
+    const existing = await client.query<{ id: string }>(
+      `SELECT id FROM public.approval
+       WHERE agent_run_id = $1 AND provider_request_id = $2`,
+      [claim.id, request.providerRequestId]
+    );
+    if (!existing.rows[0]) {
+      const approvalId = randomUUID();
+      const decisionCode = approvalId.replaceAll('-', '').slice(0, 8);
+      const requestMessageId = randomUUID();
+      await client.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          requestMessageId,
+          claim.workspace_id,
+          context.channel_id,
+          context.agent_member_id,
+          context.root_message_id,
+          `Approval ${decisionCode} needed: ${request.summary}. `
+            + `Reply “approve ${decisionCode}” or “deny ${decisionCode}” in this thread.`
+        ]
+      );
+      await client.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, message_id, topic, payload
+         ) VALUES ($1, $2, 'channel.message', $3)`,
+        [claim.workspace_id, requestMessageId, { messageId: requestMessageId }]
+      );
+      await client.query(
+        `INSERT INTO public.approval (
+         id, workspace_id, agent_run_id, provider_request_id, provider_turn_id,
+           provider_thread_id, provider_item_id, action_kind, scope_hash, decision_code, summary,
+           requester_workspace_member_id, request_message_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [
+          approvalId,
+          claim.workspace_id,
+          claim.id,
+          request.providerRequestId,
+          request.turnId,
+          request.threadId,
+          request.itemId,
+          request.actionKind,
+          request.scopeHash,
+          decisionCode,
+          request.summary,
+          context.agent_member_id,
+          requestMessageId
+        ]
+      );
+      await appendRunEventWithClient(client, claim, {
+        eventType: 'run.approval_requested',
+        status: 'waiting_for_approval',
+        summary: 'Waiting for a Pilot member to approve one action',
+        evidence: {
+          approvalId,
+          actionKind: request.actionKind,
+          scopeHash: request.scopeHash,
+          providerItemId: request.itemId
+        }
+      });
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  while (!signal.aborted) {
+    const decision = await pool.query<{ id: string; state: string }>(
+      `SELECT id, state FROM public.approval
+       WHERE agent_run_id = $1 AND provider_request_id = $2`,
+      [claim.id, request.providerRequestId]
+    );
+    if (decision.rows[0]?.state === 'approved') {
+      return consumeApprovedAction(pool, claim, request, decision.rows[0].id);
+    }
+    if (decision.rows[0] && ['denied', 'expired', 'consumed'].includes(decision.rows[0].state)) {
+      return 'denied';
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error('AgentRun approval stopped after its execution lease was lost');
+}
+
+async function consumeApprovedAction(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  request: ProviderApprovalRequest,
+  approvalId: string
+): Promise<'approved' | 'denied'> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const consumed = await client.query(
+      `UPDATE public.approval approval
+       SET state = 'consumed', consumed_at = now()
+       FROM public.agent_run run
+       WHERE approval.id = $1
+         AND approval.agent_run_id = run.id
+         AND approval.state = 'approved'
+         AND approval.provider_turn_id = $2
+         AND approval.provider_item_id = $3
+         AND approval.scope_hash = $4
+         AND run.lease_token = $5
+         AND run.provider_thread_id = $6
+         AND run.active_turn_id = $2
+         AND run.status NOT IN ('completed', 'failed', 'cancelled', 'paused')`,
+      [
+        approvalId,
+        request.turnId,
+        request.itemId,
+        request.scopeHash,
+        claim.lease_token,
+        request.threadId
+      ]
+    );
+    if (consumed.rowCount !== 1) {
+      await client.query('ROLLBACK');
+      return 'denied';
+    }
+    await postApprovalResolutionMessage(
+      client,
+      approvalId,
+      'consumed'
+    );
+    await appendRunEventWithClient(client, claim, {
+      eventType: 'run.approval_consumed',
+      status: 'working',
+      summary: 'Approved action authorised once; continuing the request',
+      evidence: { approvalId, actionKind: request.actionKind, scopeHash: request.scopeHash }
+    });
+    await client.query('COMMIT');
+    return 'approved';
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function recordRejectedAction(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  request: ProviderApprovalRequest
+): Promise<void> {
+  assertActiveProviderRequest(claim, request);
+  await appendRunEvent(pool, claim, {
+    eventType: 'run.action_rejected',
+    status: 'working',
+    summary: 'Unsafe action rejected; continuing within the allowed boundary',
+    evidence: {
+      actionKind: request.actionKind,
+      scopeHash: request.scopeHash,
+      providerItemId: request.itemId
+    }
+  });
+}
+
+function assertActiveProviderRequest(
+  claim: ClaimedAgentRun,
+  request: Pick<ProviderApprovalRequest, 'threadId' | 'turnId'>
+): void {
+  if (request.threadId !== claim.provider_thread_id || request.turnId !== claim.active_turn_id) {
+    throw new Error('Provider action does not match the active AgentRun turn');
   }
 }
 

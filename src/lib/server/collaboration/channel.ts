@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import type { GitHubRepositoryGateway } from '../github/connection.js';
 import { hasActivePilotChannelAccess } from './channel-access.js';
+import { handleApprovalReply } from './approvals.js';
 import { handleWaitingAgentRunReply } from './clarifications.js';
 import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
 import { answerAgentProgressRequest } from './progress.js';
@@ -294,7 +295,16 @@ export async function postChannelMessage(
         parentMessageId,
         body
       });
-      const waitingAgentRunReply = !agentProgressAnswered && parentMessageId
+      const approvalAnswered = !agentProgressAnswered && parentMessageId
+        ? await handleApprovalReply(client, {
+            messageId,
+            workspaceId: access.workspace.id,
+            channelId: input.channelId,
+            parentMessageId,
+            body
+          })
+        : false;
+      const waitingAgentRunReply = !agentProgressAnswered && !approvalAnswered && parentMessageId
         ? await handleWaitingAgentRunReply(client, {
             messageId,
             workspaceId: access.workspace.id,
@@ -303,7 +313,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      if (!agentProgressAnswered && !waitingAgentRunReply) {
+      if (!agentProgressAnswered && !approvalAnswered && !waitingAgentRunReply) {
         await acceptEligibleAgentMention(client, {
           messageId,
           workspaceId: access.workspace.id,

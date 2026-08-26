@@ -14,6 +14,11 @@ import {
   type ProviderNotification,
   type ProviderReconciliation
 } from './agent-run.js';
+import {
+  classifyProviderAction,
+  type ProviderActionRequest,
+  type ProviderApprovalResponse
+} from './approval-policy.js';
 
 export class LocalCodexAgentRunProvider implements AgentRunProvider {
   constructor(
@@ -27,6 +32,7 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
     let releaseNotifications!: () => void;
     const referencesPersisted = new Promise<void>((resolve) => { releaseNotifications = resolve; });
     let notificationChain = Promise.resolve();
+    let requestChain = Promise.resolve();
     let resolveTerminal!: () => void;
     let rejectTerminal!: (error: Error) => void;
     const terminal = new Promise<void>((resolve, reject) => {
@@ -53,7 +59,7 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
     };
     session.onRequest = (message) => {
       if (message.method === 'item/tool/requestUserInput') {
-        void Promise.resolve().then(async () => {
+        requestChain = requestChain.then(async () => {
           await referencesPersisted;
           const request = parseClarificationRequest(message);
           const answers = await observer.clarificationRequested(request);
@@ -69,12 +75,37 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
         return;
       }
       if (message.method === 'item/commandExecution/requestApproval'
-        || message.method === 'item/fileChange/requestApproval') {
-        void session.respond?.(message.id, { decision: 'decline' });
-        return;
-      }
-      if (message.method === 'item/permissions/requestApproval') {
-        void session.respond?.(message.id, { permissions: [], scope: 'turn' });
+        || message.method === 'item/fileChange/requestApproval'
+        || message.method === 'item/permissions/requestApproval') {
+        requestChain = requestChain.then(async () => {
+          await referencesPersisted;
+          if (!session.respond) throw new Error('Codex app-server cannot receive approval input');
+          const providerRequest = parseApprovalRequest(message);
+          const action = classifyProviderAction(providerRequest, input.workspaceDirectory);
+          const visibleRequest = {
+            providerRequestId: providerRequest.providerRequestId,
+            threadId: providerRequest.threadId,
+            turnId: providerRequest.turnId,
+            itemId: providerRequest.itemId,
+            actionKind: action.actionKind,
+            scopeHash: action.scopeHash,
+            summary: action.summary
+          };
+          if (action.classification === 'forbidden') {
+            await observer.actionRejected(visibleRequest);
+            await session.respond(message.id, deniedResponse(action.actionKind));
+            return;
+          }
+          if (action.classification === 'autonomous') {
+            await session.respond(message.id, action.providerResponse);
+            return;
+          }
+          const decision = await observer.approvalRequested(visibleRequest);
+          await session.respond(
+            message.id,
+            decision === 'approved' ? action.providerResponse : deniedResponse(action.actionKind)
+          );
+        }).catch((error) => rejectTerminal(classifyProviderError(error)));
       }
     };
     session.onFailure = (error) => rejectTerminal(classifyProviderError(error));
@@ -110,6 +141,7 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       releaseNotifications();
       await terminal;
       await notificationChain;
+      await requestChain;
     } catch (error) {
       releaseNotifications();
       throw classifyProviderError(error);
@@ -144,6 +176,116 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       session.close();
     }
   }
+}
+
+function parseApprovalRequest(
+  message: ProtocolMessage & { id: string | number; method: string }
+): ProviderActionRequest {
+  const params = message.params ?? {};
+  if (typeof params.threadId !== 'string'
+    || typeof params.turnId !== 'string'
+    || typeof params.itemId !== 'string') {
+    throw new Error('Codex approval request was invalid');
+  }
+  const common = {
+    providerRequestId: String(message.id),
+    threadId: params.threadId,
+    turnId: params.turnId,
+    itemId: params.itemId
+  };
+  if (message.method === 'item/commandExecution/requestApproval') {
+    return {
+      ...common,
+      kind: 'command',
+      command: typeof params.command === 'string' ? params.command : null,
+      cwd: typeof params.cwd === 'string' ? params.cwd : null,
+      commandActions: readCommandActions(params.commandActions),
+      networkHost: typeof asRecord(params.networkApprovalContext).host === 'string'
+        ? asRecord(params.networkApprovalContext).host as string
+        : null
+    };
+  }
+  if (message.method === 'item/fileChange/requestApproval') {
+    return {
+      ...common,
+      kind: 'file_change',
+      grantRoot: typeof params.grantRoot === 'string' ? params.grantRoot : null
+    };
+  }
+  if (!params.permissions || typeof params.permissions !== 'object'
+    || typeof params.cwd !== 'string') {
+    throw new Error('Codex permission request was invalid');
+  }
+  const permissions = asRecord(params.permissions);
+  const network = permissions.network === null ? null : asRecord(permissions.network);
+  const fileSystem = permissions.fileSystem === null ? null : asRecord(permissions.fileSystem);
+  return {
+    ...common,
+    kind: 'permissions',
+    cwd: params.cwd,
+    permissions: {
+      network: network === null ? null : {
+        enabled: typeof network.enabled === 'boolean' ? network.enabled : null
+      },
+      fileSystem: fileSystem === null ? null : {
+        read: readStringArray(fileSystem.read),
+        write: readStringArray(fileSystem.write),
+        entries: Array.isArray(fileSystem.entries)
+          ? fileSystem.entries.map(asRecord)
+          : []
+      }
+    }
+  };
+}
+
+function readCommandActions(
+  value: unknown
+): Extract<ProviderActionRequest, { kind: 'command' }>['commandActions'] {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value)) return null;
+  const actions: NonNullable<Extract<ProviderActionRequest, { kind: 'command' }>['commandActions']> = [];
+  for (const entry of value) {
+    const action = asRecord(entry);
+    if (action.type === 'unknown' && typeof action.command === 'string') {
+      actions.push({ type: 'unknown', command: action.command });
+    } else if (action.type === 'read'
+      && typeof action.command === 'string'
+      && typeof action.name === 'string'
+      && typeof action.path === 'string') {
+      actions.push({
+        type: 'read', command: action.command, name: action.name, path: action.path
+      });
+    } else if ((action.type === 'listFiles' || action.type === 'search')
+      && typeof action.command === 'string'
+      && (action.path === null || typeof action.path === 'string')) {
+      if (action.type === 'listFiles') {
+        actions.push({ type: 'listFiles', command: action.command, path: action.path });
+      } else if (action.query === null || typeof action.query === 'string') {
+        actions.push({
+          type: 'search', command: action.command, path: action.path, query: action.query
+        });
+      } else {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  }
+  return actions;
+}
+
+function deniedResponse(action: ProviderActionRequest['kind']): ProviderApprovalResponse {
+  return action === 'permissions'
+    ? { permissions: {}, scope: 'turn' }
+    : { decision: 'decline' };
+}
+
+function readStringArray(value: unknown): string[] | null {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error('Codex permission request was invalid');
+  }
+  return value as string[];
 }
 
 function parseClarificationRequest(

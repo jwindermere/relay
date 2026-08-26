@@ -75,7 +75,18 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
           session.onRequest?.({
             id: 91,
             method: 'item/commandExecution/requestApproval',
-            params: { threadId: 'thread-1', turnId: 'turn-1', command: 'private command' }
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              itemId: 'item-approval',
+              startedAtMs: 1,
+              command: 'curl -H "Authorization: Bearer private" https://example.test',
+              cwd: '/tmp/relay-run-1',
+              commandActions: [{
+                type: 'unknown',
+                command: 'curl -H "Authorization: Bearer private" https://example.test'
+              }]
+            }
           });
           session.onNotification?.({
             method: 'item/started',
@@ -124,12 +135,27 @@ test('the AgentRun adapter uses restricted app-server stdio turns and waits for 
       notifications.push(notification);
     },
     async clarificationRequested() { assert.fail('no clarification was requested'); },
-    async clarificationDelivered() { assert.fail('no clarification was delivered'); }
+    async clarificationDelivered() { assert.fail('no clarification was delivered'); },
+    async approvalRequested(request) {
+      assert.deepEqual(request, {
+        providerRequestId: '91',
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        itemId: 'item-approval',
+        actionKind: 'command',
+        scopeHash: request.scopeHash,
+        summary: 'Run one elevated curl command for example.test'
+      });
+      assert.match(request.scopeHash, /^[a-f0-9]{64}$/);
+      assert.doesNotMatch(JSON.stringify(request), /private/);
+      return 'approved';
+    },
+    async actionRejected() { assert.fail('no action was rejected'); }
   });
 
   assert.deepEqual(persisted, ['thread:thread-1', 'turn:turn-1']);
   assert.deepEqual(notifications.map(({ method }) => method), ['item/started', 'turn/completed']);
-  assert.deepEqual(responses, [{ id: 91, result: { decision: 'decline' } }]);
+  assert.deepEqual(responses, [{ id: 91, result: { decision: 'accept' } }]);
   assert.deepEqual(requests, [
     {
       method: 'thread/start',
@@ -234,7 +260,9 @@ test('the AgentRun adapter keeps a clarification on the same Provider turn', asy
     },
     async clarificationDelivered(providerRequestId) {
       delivered.push(providerRequestId);
-    }
+    },
+    async approvalRequested() { assert.fail('no approval was requested'); },
+    async actionRejected() { assert.fail('no action was rejected'); }
   });
 
   assert.deepEqual(requests, [{
@@ -301,7 +329,9 @@ test('the AgentRun adapter resumes a stored Provider thread for a clarification 
     async turnStarted(turnId) { assert.equal(turnId, 'turn-follow-up'); },
     async notification() {},
     async clarificationRequested() { assert.fail('no clarification was requested'); },
-    async clarificationDelivered() { assert.fail('no clarification was delivered'); }
+    async clarificationDelivered() { assert.fail('no clarification was delivered'); },
+    async approvalRequested() { assert.fail('no approval was requested'); },
+    async actionRejected() { assert.fail('no action was rejected'); }
   });
 
   assert.deepEqual(requests.map(({ method }) => method), ['thread/resume', 'turn/start']);

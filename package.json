@@ -20,7 +20,7 @@
     "prototype:shared-channel-ux": "npm --prefix prototype/shared-channel-ux run dev --",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --noEmit -p tsconfig.runtime.json && node --check prototype/agent-run.mjs && node --check prototype/realtime-agent-run-model.mjs && node --check prototype/realtime-agent-run.mjs",
     "test": "npm run test:unit && npm run test:prototype && npm run test:integration",
-    "test:unit": "node --import tsx --test test/reconciliation.test.ts",
+    "test:unit": "node --import tsx --test test/reconciliation.test.ts test/approval-policy.test.ts",
     "test:prototype": "node --test prototype/*.test.mjs",
     "test:integration": "node --import tsx --test --test-isolation=none test/*.integration.test.ts"
   },
