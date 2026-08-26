@@ -18,6 +18,15 @@ import {
   postChannelMessage
 } from '../src/lib/server/collaboration/channel.js';
 import {
+  beginProviderConnectionLogin,
+  disableProviderConnection,
+  disconnectProviderConnection,
+  loadProviderConnection,
+  requireReadyProviderConnection,
+  type ManagedCodexRuntime,
+  type ManagedLoginCompletion
+} from '../src/lib/server/provider/connection.js';
+import {
   acceptWorkspaceInvitation,
   issueWorkspaceInvitation,
   registerInvitedAccount
@@ -86,6 +95,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'message' },
       { table_schema: 'public', table_name: 'project' },
       { table_schema: 'public', table_name: 'project_membership' },
+      { table_schema: 'public', table_name: 'provider_connection' },
       { table_schema: 'public', table_name: 'runtime_state' },
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'workspace' },
@@ -97,7 +107,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 4');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 5');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -107,7 +117,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 4 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 5 WHERE version = 99');
     }
   });
 
@@ -474,6 +484,158 @@ if (connectionString) {
           author: 'Pilot member'
         }
       ]
+    );
+  });
+
+  test('only the active owner manages the protected Codex Provider connection', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const ownerSignIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const ownerCookie = ownerSignIn.headers.get('set-cookie');
+    assert.equal(ownerSignIn.status, 200);
+    assert.ok(ownerCookie);
+
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    let finishLogin: ((completion: ManagedLoginCompletion) => Promise<void>) | undefined;
+    const runtimeCalls: Array<Record<string, unknown>> = [];
+    const runtime: ManagedCodexRuntime = {
+      async startManagedLogin(input) {
+        runtimeCalls.push({
+          operation: 'startManagedLogin',
+          credentialStoreReference: input.credentialStoreReference,
+          loginType: input.loginType
+        });
+        finishLogin = input.onCompleted;
+        return {
+          loginId: 'provider-login-secret-reference',
+          verificationUrl: 'https://auth.openai.com/codex/device',
+          userCode: 'OWNER-CODE'
+        };
+      },
+      async logout(input) {
+        runtimeCalls.push({ operation: 'logout', ...input });
+      }
+    };
+
+    await assert.rejects(
+      beginProviderConnectionLogin(pool, memberAccess, runtime),
+      /current Workspace owner access is required/
+    );
+
+    const initiated = await beginProviderConnectionLogin(pool, ownerAccess, runtime);
+    assert.deepEqual(initiated.login, {
+      verificationUrl: 'https://auth.openai.com/codex/device',
+      userCode: 'OWNER-CODE'
+    });
+    assert.equal(initiated.connection.state, 'connecting');
+    assert.equal(initiated.connection.readyForExecution, false);
+    assert.equal(initiated.connection.canManage, true);
+    assert.ok(finishLogin);
+    await finishLogin({ success: true, authMode: 'chatgpt' });
+
+    const ownerView = await loadProviderConnection(pool, ownerAccess);
+    const memberView = await loadProviderConnection(pool, memberAccess);
+    assert.deepEqual(
+      { ...memberView, canManage: true },
+      ownerView
+    );
+    assert.equal(memberView.state, 'ready');
+    assert.equal(memberView.readyForExecution, true);
+    assert.equal(memberView.canManage, false);
+    assert.doesNotMatch(
+      JSON.stringify({ ownerView, memberView }),
+      /provider-login-secret-reference|credentialStoreReference|OWNER-CODE/i
+    );
+
+    const stored = await pool.query<{
+      id: string;
+      credential_store_reference: string;
+      provider_login_id: string;
+      status: string;
+    }>(
+      `SELECT id, credential_store_reference, provider_login_id, status
+       FROM public.provider_connection
+       WHERE workspace_id = $1`,
+      [ownerAccess.workspace.id]
+    );
+    assert.match(stored.rows[0]?.credential_store_reference ?? '', /^codex:/);
+    assert.equal(stored.rows[0]?.provider_login_id, 'provider-login-secret-reference');
+    assert.equal(stored.rows[0]?.status, 'ready');
+    const executionConnection = await requireReadyProviderConnection(pool, ownerAccess.workspace.id);
+    assert.equal(executionConnection.connectionId, stored.rows[0]?.id);
+    assert.match(executionConnection.credentialStoreReference, /^codex:/);
+
+    await assert.rejects(
+      disableProviderConnection(pool, memberAccess),
+      /current Workspace owner access is required/
+    );
+    const disabled = await disableProviderConnection(pool, ownerAccess);
+    assert.equal(disabled.state, 'disabled');
+    assert.equal(disabled.readyForExecution, false);
+    await assert.rejects(
+      requireReadyProviderConnection(pool, ownerAccess.workspace.id),
+      /ready Codex Provider connection is required/
+    );
+
+    await assert.rejects(
+      disconnectProviderConnection(pool, memberAccess, runtime),
+      /current Workspace owner access is required/
+    );
+    const failingRuntime: ManagedCodexRuntime = {
+      ...runtime,
+      async logout() {
+        throw new Error('fixture logout failure containing protected details');
+      }
+    };
+    await assert.rejects(
+      disconnectProviderConnection(pool, ownerAccess, failingRuntime),
+      /remains disabled and can be retried/
+    );
+    assert.equal((await loadProviderConnection(pool, ownerAccess)).state, 'disabled');
+
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET status = 'disconnecting'
+       WHERE workspace_id = $1`,
+      [ownerAccess.workspace.id]
+    );
+
+    const disconnected = await disconnectProviderConnection(pool, ownerAccess, runtime);
+    assert.equal(disconnected.state, 'not_connected');
+    assert.equal(disconnected.readyForExecution, false);
+    assert.equal(runtimeCalls.at(-1)?.operation, 'logout');
+
+    const preserved = await pool.query<{ provider_rows: number; agent_rows: number; message_rows: number }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.provider_connection WHERE workspace_id = $1)
+           AS provider_rows,
+         (SELECT count(*)::integer FROM public.agent WHERE workspace_id = $1) AS agent_rows,
+         (SELECT count(*)::integer FROM public.message WHERE workspace_id = $1) AS message_rows`,
+      [ownerAccess.workspace.id]
+    );
+    assert.deepEqual(preserved.rows[0], { provider_rows: 1, agent_rows: 1, message_rows: 2 });
+
+    const audit = await pool.query<{ evidence: Record<string, unknown> }>(
+      `SELECT evidence FROM public.audit_event
+       WHERE event_type LIKE 'provider.connection.%'
+       ORDER BY id`
+    );
+    assert.equal(audit.rows.length, 6);
+    assert.doesNotMatch(
+      JSON.stringify(audit.rows),
+      /provider-login-secret-reference|codex:|OWNER-CODE|api.?key/i
     );
   });
 

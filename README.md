@@ -81,4 +81,19 @@ stores neither the invitation's raw token nor the email-verification token.
 
 The existing prototypes still prove persistent Codex-backed AgentRun execution
 through the owner's local Codex/ChatGPT login and the accepted Channel interaction.
+
+## Codex Provider connection
+
+An authenticated active Workspace owner can connect or replace the Workspace's Codex
+Provider connection from the Channel sidebar. Relay starts the official managed ChatGPT
+device-code flow through the local `codex app-server`; it never accepts an OpenAI API
+key. Set `RELAY_CODEX_BIN` only when the `codex` executable is not available on the
+service user's `PATH`.
+
+The other Pilot member sees only whether the connection is ready. Codex retains its
+managed credentials in the local service account's protected state, while Relay stores
+only an opaque local reference and safe connection state. Disabling or disconnecting
+the connection makes it unavailable for new Agent execution without deleting its row,
+the Agent, Messages, or future execution history.
+
 See [prototype/README.md](prototype/README.md).

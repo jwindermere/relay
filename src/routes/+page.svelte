@@ -5,6 +5,9 @@
   let { data, form } = $props();
   let replyToId = $state<string | null>(null);
   let composer = $state<HTMLTextAreaElement>();
+  let providerBusy = $state(false);
+  let providerMessage = $state('');
+  let managedLogin = $state<{ verificationUrl: string; userCode: string } | null>(null);
   let roots = $derived(data.sharedChannel.messages.filter((message) => !message.parentMessageId));
 
   function repliesFor(rootId: string) {
@@ -29,6 +32,27 @@
     await fetch('/api/auth/sign-out', { method: 'POST' });
     window.location.assign('/sign-in');
   }
+
+  async function manageProvider(action: 'connect' | 'disable' | 'disconnect') {
+    providerBusy = true;
+    providerMessage = '';
+    if (action !== 'connect') managedLogin = null;
+    try {
+      const response = await fetch('/api/workspace/provider', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message ?? 'Provider action failed');
+      if (result.login) managedLogin = result.login;
+      await invalidateAll();
+    } catch (error) {
+      providerMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      providerBusy = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -49,6 +73,46 @@
     <nav aria-label="Project channels" class="mt-2">
       <a class="flex rounded-lg bg-base-300/70 px-3 py-2 text-sm font-semibold" href="/"># {data.sharedChannel.channel.name}</a>
     </nav>
+
+    <div class="mt-6 text-xs font-bold uppercase tracking-wider text-base-content/45">Provider connection</div>
+    <section class="mt-2 rounded-box border-base-300 border bg-base-100 p-3" aria-label="Codex Provider connection">
+      <div class="flex items-center justify-between gap-2">
+        <strong class="text-sm">Codex</strong>
+        <span class:badge-success={data.providerConnection.readyForExecution} class="badge badge-sm">
+          {data.providerConnection.state.replace('_', ' ')}
+        </span>
+      </div>
+      <p class="mt-2 text-xs leading-5 text-base-content/60">
+        {data.providerConnection.readyForExecution
+          ? 'Managed ChatGPT login is ready for shared Agent work.'
+          : 'New Agent execution is unavailable.'}
+      </p>
+      {#if data.providerConnection.canManage}
+        <div class="mt-3 flex flex-wrap gap-2">
+          {#if data.providerConnection.state !== 'disconnecting'}
+            <button class="btn btn-primary btn-xs" type="button" disabled={providerBusy} onclick={() => void manageProvider('connect')}>
+              {data.providerConnection.state === 'not_connected' ? 'Connect' : 'Replace'}
+            </button>
+          {/if}
+          {#if data.providerConnection.state === 'ready' || data.providerConnection.state === 'connecting'}
+            <button class="btn btn-ghost btn-xs" type="button" disabled={providerBusy} onclick={() => void manageProvider('disable')}>Disable</button>
+          {/if}
+          {#if data.providerConnection.state !== 'not_connected'}
+            <button class="btn btn-ghost btn-xs text-error" type="button" disabled={providerBusy} onclick={() => void manageProvider('disconnect')}>
+              {data.providerConnection.state === 'disconnecting' ? 'Retry disconnect' : 'Disconnect'}
+            </button>
+          {/if}
+        </div>
+        {#if managedLogin}
+          <div class="mt-3 rounded-lg bg-base-200 p-2 text-xs">
+            <p>Open the managed Codex sign-in page and enter:</p>
+            <code class="mt-1 block font-bold tracking-wider">{managedLogin.userCode}</code>
+            <a class="link link-primary mt-1 inline-block" href={managedLogin.verificationUrl} target="_blank" rel="noreferrer">Continue with ChatGPT</a>
+          </div>
+        {/if}
+        {#if providerMessage}<p class="mt-2 text-xs text-error" role="alert">{providerMessage}</p>{/if}
+      {/if}
+    </section>
 
     <div class="mt-6 text-xs font-bold uppercase tracking-wider text-base-content/45">Members</div>
     <ul class="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-3 md:grid-cols-1">
@@ -74,7 +138,11 @@
             <div id={`status-${member.id}`} role="tooltip" class="agent-tooltip">
               <strong>{member.name} · {member.status}</strong>
               <span class="mt-1 block text-xs text-base-content/65">
-                {member.status === 'idle' ? 'Ready for an engineering request in this Project.' : `${member.roleLabel} is ${member.status}.`}
+                {member.status === 'idle'
+                  ? (data.providerConnection.readyForExecution
+                    ? 'Ready for an engineering request in this Project.'
+                    : 'A ready Codex Provider connection is required before new work.')
+                  : `${member.roleLabel} is ${member.status}.`}
               </span>
             </div>
           {/if}

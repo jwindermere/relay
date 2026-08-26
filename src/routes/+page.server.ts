@@ -11,6 +11,7 @@ import {
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
+import { loadProviderConnection } from '$lib/server/provider/connection.js';
 
 export async function load({ request }) {
   try {
@@ -20,11 +21,16 @@ export async function load({ request }) {
       getRelayAuth(),
       request.headers
     );
+    const [sharedChannel, providerConnection] = await Promise.all([
+      loadSharedAgentChannel(pool, access),
+      loadProviderConnection(pool, access)
+    ]);
     return {
       email: access.identity.email,
       role: access.membership.role,
       workspaceName: access.workspace.name,
-      sharedChannel: await loadSharedAgentChannel(pool, access)
+      sharedChannel,
+      providerConnection
     };
   } catch (error) {
     if (error instanceof WorkspaceAccessError) redirect(303, '/sign-in');
