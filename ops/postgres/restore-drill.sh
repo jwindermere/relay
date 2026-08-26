@@ -42,7 +42,7 @@ fi
 checksum="$BACKUP_FILE.sha256"
 test -r "$BACKUP_FILE"
 test -r "$checksum"
-(cd "$(dirname "$BACKUP_FILE")" && sha256sum --check "$(basename "$checksum")")
+(cd "$(dirname "$BACKUP_FILE")" && sha256sum -c "$(basename "$checksum")")
 
 pg_restore \
   --dbname "$RESTORE_DATABASE_URL" \
