@@ -1,5 +1,6 @@
 import { createDatabasePool } from '../lib/server/database/pool.js';
 import { assertCompatibleSchema } from '../lib/server/database/schema.js';
+import { loadFileBackedEnvironment } from '../lib/server/configuration.js';
 import { bootstrapOwner } from '../lib/server/authentication/bootstrap.js';
 
 function argument(name: string): string | undefined {
@@ -7,6 +8,7 @@ function argument(name: string): string | undefined {
   return position >= 0 ? process.argv[position + 1] : undefined;
 }
 
+await loadFileBackedEnvironment(['DATABASE_URL', 'RELAY_OWNER_PASSWORD']);
 const email = argument('email');
 const name = argument('name');
 const workspaceName = argument('workspace');

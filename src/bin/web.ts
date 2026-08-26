@@ -3,11 +3,21 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { createDatabasePool } from '../lib/server/database/pool.js';
+import { loadFileBackedEnvironment } from '../lib/server/configuration.js';
 import { getAuthDatabasePool, getRelayAuth } from '../lib/server/auth.js';
 import { formatError } from '../lib/server/errors.js';
 import { attachAuthenticatedRealtime } from '../lib/server/realtime.js';
+import { requireRealtimeSecret } from '../lib/server/realtime-ticket.js';
 import { checkRuntimeReadiness } from '../lib/server/runtime.js';
 
+await loadFileBackedEnvironment([
+  'DATABASE_URL',
+  'BETTER_AUTH_SECRET',
+  'RELAY_EMAIL_DELIVERY_TOKEN',
+  'RELAY_REALTIME_SECRET',
+  'RELAY_GITHUB_PRIVATE_KEY',
+  'RELAY_GITHUB_WEBHOOK_SECRET'
+]);
 const pool = createDatabasePool();
 
 try {
@@ -19,7 +29,9 @@ try {
   const host = process.env.HOST ?? '0.0.0.0';
   const port = Number(process.env.PORT ?? 3000);
   const server = createServer(handler);
-  const realtime = attachAuthenticatedRealtime(server, pool, getRelayAuth());
+  const realtime = attachAuthenticatedRealtime(server, pool, getRelayAuth(), {
+    ticketSecret: requireRealtimeSecret()
+  });
 
   server.listen(port, host, () => {
     console.log(JSON.stringify({ event: 'web.ready', host, port, ...readiness }));

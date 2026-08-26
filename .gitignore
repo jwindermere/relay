@@ -1,5 +1,6 @@
 prototype/runs/
 .env
+secrets/
 .svelte-kit/
 build/
 build-runtime/

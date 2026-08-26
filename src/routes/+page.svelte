@@ -93,10 +93,19 @@
     let stopped = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let websocket: WebSocket | undefined;
-    const connect = () => {
+    const connect = async () => {
+      if (stopped) return;
+      const ticketResponse = await fetch('/api/realtime-ticket', { method: 'POST' });
+      if (!ticketResponse.ok) {
+        reconnectTimer = setTimeout(connect, 1_000);
+        return;
+      }
+      const { ticket } = await ticketResponse.json() as { ticket: string };
       if (stopped) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      websocket = new WebSocket(`${protocol}//${window.location.host}/realtime`);
+      websocket = new WebSocket(
+        `${protocol}//${window.location.host}/realtime?ticket=${encodeURIComponent(ticket)}`
+      );
       websocket.addEventListener('message', async ({ data: payload }) => {
         let message: { type?: string; channelId?: string };
         try {
@@ -126,7 +135,7 @@
         }
       });
       websocket.addEventListener('close', () => {
-        if (!stopped) reconnectTimer = setTimeout(connect, 1_000);
+        if (!stopped) reconnectTimer = setTimeout(() => void connect(), 1_000);
       });
     };
     const wake = () => void requestReconciliation();
@@ -136,7 +145,7 @@
     window.addEventListener('focus', wake);
     window.addEventListener('pageshow', wake);
     document.addEventListener('visibilitychange', visibilityWake);
-    connect();
+    void connect();
 
     return () => {
       stopped = true;

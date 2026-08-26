@@ -11,6 +11,7 @@ import {
   type ChannelWakeup
 } from './collaboration/realtime-wakeup.js';
 import { hasActivePilotChannelAccess } from './collaboration/channel-access.js';
+import { verifyRealtimeTicket } from './realtime-ticket.js';
 
 interface RealtimeClient {
   headers: Headers;
@@ -54,7 +55,8 @@ function isSameOrigin(request: IncomingMessage): boolean {
 export function attachAuthenticatedRealtime(
   server: HttpServer,
   pool: Pool,
-  auth: RelayAuth
+  auth: RelayAuth,
+  options: { ticketSecret?: string } = {}
 ): WebSocketServer {
   const realtime = new WebSocketServer({ noServer: true });
   const clients = new Set<RealtimeClient>();
@@ -107,6 +109,14 @@ export function attachAuthenticatedRealtime(
     try {
       await Promise.all([subscriptionReady, wakeupsReady]);
       const access = await authorizeWorkspaceRequest(pool, auth, headers);
+      if (options.ticketSecret && !verifyRealtimeTicket(
+        url.searchParams.get('ticket') ?? '',
+        access.identity.sessionId,
+        options.ticketSecret
+      )) {
+        rejectUpgrade(socket);
+        return;
+      }
       realtime.handleUpgrade(request, socket, head, (websocket) => {
         realtime.emit('connection', websocket, request);
         const membershipKey = access.membership.id;

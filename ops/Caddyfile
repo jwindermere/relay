@@ -1,0 +1,14 @@
+{
+	auto_https disable_redirects
+}
+
+{$RELAY_HOSTNAME} {
+	tls /run/secrets/tls_certificate /run/secrets/tls_private_key
+	encode zstd gzip
+	reverse_proxy web:3000
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+	}
+}

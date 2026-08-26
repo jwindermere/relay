@@ -5,3 +5,4 @@ build
 build-runtime
 node_modules
 prototype/runs
+secrets

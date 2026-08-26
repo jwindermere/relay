@@ -7,18 +7,23 @@ worker, and PostgreSQL. The disposable product and execution prototypes remain u
 
 ## Local production stack
 
-Copy `.env.example` to `.env`, then start the production-shaped stack:
+Copy `.env.example` to `.env`, provision the referenced secret files and off-host
+backup mount, then start the production-shaped stack:
 
 ```sh
 docker compose up --build
 ```
 
-The web service is available at <http://localhost:3000>. Its `GET /health` endpoint
+Only the TLS proxy publishes a host port; the web service is available at the
+configured `https://RELAY_HOSTNAME`. Its `GET /health` endpoint
 returns `200` only when PostgreSQL is reachable and both the Relay migration stream
 in `public` and the Better Auth migration stream in `auth` match the binary's required
 versions. The worker reports readiness and database health as structured log events.
 Both processes exit before normal startup when the database is unreachable or
 incompatible.
+
+Deployment replacement, backup restoration, migration compatibility, and independent
+secret-rotation procedures are documented in [`ops/README.md`](ops/README.md).
 
 The worker exclusively leases queued AgentRuns from PostgreSQL and runs one Codex
 turn at a time through worker-local app-server stdio. Its Codex state and isolated

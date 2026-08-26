@@ -5,7 +5,8 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-relay}
       POSTGRES_USER: ${POSTGRES_USER:-relay}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -13,35 +14,43 @@ services:
       retries: 10
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
 
   migrate:
     build: .
     environment:
-      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets: [database_url]
     command: ["npm", "run", "start:migrate"]
     depends_on:
       postgres:
         condition: service_healthy
+    networks: [backend]
 
   web:
     build: .
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      BETTER_AUTH_SECRET_FILE: /run/secrets/better_auth_secret
+      BETTER_AUTH_URL: https://${RELAY_HOSTNAME:?set RELAY_HOSTNAME in .env}
       RELAY_EMAIL_DELIVERY_URL: ${RELAY_EMAIL_DELIVERY_URL:?set RELAY_EMAIL_DELIVERY_URL in .env}
-      RELAY_EMAIL_DELIVERY_TOKEN: ${RELAY_EMAIL_DELIVERY_TOKEN:-}
+      RELAY_EMAIL_DELIVERY_TOKEN_FILE: /run/secrets/email_delivery_token
+      RELAY_REALTIME_SECRET_FILE: /run/secrets/realtime_secret
       RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID in .env}
-      RELAY_GITHUB_PRIVATE_KEY: ${RELAY_GITHUB_PRIVATE_KEY:?set RELAY_GITHUB_PRIVATE_KEY in .env}
-      RELAY_GITHUB_WEBHOOK_SECRET: ${RELAY_GITHUB_WEBHOOK_SECRET:?set RELAY_GITHUB_WEBHOOK_SECRET in .env}
+      RELAY_GITHUB_PRIVATE_KEY_FILE: /run/secrets/github_private_key
+      RELAY_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/github_webhook_secret
       HOST: 0.0.0.0
       PORT: 3000
+    secrets:
+      - database_url
+      - better_auth_secret
+      - email_delivery_token
+      - realtime_secret
+      - github_private_key
+      - github_webhook_secret
     command: ["npm", "run", "start:web"]
-    volumes:
-      - codex-state:/home/node/.codex
-    ports:
-      - "127.0.0.1:3000:3000"
+    expose: ["3000"]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -50,16 +59,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    stop_grace_period: 30s
+    networks: [edge, backend]
 
   worker:
     build: .
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      DATABASE_URL_FILE: /run/secrets/database_url
       RELAY_CODEX_BIN: ${RELAY_CODEX_BIN:-codex}
       RELAY_AGENT_WORKSPACE_ROOT: /var/lib/relay/agent-runs
       RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID in .env}
-      RELAY_GITHUB_PRIVATE_KEY: ${RELAY_GITHUB_PRIVATE_KEY:?set RELAY_GITHUB_PRIVATE_KEY in .env}
+      RELAY_GITHUB_PRIVATE_KEY_FILE: /run/secrets/github_private_key
+    secrets: [database_url, github_private_key]
     command: ["npm", "run", "start:worker"]
     volumes:
       - codex-state:/home/node/.codex
@@ -67,8 +79,69 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    stop_grace_period: 30m
+    networks: [backend]
+
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      BACKUP_DIRECTORY: /backups
+      BACKUP_INTERVAL_SECONDS: ${RELAY_BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${RELAY_BACKUP_RETENTION_DAYS:-14}
+    secrets: [database_url]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - export DATABASE_URL="$$(cat /run/secrets/database_url)"; exec /ops/postgres/run-scheduled-backups.sh
+    volumes:
+      - ./ops:/ops:ro
+      - type: bind
+        source: ${RELAY_BACKUP_DIRECTORY:?set RELAY_BACKUP_DIRECTORY to an off-host mounted directory}
+        target: /backups
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+
+  proxy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      RELAY_HOSTNAME: ${RELAY_HOSTNAME:?set RELAY_HOSTNAME in .env}
+    secrets: [tls_certificate, tls_private_key]
+    ports: ["443:443"]
+    volumes:
+      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      web:
+        condition: service_healthy
+    networks: [edge]
+
+secrets:
+  postgres_password:
+    file: ${RELAY_POSTGRES_PASSWORD_FILE:-./secrets/postgres-password}
+  database_url:
+    file: ${RELAY_DATABASE_URL_FILE:-./secrets/database-url}
+  better_auth_secret:
+    file: ${RELAY_BETTER_AUTH_SECRET_FILE:-./secrets/better-auth-secret}
+  email_delivery_token:
+    file: ${RELAY_EMAIL_DELIVERY_TOKEN_FILE:-./secrets/email-delivery-token}
+  github_private_key:
+    file: ${RELAY_GITHUB_PRIVATE_KEY_FILE:-./secrets/github-private-key.pem}
+  github_webhook_secret:
+    file: ${RELAY_GITHUB_WEBHOOK_SECRET_FILE:-./secrets/github-webhook-secret}
+  realtime_secret:
+    file: ${RELAY_REALTIME_SECRET_FILE:-./secrets/realtime-secret}
+  tls_certificate:
+    file: ${RELAY_TLS_CERTIFICATE_FILE:-./secrets/tls-certificate.pem}
+  tls_private_key:
+    file: ${RELAY_TLS_PRIVATE_KEY_FILE:-./secrets/tls-private-key.pem}
 
 volumes:
   postgres-data:
   codex-state:
   agent-run-workspaces:
+
+networks:
+  edge:
+  backend:

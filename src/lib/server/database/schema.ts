@@ -21,12 +21,20 @@ export class IncompatibleSchemaError extends Error {
   readonly actualVersions: MigrationStreamVersions;
   readonly requiredVersions: MigrationStreamVersions;
 
-  constructor(actualVersions: MigrationStreamVersions) {
-    const mismatch = MIGRATION_STREAM_NAMES.find(
-      (stream) => actualVersions[stream] !== REQUIRED_MIGRATION_STREAM_VERSIONS[stream]
+  constructor(
+    actualVersions: MigrationStreamVersions,
+    minimumRuntimeVersions: MigrationStreamVersions = actualVersions
+  ) {
+    const missing = MIGRATION_STREAM_NAMES.find(
+      (stream) => actualVersions[stream] < REQUIRED_MIGRATION_STREAM_VERSIONS[stream]
     );
-    const detail = mismatch
-      ? `${mismatch} schema version ${actualVersions[mismatch]} is incompatible with required version ${REQUIRED_MIGRATION_STREAM_VERSIONS[mismatch]}`
+    const unsafe = MIGRATION_STREAM_NAMES.find(
+      (stream) => minimumRuntimeVersions[stream] > REQUIRED_MIGRATION_STREAM_VERSIONS[stream]
+    );
+    const detail = missing
+      ? `${missing} schema version ${actualVersions[missing]} is older than required version ${REQUIRED_MIGRATION_STREAM_VERSIONS[missing]}`
+      : unsafe
+        ? `${unsafe} schema version ${actualVersions[unsafe]} requires runtime schema interface ${minimumRuntimeVersions[unsafe]}`
       : 'database schema is incompatible';
 
     super(detail);
@@ -34,6 +42,29 @@ export class IncompatibleSchemaError extends Error {
     this.actualVersions = actualVersions;
     this.requiredVersions = REQUIRED_MIGRATION_STREAM_VERSIONS;
   }
+}
+
+async function readMinimumRuntimeVersion(
+  pool: Pool,
+  stream: MigrationStreamName,
+  actualVersion: number
+): Promise<number> {
+  const { postgresSchema } = MIGRATION_STREAMS[stream];
+  const column = await pool.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name = 'schema_migrations'
+         AND column_name = 'minimum_runtime_version'
+     ) AS exists`,
+    [postgresSchema]
+  );
+  if (!column.rows[0]?.exists) return actualVersion;
+
+  const result = await pool.query<{ version: number }>(
+    `SELECT COALESCE(MAX(minimum_runtime_version), 0)::integer AS version
+     FROM ${postgresSchema}.schema_migrations`
+  );
+  return result.rows[0]?.version ?? actualVersion;
 }
 
 async function readMigrationStreamVersion(
@@ -64,10 +95,16 @@ export async function getMigrationStreamVersions(pool: Pool): Promise<MigrationS
 
 export async function assertCompatibleSchema(pool: Pool): Promise<MigrationStreamVersions> {
   const actualVersions = await getMigrationStreamVersions(pool);
-  const compatible = MIGRATION_STREAM_NAMES.every(
-    (stream) => actualVersions[stream] === REQUIRED_MIGRATION_STREAM_VERSIONS[stream]
+  const [relay, auth] = await Promise.all([
+    readMinimumRuntimeVersion(pool, 'relay', actualVersions.relay),
+    readMinimumRuntimeVersion(pool, 'auth', actualVersions.auth)
+  ]);
+  const minimumRuntimeVersions = { relay, auth };
+  const compatible = MIGRATION_STREAM_NAMES.every((stream) =>
+    actualVersions[stream] >= REQUIRED_MIGRATION_STREAM_VERSIONS[stream]
+      && minimumRuntimeVersions[stream] <= REQUIRED_MIGRATION_STREAM_VERSIONS[stream]
   );
 
-  if (!compatible) throw new IncompatibleSchemaError(actualVersions);
+  if (!compatible) throw new IncompatibleSchemaError(actualVersions, minimumRuntimeVersions);
   return actualVersions;
 }

@@ -171,18 +171,27 @@ if (connectionString) {
     await assert.doesNotReject(assertCompatibleSchema(pool));
   });
 
-  test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 14');
+  test('a runtime accepts additive mixed-version schemas and rejects unsafe contracts', async () => {
+    await pool.query(
+      `INSERT INTO public.schema_migrations (version, name, minimum_runtime_version)
+       VALUES (15, '0015_expand_only.sql', 14)`
+    );
+    await assert.doesNotReject(assertCompatibleSchema(pool));
+
+    await pool.query(
+      `INSERT INTO public.schema_migrations (version, name, minimum_runtime_version)
+       VALUES (16, '0016_contract.sql', 16)`
+    );
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
         assert.ok(error instanceof IncompatibleSchemaError);
-        assert.match(error.message, /relay schema version 99 is incompatible/);
+        assert.match(error.message, /relay schema version 16 requires runtime schema interface 16/);
         assert.deepEqual(error.requiredVersions, REQUIRED_MIGRATION_STREAM_VERSIONS);
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 14 WHERE version = 99');
+      await pool.query('DELETE FROM public.schema_migrations WHERE version IN (15, 16)');
     }
   });
 
