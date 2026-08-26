@@ -10,6 +10,7 @@ import {
   type AgentRunProvider,
   type AgentRunProviderInput,
   type AgentRunProviderObserver,
+  type ProviderClarificationRequest,
   type ProviderNotification,
   type ProviderReconciliation
 } from './agent-run.js';
@@ -51,26 +52,50 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       }).catch(rejectTerminal);
     };
     session.onRequest = (message) => {
+      if (message.method === 'item/tool/requestUserInput') {
+        void Promise.resolve().then(async () => {
+          await referencesPersisted;
+          const request = parseClarificationRequest(message);
+          const answers = await observer.clarificationRequested(request);
+          if (!session.respond) throw new Error('Codex app-server cannot receive clarification input');
+          await session.respond(message.id, {
+            answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [
+              id,
+              { answers: values }
+            ]))
+          });
+          await observer.clarificationDelivered(request.providerRequestId);
+        }).catch((error) => rejectTerminal(classifyProviderError(error)));
+        return;
+      }
       if (message.method === 'item/commandExecution/requestApproval'
         || message.method === 'item/fileChange/requestApproval') {
-        session.respond?.(message.id, { decision: 'decline' });
+        void session.respond?.(message.id, { decision: 'decline' });
         return;
       }
       if (message.method === 'item/permissions/requestApproval') {
-        session.respond?.(message.id, { permissions: [], scope: 'turn' });
+        void session.respond?.(message.id, { permissions: [], scope: 'turn' });
       }
     };
     session.onFailure = (error) => rejectTerminal(classifyProviderError(error));
 
     try {
       await session.initialize();
-      const threadResult = asRecord(await session.send('thread/start', {
-        cwd: input.workspaceDirectory,
-        approvalPolicy: input.approvalPolicy,
-        sandbox: 'workspaceWrite',
-        serviceName: 'relay-worker'
-      }));
+      const threadResult = asRecord(await session.send(
+        input.providerThreadId ? 'thread/resume' : 'thread/start',
+        input.providerThreadId
+          ? { threadId: input.providerThreadId }
+          : {
+              cwd: input.workspaceDirectory,
+              approvalPolicy: input.approvalPolicy,
+              sandbox: 'workspaceWrite',
+              serviceName: 'relay-worker'
+            }
+      ));
       const threadId = readId(asRecord(threadResult.thread), 'Codex thread');
+      if (input.providerThreadId && threadId !== input.providerThreadId) {
+        throw new Error('Codex resumed a different Provider thread');
+      }
       await observer.threadStarted(threadId);
 
       const turnResult = asRecord(await session.send('turn/start', {
@@ -119,6 +144,57 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       session.close();
     }
   }
+}
+
+function parseClarificationRequest(
+  message: ProtocolMessage & { id: string | number; method: string }
+): ProviderClarificationRequest {
+  const params = message.params ?? {};
+  const questions = Array.isArray(params.questions) ? params.questions : [];
+  if (
+    typeof params.threadId !== 'string'
+    || typeof params.turnId !== 'string'
+    || typeof params.itemId !== 'string'
+    || params.isBlocking !== true
+    || questions.length < 1
+    || questions.length > 3
+  ) {
+    throw new Error('Codex clarification request was invalid');
+  }
+  return {
+    providerRequestId: String(message.id),
+    threadId: params.threadId,
+    turnId: params.turnId,
+    itemId: params.itemId,
+    questions: questions.map((value) => {
+      const question = asRecord(value);
+      if (
+        typeof question.id !== 'string'
+        || typeof question.header !== 'string'
+        || typeof question.question !== 'string'
+        || question.isSecret === true
+      ) {
+        throw new Error('Codex clarification question was invalid');
+      }
+      const options = question.options === null
+        ? null
+        : Array.isArray(question.options)
+          ? question.options.map((value) => {
+              const option = asRecord(value);
+              if (typeof option.label !== 'string' || typeof option.description !== 'string') {
+                throw new Error('Codex clarification option was invalid');
+              }
+              return { label: option.label, description: option.description };
+            })
+          : null;
+      return {
+        id: question.id,
+        header: question.header,
+        question: question.question,
+        options
+      };
+    })
+  };
 }
 
 function parseNotification(message: ProtocolMessage): ProviderNotification | undefined {

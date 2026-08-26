@@ -68,14 +68,14 @@ const forbiddenAutonomousRequestPatterns: Array<{ pattern: RegExp; reason: strin
   }
 ];
 
-function explicitMentionPattern(agentName: string): RegExp {
+export function explicitAgentMentionPattern(agentName: string): RegExp {
   const escaped = agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   return new RegExp(`(?<![\\p{L}\\p{N}_.+@-])@${escaped}(?![\\p{L}\\p{N}_-])`, 'iu');
 }
 
 function evaluateAgentRequestSafety(body: string, agentName: string): AgentRequestSafetyDecision {
   const request = body
-    .replace(explicitMentionPattern(agentName), ' ')
+    .replace(explicitAgentMentionPattern(agentName), ' ')
     .trim()
     .replace(/^[\s,.:;!?-]+/u, '')
     .replace(
@@ -116,7 +116,7 @@ export async function acceptEligibleAgentMention(
      FOR UPDATE`,
     [context.workspaceId]
   );
-  const agent = agents.rows.find(({ name }) => explicitMentionPattern(name).test(context.body));
+  const agent = agents.rows.find(({ name }) => explicitAgentMentionPattern(name).test(context.body));
   if (!agent) return null;
 
   const scope = await client.query<{

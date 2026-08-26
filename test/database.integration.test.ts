@@ -144,6 +144,7 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'agent_run' },
+      { table_schema: 'public', table_name: 'agent_run_clarification' },
       { table_schema: 'public', table_name: 'agent_run_event' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
@@ -166,7 +167,7 @@ if (connectionString) {
   });
 
   test('a runtime rejects an incompatible schema version', async () => {
-    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 9');
+    await pool.query('UPDATE public.schema_migrations SET version = 99 WHERE version = 10');
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
@@ -176,7 +177,7 @@ if (connectionString) {
         return true;
       });
     } finally {
-      await pool.query('UPDATE public.schema_migrations SET version = 9 WHERE version = 99');
+      await pool.query('UPDATE public.schema_migrations SET version = 10 WHERE version = 99');
     }
   });
 
@@ -1174,6 +1175,259 @@ if (connectionString) {
          WHERE task.request_snapshot = '@Alex prove the transaction rolls back.') AS runs
     `, [failedSubmissionId]);
     assert.deepEqual(rolledBack.rows[0], { messages: 0, tasks: 0, runs: 0 });
+  });
+
+  test('either Pilot member can answer one visible clarification while progress stays conversational', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const ownerSignIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const ownerCookie = ownerSignIn.headers.get('set-cookie');
+    assert.equal(ownerSignIn.status, 200);
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+    const taskBefore = await pool.query<{ count: number }>(
+      'SELECT count(*)::integer AS count FROM public.task WHERE workspace_id = $1',
+      [memberAccess.workspace.id]
+    );
+    const active = await pool.query<{
+      run_id: string;
+      root_message_id: string;
+      agent_id: string;
+      agent_member_id: string;
+    }>(
+      `SELECT run.id AS run_id, COALESCE(source.parent_message_id, source.id) AS root_message_id,
+              run.agent_id, agent_member.id AS agent_member_id
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id
+       JOIN public.message source ON source.id = task.source_message_id
+       JOIN public.workspace_member agent_member ON agent_member.agent_id = run.agent_id
+       WHERE run.workspace_id = $1 AND task.request_snapshot = $2`,
+      [memberAccess.workspace.id, '@Alex investigate why the app failed to deploy to production.']
+    );
+    assert.ok(active.rows[0]);
+    const clarificationId = randomUUID();
+    const requestMessageId = randomUUID();
+    const setupClient = await pool.connect();
+    await setupClient.query('BEGIN');
+    try {
+      await setupClient.query(
+        `UPDATE public.agent_run
+         SET status = 'waiting_for_input', provider_thread_id = 'thread-channel-clarification',
+             active_turn_id = 'turn-channel-clarification',
+             lease_owner = 'worker-channel-clarification',
+             lease_token = 'lease-channel-clarification',
+             lease_expires_at = now() + interval '5 minutes', updated_at = now()
+         WHERE id = $1`,
+        [active.rows[0].run_id]
+      );
+      await setupClient.query(
+        `UPDATE public.agent SET status = 'waiting' WHERE id = $1`,
+        [active.rows[0].agent_id]
+      );
+      await setupClient.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          requestMessageId,
+          memberAccess.workspace.id,
+          channel.channel.id,
+          active.rows[0].agent_member_id,
+          active.rows[0].root_message_id,
+          'Quick clarification: Coverage: should the regression cover a complete web-process restart? Reply in this thread to continue.'
+        ]
+      );
+      await setupClient.query(
+        `INSERT INTO public.agent_run_clarification (
+           id, workspace_id, agent_run_id, provider_request_id, provider_turn_id,
+           provider_item_id, questions, request_message_id
+         ) VALUES ($1, $2, $3, 'request-channel-clarification',
+           'turn-channel-clarification', 'item-channel-clarification', $4, $5)`,
+        [
+          clarificationId,
+          memberAccess.workspace.id,
+          active.rows[0].run_id,
+          [{
+            id: 'coverage',
+            header: 'Coverage',
+            question: 'Should the regression cover a complete web-process restart?',
+            options: null
+          }],
+          requestMessageId
+        ]
+      );
+      const waitingEvent = await setupClient.query<{ id: number }>(
+        `INSERT INTO public.agent_run_event (
+           workspace_id, agent_run_id, sequence, event_type, status, summary
+         ) VALUES ($1, $2, 2, 'run.clarification_requested', 'waiting_for_input',
+           'Waiting for a Pilot member to clarify the request') RETURNING id`,
+        [memberAccess.workspace.id, active.rows[0].run_id]
+      );
+      await setupClient.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, message_id, topic, payload
+         ) VALUES ($1, $2, 'channel.message', $3)`,
+        [memberAccess.workspace.id, requestMessageId, { messageId: requestMessageId }]
+      );
+      await setupClient.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, agent_run_event_id, topic, payload
+         ) VALUES ($1, $2, 'agent_run.event', $3)`,
+        [memberAccess.workspace.id, waitingEvent.rows[0]!.id, {
+          agentRunId: active.rows[0].run_id,
+          eventType: 'run.clarification_requested',
+          sequence: 2
+        }]
+      );
+      await setupClient.query('COMMIT');
+    } catch (error) {
+      await setupClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      setupClient.release();
+    }
+
+    const waitingProjection = await loadChannelReconciliation(
+      pool, ownerAccess, channel.channel.id, {}
+    );
+    assert.equal(
+      waitingProjection.runs.find(({ id }) => id === active.rows[0].run_id)?.summary,
+      'Waiting for a reply'
+    );
+    const visibleRequest = waitingProjection.messages.find(({ id }) => id === requestMessageId);
+    assert.equal(visibleRequest?.author.kind, 'agent');
+    assert.match(visibleRequest?.body ?? '', /complete web-process restart/);
+
+    const progress = await postChannelMessage(pool, ownerAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex could I get a status update?'
+    });
+    assert.equal(progress.agentMention, null);
+    const afterProgress = await loadSharedAgentChannel(pool, memberAccess);
+    const progressResponse = afterProgress.messages.find(
+      ({ parentMessageId, author }) => parentMessageId === progress.id && author.kind === 'agent'
+    );
+    assert.equal(
+      progressResponse?.body,
+      'Current progress: I am waiting for a Pilot member to answer the clarification in this thread.'
+    );
+    assert.doesNotMatch(progressResponse?.body ?? '', /thread-channel|turn-channel|sequence|worker/i);
+
+    const repeatedSubmissionId = randomUUID();
+    const [memberAnswer, memberRetry, ownerAnswer] = await Promise.all([
+      postChannelMessage(pool, memberAccess, {
+        channelId: channel.channel.id,
+        parentMessageId: active.rows[0].root_message_id,
+        body: 'Yes, cover a complete web-process restart.',
+        submissionId: repeatedSubmissionId
+      }),
+      postChannelMessage(pool, memberAccess, {
+        channelId: channel.channel.id,
+        parentMessageId: active.rows[0].root_message_id,
+        body: 'This retry must not replace the original answer.',
+        submissionId: repeatedSubmissionId
+      }),
+      postChannelMessage(pool, ownerAccess, {
+        channelId: channel.channel.id,
+        parentMessageId: active.rows[0].root_message_id,
+        body: '@Alex cover both the dropped wake-up and full restart.'
+      })
+    ]);
+    assert.equal(memberAnswer.id, memberRetry.id);
+    assert.equal(memberAnswer.body, memberRetry.body);
+    assert.equal(ownerAnswer.agentMention, null);
+
+    const answered = await pool.query<{
+      answer_message_id: string;
+      answered_by_workspace_member_id: string;
+      answers: Record<string, string[]>;
+      status: string;
+    }>(
+      `SELECT answer_message_id, answered_by_workspace_member_id, answers, status
+       FROM public.agent_run_clarification WHERE id = $1`,
+      [clarificationId]
+    );
+    assert.equal(answered.rows[0]?.status, 'answered');
+    const candidates = new Map([
+      [memberAnswer.id, {
+        membershipId: memberAccess.membership.id,
+        answer: memberAnswer.body
+      }],
+      [ownerAnswer.id, {
+        membershipId: ownerAccess.membership.id,
+        answer: ownerAnswer.body
+      }]
+    ]);
+    const winner = candidates.get(answered.rows[0]!.answer_message_id);
+    assert.ok(winner);
+    assert.equal(answered.rows[0]?.answered_by_workspace_member_id, winner.membershipId);
+    assert.deepEqual(answered.rows[0]?.answers, { coverage: [winner.answer] });
+
+    const durable = await pool.query<{
+      tasks: number;
+      runs: number;
+      answered_events: number;
+      status: string;
+      provider_thread_id: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.task WHERE workspace_id = $1) AS tasks,
+         (SELECT count(*)::integer FROM public.agent_run WHERE id = $2) AS runs,
+         (SELECT count(*)::integer FROM public.agent_run_event
+          WHERE agent_run_id = $2 AND event_type = 'run.clarification_answered') AS answered_events,
+         run.status, run.provider_thread_id
+       FROM public.agent_run run WHERE run.id = $2`,
+      [memberAccess.workspace.id, active.rows[0].run_id]
+    );
+    assert.equal(durable.rows[0]?.tasks, taskBefore.rows[0]?.count);
+    assert.deepEqual({
+      runs: durable.rows[0]?.runs,
+      answeredEvents: durable.rows[0]?.answered_events,
+      status: durable.rows[0]?.status,
+      providerThreadId: durable.rows[0]?.provider_thread_id
+    }, {
+      runs: 1,
+      answeredEvents: 1,
+      status: 'working',
+      providerThreadId: 'thread-channel-clarification'
+    });
+
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'completed', completed_at = now(), active_turn_id = NULL,
+           lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+       WHERE id = $1`,
+      [active.rows[0].run_id]
+    );
+    await pool.query('UPDATE public.agent SET status = \'idle\' WHERE id = $1', [
+      active.rows[0].agent_id
+    ]);
+    const idleProgress = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex please let me know the progress'
+    });
+    const idleResponse = (await loadSharedAgentChannel(pool, ownerAccess)).messages.find(
+      ({ parentMessageId, author }) => parentMessageId === idleProgress.id && author.kind === 'agent'
+    );
+    assert.equal(idleResponse?.body, 'Current progress: There is no active engineering request.');
+    const taskAfterIdleProgress = await pool.query<{ count: number }>(
+      'SELECT count(*)::integer AS count FROM public.task WHERE workspace_id = $1',
+      [memberAccess.workspace.id]
+    );
+    assert.equal(taskAfterIdleProgress.rows[0]?.count, taskBefore.rows[0]?.count);
   });
 
   test('revocation immediately denies protected HTTP and realtime access', async () => {

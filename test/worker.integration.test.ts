@@ -133,6 +133,108 @@ if (skipDatabaseTests) {
     assert.deepEqual(outbox.rows[0], { events: 7, outbox: 7 });
   });
 
+  test('a Provider clarification waits visibly for durable Pilot input and continues the same turn', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'clarification');
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-clarification');
+      await observer.turnStarted('turn-clarification');
+      const answers = await observer.clarificationRequested({
+        providerRequestId: 'request-clarification',
+        threadId: 'thread-clarification',
+        turnId: 'turn-clarification',
+        itemId: 'item-clarification',
+        questions: [{
+          id: 'coverage',
+          header: 'Coverage',
+          question: 'Should the regression cover a complete web-process restart?',
+          options: null
+        }]
+      });
+      assert.deepEqual(answers, {
+        coverage: ['Yes, cover a complete web-process restart.']
+      });
+      await observer.clarificationDelivered('request-clarification');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-clarification:completed',
+        turn: { id: 'turn-clarification', status: 'completed' }
+      });
+    });
+
+    const execution = processNextAgentRun(pool, provider, {
+      workerId: 'worker-clarification', workspaceRoot, leaseDurationMs: 10_000
+    });
+    const clarification = await waitForRow<{
+      id: string;
+      request_message_id: string;
+      status: string;
+    }>(pool, `SELECT id, request_message_id, status
+              FROM public.agent_run_clarification WHERE agent_run_id = $1`, [ids.runId]);
+    assert.equal(clarification.status, 'pending');
+    const visible = await pool.query<{ body: string; kind: string; parent_message_id: string }>(
+      `SELECT message.body, author.kind, message.parent_message_id
+       FROM public.message message
+       JOIN public.workspace_member author ON author.id = message.author_workspace_member_id
+       WHERE message.id = $1`,
+      [clarification.request_message_id]
+    );
+    assert.equal(visible.rows[0]?.kind, 'agent');
+    assert.equal(visible.rows[0]?.parent_message_id, 'message-clarification');
+    assert.match(visible.rows[0]?.body ?? '', /complete web-process restart/);
+    const waiting = await pool.query<{ status: string }>(
+      'SELECT status FROM public.agent_run WHERE id = $1', [ids.runId]
+    );
+    assert.equal(waiting.rows[0]?.status, 'waiting_for_input');
+
+    const answerMessageId = 'answer-clarification';
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES ($1, $2, $3, $4, 'message-clarification', $5)`,
+      [
+        answerMessageId,
+        ids.workspaceId,
+        ids.channelId,
+        ids.pilotMemberId,
+        'Yes, cover a complete web-process restart.'
+      ]
+    );
+    await pool.query(
+      `UPDATE public.agent_run_clarification
+       SET status = 'answered', answers = $2, answer_message_id = $3,
+           answered_by_workspace_member_id = $4, answered_at = now()
+       WHERE id = $1`,
+      [
+        clarification.id,
+        { coverage: ['Yes, cover a complete web-process restart.'] },
+        answerMessageId,
+        ids.pilotMemberId
+      ]
+    );
+    assert.deepEqual(await execution, {
+      kind: 'executed', agentRunId: ids.runId, status: 'completed'
+    });
+    assert.equal(provider.executions.length, 1);
+    const stored = await pool.query<{
+      task_id: string;
+      provider_thread_id: string;
+      delivery_attempted_at: Date;
+      delivered_at: Date;
+    }>(
+      `SELECT run.task_id, run.provider_thread_id,
+              clarification.delivery_attempted_at, clarification.delivered_at
+       FROM public.agent_run run
+       JOIN public.agent_run_clarification clarification
+         ON clarification.agent_run_id = run.id
+       WHERE run.id = $1`,
+      [ids.runId]
+    );
+    assert.equal(stored.rows[0]?.task_id, 'task-clarification');
+    assert.equal(stored.rows[0]?.provider_thread_id, 'thread-clarification');
+    assert.ok(stored.rows[0]?.delivery_attempted_at);
+    assert.ok(stored.rows[0]?.delivered_at);
+  });
+
   test('the Provider connection admits at most one executing AgentRun', async () => {
     const first = await seedQueuedAgentRun(pool, 'exclusive-a');
     const second = await seedAdditionalQueuedAgentRun(pool, first, 'exclusive-b');
@@ -268,6 +370,89 @@ if (skipDatabaseTests) {
       { event_type: 'run.recovering' },
       { event_type: 'run.paused' }
     ]);
+  });
+
+  test('an answered clarification survives worker loss and resumes the same Provider thread', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'clarification-recovery');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'waiting_for_input', provider_thread_id = 'thread-clarification-recovery',
+           active_turn_id = 'turn-clarification-recovery', lease_owner = 'dead-worker',
+           lease_token = 'dead-token', lease_expires_at = now() - interval '1 minute'
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES
+         ('request-clarification-recovery', $1, $2, $3, 'message-clarification-recovery',
+          'Quick clarification: should restart recovery be included?'),
+         ('answer-clarification-recovery', $1, $2, $4, 'message-clarification-recovery',
+          'Yes, include restart recovery.')`,
+      [ids.workspaceId, ids.channelId, `agent-member-clarification-recovery`, ids.pilotMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run_clarification (
+         id, workspace_id, agent_run_id, provider_request_id, provider_turn_id,
+         provider_item_id, questions, request_message_id, status, answers,
+         answer_message_id, answered_by_workspace_member_id, answered_at
+       ) VALUES (
+         'clarification-recovery', $1, $2, 'provider-request-recovery',
+         'turn-clarification-recovery', 'item-clarification-recovery', $3,
+         'request-clarification-recovery', 'answered', $4,
+         'answer-clarification-recovery', $5, now()
+       )`,
+      [
+        ids.workspaceId,
+        ids.runId,
+        [{ id: 'recovery', header: 'Recovery', question: 'Include restart recovery?', options: null }],
+        { recovery: ['Yes, include restart recovery.'] },
+        ids.pilotMemberId
+      ]
+    );
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.equal(input.providerThreadId, 'thread-clarification-recovery');
+      assert.equal(input.prompt, 'Yes, include restart recovery.');
+      await observer.threadStarted('thread-clarification-recovery');
+      await observer.turnStarted('turn-clarification-follow-up');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-clarification-follow-up:completed',
+        turn: { id: 'turn-clarification-follow-up', status: 'completed' }
+      });
+    });
+
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-clarification-recovery', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'recovered', agentRunId: ids.runId, status: 'queued' });
+    assert.equal(provider.executions.length, 0);
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-clarification-follow-up', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+    assert.equal(provider.executions.length, 1);
+
+    const stored = await pool.query<{
+      task_id: string;
+      provider_thread_id: string;
+      delivery_attempted_at: Date;
+      delivered_at: Date;
+      task_count: number;
+    }>(
+      `SELECT run.task_id, run.provider_thread_id,
+              clarification.delivery_attempted_at, clarification.delivered_at,
+              (SELECT count(*)::integer FROM public.task WHERE id = run.task_id) AS task_count
+       FROM public.agent_run run
+       JOIN public.agent_run_clarification clarification
+         ON clarification.agent_run_id = run.id
+       WHERE run.id = $1`,
+      [ids.runId]
+    );
+    assert.equal(stored.rows[0]?.task_id, 'task-clarification-recovery');
+    assert.equal(stored.rows[0]?.provider_thread_id, 'thread-clarification-recovery');
+    assert.equal(stored.rows[0]?.task_count, 1);
+    assert.ok(stored.rows[0]?.delivery_attempted_at);
+    assert.ok(stored.rows[0]?.delivered_at);
   });
 }
 
@@ -461,4 +646,19 @@ async function insertQueuedEvent(pool: Pool, workspaceId: string, runId: string)
        ) FROM event`,
     [workspaceId, runId]
   );
+}
+
+async function waitForRow<T>(
+  pool: Pool,
+  query: string,
+  values: unknown[],
+  timeoutMs = 2_000
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<T & Record<string, unknown>>(query, values);
+    if (result.rows[0]) return result.rows[0] as T;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for persisted test state');
 }

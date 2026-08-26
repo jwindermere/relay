@@ -1,5 +1,33 @@
 export type ProviderTerminalOutcome = 'completed' | 'interrupted' | 'failed';
 export type ProviderAgentRunStatus = 'completed' | 'cancelled' | 'failed';
+export type AgentRunStatus =
+  | 'queued'
+  | 'planning'
+  | 'working'
+  | 'waiting_for_input'
+  | 'waiting_for_approval'
+  | 'recovering'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+export type AgentRunEventType =
+  | 'run.queued'
+  | 'run.claimed'
+  | 'run.recovering'
+  | 'run.failed'
+  | 'run.paused'
+  | 'run.deferred'
+  | 'run.clarification_requested'
+  | 'run.clarification_answered'
+  | 'run.clarification_requeued'
+  | 'run.clarification_wait_recovered'
+  | 'provider.thread.started'
+  | 'provider.turn.started'
+  | 'provider.turn.completed'
+  | 'provider.turn.reconciled'
+  | 'provider.item.started'
+  | 'provider.item.completed';
 
 export interface ProviderNotification {
   method: 'item/started' | 'item/completed' | 'turn/completed';
@@ -17,6 +45,7 @@ export interface AgentRunProviderInput {
   credentialStoreReference: string;
   workspaceDirectory: string;
   prompt: string;
+  providerThreadId?: string;
   approvalPolicy: 'onRequest';
   sandboxPolicy: {
     type: 'workspaceWrite';
@@ -34,7 +63,26 @@ export interface AgentRunProviderObserver {
   threadStarted(threadId: string): Promise<void>;
   turnStarted(turnId: string): Promise<void>;
   notification(notification: ProviderNotification): Promise<void>;
+  clarificationRequested(request: ProviderClarificationRequest): Promise<ProviderClarificationAnswers>;
+  clarificationDelivered(providerRequestId: string): Promise<void>;
 }
+
+export interface ProviderClarificationQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }> | null;
+}
+
+export interface ProviderClarificationRequest {
+  providerRequestId: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  questions: ProviderClarificationQuestion[];
+}
+
+export type ProviderClarificationAnswers = Record<string, string[]>;
 
 export type ProviderReconciliation =
   | { outcome: ProviderTerminalOutcome; errorCode?: string }

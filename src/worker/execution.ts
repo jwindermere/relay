@@ -6,23 +6,18 @@ import {
   AgentRunProviderError,
   mapProviderOutcomeToAgentRunStatus,
   readSafeCodexErrorCode,
+  type AgentRunStatus,
   type AgentRunProvider,
   type AgentRunProviderInput,
   type AgentRunProviderObserver,
+  type ProviderClarificationAnswers,
+  type ProviderClarificationRequest,
   type ProviderNotification
 } from '../lib/server/provider/agent-run.js';
-
-type AgentRunStatus =
-  | 'queued'
-  | 'planning'
-  | 'working'
-  | 'waiting_for_input'
-  | 'waiting_for_approval'
-  | 'recovering'
-  | 'paused'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
+import {
+  appendAgentRunEvent,
+  type AgentRunEventInput
+} from '../lib/server/provider/agent-run-events.js';
 
 export interface WorkerExecutionOptions {
   workerId: string;
@@ -41,25 +36,13 @@ export type WorkerCycleResult =
 interface ClaimedAgentRun {
   id: string;
   workspace_id: string;
-  request_snapshot: string;
+  provider_input: string;
   credential_store_reference: string;
   provider_thread_id: string | null;
   active_turn_id: string | null;
+  resume_clarification_id: string | null;
   lease_token: string;
   recovering: boolean;
-}
-
-interface RunEvent {
-  eventType: string;
-  status: AgentRunStatus;
-  summary: string;
-  evidence?: Record<string, unknown>;
-  providerEventId?: string;
-  providerTurnId?: string;
-  providerItemId?: string;
-  completed?: boolean;
-  clearActiveTurn?: boolean;
-  releaseLease?: boolean;
 }
 
 export async function processNextAgentRun(
@@ -97,6 +80,12 @@ export async function processNextAgentRun(
     async notification(notification) {
       terminalStatus = await persistProviderNotification(pool, claim, notification)
         ?? terminalStatus;
+    },
+    async clarificationRequested(request) {
+      return requestClarificationAndWait(pool, claim, request, executionAbort.signal);
+    },
+    async clarificationDelivered(providerRequestId) {
+      await markClarificationDelivered(pool, claim, providerRequestId);
     }
   };
 
@@ -109,11 +98,22 @@ export async function processNextAgentRun(
   renewal.unref();
 
   try {
+    if (claim.resume_clarification_id) {
+      await pool.query(
+        `UPDATE public.agent_run_clarification
+         SET delivery_attempted_at = COALESCE(delivery_attempted_at, now())
+         WHERE id = $1 AND agent_run_id = $2`,
+        [claim.resume_clarification_id, claim.id]
+      );
+    }
     await provider.execute({
       signal: executionAbort.signal,
       credentialStoreReference: claim.credential_store_reference,
       workspaceDirectory,
-      prompt: claim.request_snapshot,
+      prompt: claim.provider_input,
+      ...(claim.resume_clarification_id && claim.provider_thread_id
+        ? { providerThreadId: claim.provider_thread_id }
+        : {}),
       approvalPolicy: 'onRequest',
       sandboxPolicy: {
         type: 'workspaceWrite',
@@ -179,21 +179,33 @@ async function claimNextAgentRun(
       id: string;
       workspace_id: string;
       provider_connection_id: string;
-      request_snapshot: string;
+      provider_input: string;
       provider_thread_id: string | null;
       active_turn_id: string | null;
       credential_store_reference: string;
       status: AgentRunStatus;
       recovering: boolean;
+      resume_clarification_id: string | null;
     }>(
       `SELECT run.id, run.workspace_id, run.provider_connection_id,
-              task.request_snapshot, run.provider_thread_id, run.active_turn_id,
+              COALESCE(answer.body, task.request_snapshot) AS provider_input,
+              run.provider_thread_id, run.active_turn_id,
               connection.credential_store_reference,
               run.status,
-              (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1) AS recovering
+              (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1) AS recovering,
+              clarification.id AS resume_clarification_id
        FROM public.agent_run run
        JOIN public.task task ON task.id = run.task_id
        JOIN public.provider_connection connection ON connection.id = run.provider_connection_id
+       LEFT JOIN LATERAL (
+         SELECT pending.id, pending.answer_message_id
+         FROM public.agent_run_clarification pending
+         WHERE pending.agent_run_id = run.id
+           AND pending.status = 'answered' AND pending.delivery_attempted_at IS NULL
+         ORDER BY pending.answered_at DESC, pending.id DESC
+         LIMIT 1
+       ) clarification ON true
+       LEFT JOIN public.message answer ON answer.id = clarification.answer_message_id
        WHERE connection.status = 'ready'
          AND (
            (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1
@@ -256,10 +268,11 @@ async function claimNextAgentRun(
     return {
       id: row.id,
       workspace_id: row.workspace_id,
-      request_snapshot: row.request_snapshot,
+      provider_input: row.provider_input,
       credential_store_reference: row.credential_store_reference,
       provider_thread_id: row.provider_thread_id,
       active_turn_id: row.active_turn_id,
+      resume_clarification_id: row.resume_clarification_id,
       lease_token: leaseToken,
       recovering: row.recovering
     };
@@ -276,6 +289,10 @@ async function recoverAgentRun(
   provider: AgentRunProvider,
   claim: ClaimedAgentRun
 ): Promise<WorkerCycleResult> {
+  const clarificationStatus = await recoverClarificationBoundary(pool, claim);
+  if (clarificationStatus) {
+    return { kind: 'recovered', agentRunId: claim.id, status: clarificationStatus };
+  }
   if (!claim.provider_thread_id || !claim.active_turn_id) {
     await appendRunEvent(pool, claim, {
       eventType: 'run.paused',
@@ -324,6 +341,52 @@ async function recoverAgentRun(
   }
 }
 
+async function recoverClarificationBoundary(
+  pool: Pool,
+  claim: ClaimedAgentRun
+): Promise<'waiting_for_input' | 'queued' | undefined> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query<{ id: string; status: 'pending' | 'answered' }>(
+      `SELECT clarification.id, clarification.status
+       FROM public.agent_run_clarification clarification
+       JOIN public.agent_run run ON run.id = clarification.agent_run_id
+       WHERE clarification.agent_run_id = $1
+         AND clarification.delivery_attempted_at IS NULL
+       ORDER BY clarification.created_at DESC, clarification.id DESC
+       LIMIT 1
+       FOR UPDATE OF clarification, run`,
+      [claim.id]
+    );
+    const clarification = result.rows[0];
+    if (!clarification) {
+      await client.query('COMMIT');
+      return undefined;
+    }
+    const status = clarification.status === 'answered' ? 'queued' : 'waiting_for_input';
+    await appendRunEventWithClient(client, claim, {
+      eventType: clarification.status === 'answered'
+        ? 'run.clarification_requeued'
+        : 'run.clarification_wait_recovered',
+      status,
+      summary: clarification.status === 'answered'
+        ? 'Clarification retained; continuing on the existing Provider thread'
+        : 'Clarification remains open for a Pilot member',
+      evidence: { clarificationId: clarification.id },
+      clearActiveTurn: clarification.status === 'answered',
+      releaseLease: true
+    });
+    await client.query('COMMIT');
+    return status;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function prepareAgentRunWorkspace(root: string, agentRunId: string): Promise<string> {
   const resolvedRoot = resolve(root);
   const workspaceDirectory = resolve(resolvedRoot, agentRunId);
@@ -362,21 +425,39 @@ async function persistProviderTurn(
   claim: ClaimedAgentRun,
   turnId: string
 ): Promise<void> {
-  const updated = await pool.query(
-    `UPDATE public.agent_run SET active_turn_id = $3, updated_at = now()
-     WHERE id = $1 AND lease_token = $2`,
-    [claim.id, claim.lease_token, turnId]
-  );
-  if (updated.rowCount !== 1) throw new Error('AgentRun execution lease was lost');
-  claim.active_turn_id = turnId;
-  await appendRunEvent(pool, claim, {
-    eventType: 'provider.turn.started',
-    status: 'working',
-    summary: 'Codex turn started',
-    evidence: { provider: 'codex' },
-    providerEventId: `turn:${turnId}:started`,
-    providerTurnId: turnId
-  });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE public.agent_run SET active_turn_id = $3, updated_at = now()
+       WHERE id = $1 AND lease_token = $2`,
+      [claim.id, claim.lease_token, turnId]
+    );
+    if (updated.rowCount !== 1) throw new Error('AgentRun execution lease was lost');
+    if (claim.resume_clarification_id) {
+      await client.query(
+        `UPDATE public.agent_run_clarification
+         SET delivered_at = COALESCE(delivered_at, now())
+         WHERE id = $1 AND agent_run_id = $2`,
+        [claim.resume_clarification_id, claim.id]
+      );
+    }
+    await appendRunEventWithClient(client, claim, {
+      eventType: 'provider.turn.started',
+      status: 'working',
+      summary: 'Codex turn started',
+      evidence: { provider: 'codex' },
+      providerEventId: `turn:${turnId}:started`,
+      providerTurnId: turnId
+    });
+    await client.query('COMMIT');
+    claim.active_turn_id = turnId;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function persistProviderNotification(
@@ -439,7 +520,151 @@ function safeItemType(value: unknown): string {
   return summaries[value] ?? 'Codex activity';
 }
 
-async function appendRunEvent(pool: Pool, claim: ClaimedAgentRun, event: RunEvent): Promise<void> {
+async function requestClarificationAndWait(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  request: ProviderClarificationRequest,
+  signal: AbortSignal
+): Promise<ProviderClarificationAnswers> {
+  if (request.threadId !== claim.provider_thread_id || request.turnId !== claim.active_turn_id) {
+    throw new Error('Provider clarification does not match the active AgentRun turn');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const run = await client.query<{
+      source_message_id: string;
+      root_message_id: string;
+      agent_member_id: string;
+      channel_id: string;
+    }>(
+      `SELECT task.source_message_id,
+              COALESCE(source.parent_message_id, source.id) AS root_message_id,
+              agent_member.id AS agent_member_id,
+              source.channel_id
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id
+       JOIN public.message source ON source.id = task.source_message_id
+       JOIN public.workspace_member agent_member
+         ON agent_member.agent_id = run.agent_id
+        AND agent_member.workspace_id = run.workspace_id
+       WHERE run.id = $1 AND run.workspace_id = $2 AND run.lease_token = $3
+       FOR UPDATE OF run`,
+      [claim.id, claim.workspace_id, claim.lease_token]
+    );
+    const context = run.rows[0];
+    if (!context) throw new Error('AgentRun execution lease was lost');
+
+    const existing = await client.query<{ id: string }>(
+      `SELECT id FROM public.agent_run_clarification
+       WHERE agent_run_id = $1 AND provider_request_id = $2`,
+      [claim.id, request.providerRequestId]
+    );
+    if (!existing.rows[0]) {
+      const clarificationId = randomUUID();
+      const requestMessageId = randomUUID();
+      await client.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          requestMessageId,
+          claim.workspace_id,
+          context.channel_id,
+          context.agent_member_id,
+          context.root_message_id,
+          visibleClarificationRequest(request)
+        ]
+      );
+      await client.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, message_id, topic, payload
+         ) VALUES ($1, $2, 'channel.message', $3)`,
+        [claim.workspace_id, requestMessageId, { messageId: requestMessageId }]
+      );
+      await client.query(
+        `INSERT INTO public.agent_run_clarification (
+           id, workspace_id, agent_run_id, provider_request_id, provider_turn_id,
+           provider_item_id, questions, request_message_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          clarificationId,
+          claim.workspace_id,
+          claim.id,
+          request.providerRequestId,
+          request.turnId,
+          request.itemId,
+          JSON.stringify(request.questions),
+          requestMessageId
+        ]
+      );
+      await appendRunEventWithClient(client, claim, {
+        eventType: 'run.clarification_requested',
+        status: 'waiting_for_input',
+        summary: 'Waiting for a Pilot member to clarify the request',
+        evidence: { clarificationId, providerItemId: request.itemId }
+      });
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  while (!signal.aborted) {
+    const answer = await pool.query<{ id: string; answers: ProviderClarificationAnswers }>(
+      `SELECT id, answers FROM public.agent_run_clarification
+       WHERE agent_run_id = $1 AND provider_request_id = $2 AND status = 'answered'`,
+      [claim.id, request.providerRequestId]
+    );
+    if (answer.rows[0]) {
+      await pool.query(
+        `UPDATE public.agent_run_clarification
+         SET delivery_attempted_at = COALESCE(delivery_attempted_at, now())
+         WHERE id = $1`,
+        [answer.rows[0].id]
+      );
+      return answer.rows[0].answers;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error('AgentRun clarification stopped after its execution lease was lost');
+}
+
+async function markClarificationDelivered(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  providerRequestId: string
+): Promise<void> {
+  const updated = await pool.query(
+    `UPDATE public.agent_run_clarification
+     SET delivered_at = COALESCE(delivered_at, now())
+     WHERE agent_run_id = $1 AND provider_request_id = $2
+       AND delivery_attempted_at IS NOT NULL`,
+    [claim.id, providerRequestId]
+  );
+  if (updated.rowCount !== 1) {
+    throw new Error('AgentRun clarification delivery boundary changed');
+  }
+}
+
+function visibleClarificationRequest(request: ProviderClarificationRequest): string {
+  const questions = request.questions.map(({ header, question, options }) => {
+    const choices = options?.length
+      ? ` Options: ${options.map(({ label }) => label).join(', ')}.`
+      : '';
+    return `${header}: ${question}${choices}`;
+  });
+  return `Quick clarification: ${questions.join('\n')} Reply in this thread to continue.`.slice(0, 4000);
+}
+
+async function appendRunEvent(
+  pool: Pool,
+  claim: ClaimedAgentRun,
+  event: AgentRunEventInput
+): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -456,73 +681,13 @@ async function appendRunEvent(pool: Pool, claim: ClaimedAgentRun, event: RunEven
 async function appendRunEventWithClient(
   client: PoolClient,
   claim: Pick<ClaimedAgentRun, 'id' | 'workspace_id' | 'lease_token'>,
-  event: RunEvent
+  event: AgentRunEventInput
 ): Promise<void> {
-  const leased = await client.query(
-    'SELECT id FROM public.agent_run WHERE id = $1 AND lease_token = $2 FOR UPDATE',
-    [claim.id, claim.lease_token]
-  );
-  if (!leased.rowCount) throw new Error('AgentRun execution lease was lost');
-  if (event.providerEventId) {
-    const duplicate = await client.query(
-      `SELECT 1 FROM public.agent_run_event
-       WHERE agent_run_id = $1 AND provider_event_id = $2`,
-      [claim.id, event.providerEventId]
-    );
-    if (duplicate.rowCount) return;
-  }
-  const inserted = await client.query<{ id: number; sequence: number }>(
-    `INSERT INTO public.agent_run_event (
-       workspace_id, agent_run_id, sequence, event_type, status, summary, evidence,
-       provider_event_id, provider_turn_id, provider_item_id
-     )
-     SELECT $2, $1, COALESCE(MAX(sequence), 0) + 1, $3, $4, $5, $6, $7, $8, $9
-     FROM public.agent_run_event WHERE agent_run_id = $1
-     RETURNING id, sequence`,
-    [
-      claim.id,
-      claim.workspace_id,
-      event.eventType,
-      event.status,
-      event.summary,
-      event.evidence ?? {},
-      event.providerEventId ?? null,
-      event.providerTurnId ?? null,
-      event.providerItemId ?? null
-    ]
-  );
-  const eventId = inserted.rows[0]?.id;
-  const sequence = inserted.rows[0]?.sequence;
-  if (!eventId || !sequence) throw new Error('AgentRun event was not persisted');
-  await client.query(
-    `INSERT INTO public.notification_outbox (
-       workspace_id, agent_run_event_id, topic, payload
-     ) VALUES ($1, $2, 'agent_run.event', $3)`,
-    [claim.workspace_id, eventId, {
-      agentRunId: claim.id,
-      eventType: event.eventType,
-      sequence
-    }]
-  );
-  await client.query(
-    `UPDATE public.agent_run
-     SET status = $3,
-         active_turn_id = CASE WHEN $4 THEN NULL ELSE active_turn_id END,
-         completed_at = CASE WHEN $5 THEN now() ELSE completed_at END,
-         lease_owner = CASE WHEN $5 OR $3 = 'paused' OR $6 THEN NULL ELSE lease_owner END,
-         lease_token = CASE WHEN $5 OR $3 = 'paused' OR $6 THEN NULL ELSE lease_token END,
-         lease_expires_at = CASE WHEN $5 OR $3 = 'paused' OR $6 THEN NULL ELSE lease_expires_at END,
-         updated_at = now()
-     WHERE id = $1 AND workspace_id = $2`,
-    [
-      claim.id,
-      claim.workspace_id,
-      event.status,
-      event.clearActiveTurn ?? false,
-      event.completed ?? false,
-      event.releaseLease ?? false
-    ]
-  );
+  await appendAgentRunEvent(client, {
+    id: claim.id,
+    workspaceId: claim.workspace_id,
+    requiredLeaseToken: claim.lease_token
+  }, event);
 }
 
 async function renewLease(

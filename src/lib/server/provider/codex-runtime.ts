@@ -14,7 +14,7 @@ interface PendingRequest {
 }
 
 export interface ProtocolMessage {
-  id?: number;
+  id?: string | number;
   method?: string;
   result?: unknown;
   error?: { code?: number; message?: string; data?: unknown };
@@ -30,11 +30,11 @@ export class CodexProtocolError extends Error {
 
 export interface CodexAppServerSession {
   onNotification?: (message: ProtocolMessage) => void;
-  onRequest?: (message: ProtocolMessage & { id: number; method: string }) => void;
+  onRequest?: (message: ProtocolMessage & { id: string | number; method: string }) => void;
   onFailure?: (error: Error) => void;
   initialize(): Promise<void>;
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
-  respond?(id: number, result: unknown): void;
+  respond?(id: string | number, result: unknown): Promise<void>;
   close(): void;
 }
 
@@ -44,7 +44,7 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
   private requestId = 0;
   private closed = false;
   onNotification?: (message: ProtocolMessage) => void;
-  onRequest?: (message: ProtocolMessage & { id: number; method: string }) => void;
+  onRequest?: (message: ProtocolMessage & { id: string | number; method: string }) => void;
   onFailure?: (error: Error) => void;
 
   constructor(binary: string) {
@@ -65,11 +65,16 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
         return;
       }
       if (message.id !== undefined) {
+        if (message.method) {
+          this.onRequest?.(message as ProtocolMessage & {
+            id: string | number;
+            method: string;
+          });
+          return;
+        }
+        if (typeof message.id !== 'number') return;
         const request = this.pending.get(message.id);
         if (!request) {
-          if (message.method) {
-            this.onRequest?.(message as ProtocolMessage & { id: number; method: string });
-          }
           return;
         }
         clearTimeout(request.timer);
@@ -88,7 +93,7 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
   async initialize(): Promise<void> {
     await this.send('initialize', {
       clientInfo: { name: 'relay-provider-connection', version: '0.1.0' },
-      capabilities: {}
+      capabilities: { experimentalApi: true }
     });
     this.process.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`);
   }
@@ -111,9 +116,14 @@ class ChildProcessCodexAppServerSession implements CodexAppServerSession {
     });
   }
 
-  respond(id: number, result: unknown): void {
-    if (this.closed) return;
-    this.process.stdin.write(`${JSON.stringify({ id, result })}\n`);
+  respond(id: string | number, result: unknown): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('Codex app-server is unavailable'));
+    return new Promise((resolve, reject) => {
+      this.process.stdin.write(`${JSON.stringify({ id, result })}\n`, (error) => {
+        if (error) reject(new Error('Codex clarification response could not be sent'));
+        else resolve();
+      });
+    });
   }
 
   close(): void {

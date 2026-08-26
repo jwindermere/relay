@@ -4,7 +4,9 @@ import type { Pool, PoolClient } from 'pg';
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import type { GitHubRepositoryGateway } from '../github/connection.js';
 import { hasActivePilotChannelAccess } from './channel-access.js';
+import { handleWaitingAgentRunReply } from './clarifications.js';
 import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
+import { answerAgentProgressRequest } from './progress.js';
 
 export class ChannelMessageError extends Error {
   constructor(message: string) {
@@ -285,13 +287,31 @@ export async function postChannelMessage(
          ) VALUES ($1, $2, 'channel.message', $3)`,
         [access.workspace.id, messageId, { messageId }]
       );
-      await acceptEligibleAgentMention(client, {
+      const agentProgressAnswered = await answerAgentProgressRequest(client, {
         messageId,
         workspaceId: access.workspace.id,
         channelId: input.channelId,
-        body,
-        getRepositoryGateway: dependencies.getRepositoryGateway
+        parentMessageId,
+        body
       });
+      const waitingAgentRunReply = !agentProgressAnswered && parentMessageId
+        ? await handleWaitingAgentRunReply(client, {
+            messageId,
+            workspaceId: access.workspace.id,
+            channelId: input.channelId,
+            parentMessageId,
+            body
+          })
+        : false;
+      if (!agentProgressAnswered && !waitingAgentRunReply) {
+        await acceptEligibleAgentMention(client, {
+          messageId,
+          workspaceId: access.workspace.id,
+          channelId: input.channelId,
+          body,
+          getRepositoryGateway: dependencies.getRepositoryGateway
+        });
+      }
     }
     const row = await readMessage(client, storedMessageId);
     if (!row) throw new Error('committed Channel Message could not be loaded');
