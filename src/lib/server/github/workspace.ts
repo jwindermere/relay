@@ -6,6 +6,7 @@ import type { Pool } from 'pg';
 
 import type { PullRequestPublication } from '../collaboration/pull-request-result.js';
 import { executeGitHubBrokerOperation, type GitHubBrokerRemote } from './broker.js';
+import type { GitHubFileMode } from './broker-policy.js';
 
 const executeFile = promisify(execFile);
 
@@ -23,7 +24,19 @@ interface AgentRunRepositoryContext {
 export interface PreparedAgentRunRepository {
   baseCommitSha: string;
   assignedBranch: string;
-  originalFiles: Map<string, string>;
+  originalFiles: Map<string, WorkspaceFileSnapshot>;
+}
+
+export interface WorkspaceFileSnapshot {
+  content: string;
+  mode: GitHubFileMode;
+}
+
+export class AgentRunGitHubPublicationError extends Error {
+  constructor(readonly code: 'no_repository_changes') {
+    super('AgentRun completed without repository changes');
+    this.name = 'AgentRunGitHubPublicationError';
+  }
 }
 
 export class AgentRunGitHubWorkspaceBroker {
@@ -42,12 +55,15 @@ export class AgentRunGitHubWorkspaceBroker {
     for (const entry of await readdir(workspaceDirectory)) {
       await rm(safeWorkspacePath(workspaceDirectory, entry), { recursive: true, force: true });
     }
-    const originalFiles = new Map<string, string>();
+    const originalFiles = new Map<string, WorkspaceFileSnapshot>();
     for (const file of clone.result.files) {
       const target = safeWorkspacePath(workspaceDirectory, file.path);
       await mkdir(dirname(target), { recursive: true });
-      await writeFile(target, Buffer.from(file.content, 'base64'), { mode: 0o600 });
-      originalFiles.set(file.path, file.content);
+      const mode = file.mode ?? '100644';
+      await writeFile(target, Buffer.from(file.content, 'base64'), {
+        mode: mode === '100755' ? 0o700 : 0o600
+      });
+      originalFiles.set(file.path, { content: file.content, mode });
     }
     await initializeCredentialFreeGitWorkspace(workspaceDirectory, clone.decision.assignedBranch);
     const branch = await executeGitHubBrokerOperation(this.pool, this.remote, {
@@ -75,7 +91,10 @@ export class AgentRunGitHubWorkspaceBroker {
     return {
       baseCommitSha: clone.result.commitSha,
       assignedBranch: clone.decision.assignedBranch,
-      originalFiles: new Map(clone.result.files.map(({ path, content }) => [path, content]))
+      originalFiles: new Map(clone.result.files.map(({ path, content, mode }) => [
+        path,
+        { content, mode: mode ?? '100644' }
+      ]))
     };
   }
 
@@ -86,21 +105,13 @@ export class AgentRunGitHubWorkspaceBroker {
   ): Promise<PullRequestPublication> {
     const context = await this.context(agentRunId);
     const common = this.commonRequest(agentRunId, context);
-    const currentFiles = await readWorkspaceFiles(workspaceDirectory);
-    const changedFiles: Array<{
-      path: string;
-      content: string | null;
-      encoding: 'base64';
-    }> = [];
-    for (const [path, content] of currentFiles) {
-      if (prepared.originalFiles.get(path) !== content) {
-        changedFiles.push({ path, content, encoding: 'base64' });
-      }
+    const changedFiles = await collectWorkspaceChanges(
+      workspaceDirectory,
+      prepared.originalFiles
+    );
+    if (changedFiles.length === 0) {
+      throw new AgentRunGitHubPublicationError('no_repository_changes');
     }
-    for (const path of prepared.originalFiles.keys()) {
-      if (!currentFiles.has(path)) changedFiles.push({ path, content: null, encoding: 'base64' });
-    }
-    if (changedFiles.length === 0) throw new Error('AgentRun completed without repository changes');
 
     const commit = await executeGitHubBrokerOperation(this.pool, this.remote, {
       ...common,
@@ -185,8 +196,38 @@ function safeWorkspacePath(root: string, path: string): string {
   return target;
 }
 
-async function readWorkspaceFiles(root: string): Promise<Map<string, string>> {
-  const files = new Map<string, string>();
+export async function collectWorkspaceChanges(
+  root: string,
+  originalFiles: Map<string, WorkspaceFileSnapshot>
+): Promise<Array<{
+  path: string;
+  content: string | null;
+  encoding: 'base64';
+  mode: GitHubFileMode;
+}>> {
+  const currentFiles = await readWorkspaceFiles(root);
+  const changedFiles: Array<{
+    path: string;
+    content: string | null;
+    encoding: 'base64';
+    mode: GitHubFileMode;
+  }> = [];
+  for (const [path, file] of currentFiles) {
+    const original = originalFiles.get(path);
+    if (!original || original.content !== file.content || original.mode !== file.mode) {
+      changedFiles.push({ path, ...file, encoding: 'base64' });
+    }
+  }
+  for (const [path, file] of originalFiles) {
+    if (!currentFiles.has(path)) {
+      changedFiles.push({ path, content: null, encoding: 'base64', mode: file.mode });
+    }
+  }
+  return changedFiles;
+}
+
+async function readWorkspaceFiles(root: string): Promise<Map<string, WorkspaceFileSnapshot>> {
+  const files = new Map<string, WorkspaceFileSnapshot>();
   const visit = async (directory: string, prefix: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       if (!prefix && entry.name === '.git') continue;
@@ -196,7 +237,10 @@ async function readWorkspaceFiles(root: string): Promise<Map<string, string>> {
       else {
         const metadata = await lstat(absolute);
         if (!metadata.isFile()) throw new Error('AgentRun workspace contains an unsupported file type');
-        files.set(path, (await readFile(absolute)).toString('base64'));
+        files.set(path, {
+          content: (await readFile(absolute)).toString('base64'),
+          mode: metadata.mode & 0o111 ? '100755' : '100644'
+        });
       }
     }
   };

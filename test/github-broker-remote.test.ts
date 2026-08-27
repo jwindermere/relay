@@ -30,11 +30,25 @@ test('broker remote retains one repository-scoped installation token while retur
       if (path === `/repos/relay-owner/pilot/git/trees/${'a'.repeat(40)}?recursive=1`) {
         return Response.json({
           truncated: false,
-          tree: [{ path: 'README.md', type: 'blob', sha: 'b'.repeat(40), size: 5 }]
+          tree: [{
+            path: 'README.md', mode: '100644', type: 'blob', sha: 'b'.repeat(40), size: 5
+          }]
         });
       }
       if (path === `/repos/relay-owner/pilot/git/blobs/${'b'.repeat(40)}`) {
         return Response.json({ content: Buffer.from('hello').toString('base64'), encoding: 'base64' });
+      }
+      if (path === `/repos/relay-owner/pilot/git/commits/${'a'.repeat(40)}`) {
+        return Response.json({ tree: { sha: 'c'.repeat(40) } });
+      }
+      if (path === '/repos/relay-owner/pilot/git/blobs') {
+        return Response.json({ sha: 'd'.repeat(40) });
+      }
+      if (path === '/repos/relay-owner/pilot/git/trees') {
+        return Response.json({ sha: 'e'.repeat(40) });
+      }
+      if (path === '/repos/relay-owner/pilot/git/commits') {
+        return Response.json({ sha: 'f'.repeat(40) });
       }
       return Response.json({ message: 'not found' }, { status: 404 });
     }
@@ -62,10 +76,27 @@ test('broker remote retains one repository-scoped installation token while retur
       attemptNumber: 1, actorWorkspaceMemberId: 'agent-member-25'
     }
   });
+  await remote.execute({
+    ...common,
+    request: {
+      operation: 'commit', repositoryId: '202', agentRunId: 'run-25',
+      attemptNumber: 1, actorWorkspaceMemberId: 'agent-member-25',
+      branch: 'relay/run-25', commitSha: 'a'.repeat(40), commitMessage: 'Make script executable',
+      files: [{
+        path: 'script.sh', content: Buffer.from('#!/bin/sh\n').toString('base64'),
+        encoding: 'base64', mode: '100755'
+      }]
+    }
+  });
 
   assert.deepEqual(clone, {
     commitSha: 'a'.repeat(40),
-    files: [{ path: 'README.md', content: Buffer.from('hello').toString('base64'), encoding: 'base64' }]
+    files: [{
+      path: 'README.md',
+      content: Buffer.from('hello').toString('base64'),
+      encoding: 'base64',
+      mode: '100644'
+    }]
   });
   assert.equal(requests.filter(({ path }) => path.endsWith('/access_tokens')).length, 1);
   assert.deepEqual(requests[0]?.body, {
@@ -73,6 +104,13 @@ test('broker remote retains one repository-scoped installation token while retur
     permissions: { metadata: 'read', contents: 'write', pull_requests: 'write' }
   });
   assert.ok(requests.slice(1).every(({ authorization }) => authorization === 'Bearer installation-secret'));
+  assert.deepEqual(
+    requests.find(({ path }) => path === '/repos/relay-owner/pilot/git/trees')?.body,
+    {
+      base_tree: 'c'.repeat(40),
+      tree: [{ path: 'script.sh', mode: '100755', type: 'blob', sha: 'd'.repeat(40) }]
+    }
+  );
   assert.doesNotMatch(JSON.stringify(clone), /installation-secret|BEGIN PRIVATE/);
 });
 

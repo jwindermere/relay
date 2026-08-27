@@ -15,6 +15,8 @@ export type GitHubBrokerOperation =
   | 'workflow'
   | 'secret';
 
+export type GitHubFileMode = '100644' | '100755';
+
 export interface GitHubBrokerRequest {
   operation: GitHubBrokerOperation;
   repositoryId: string;
@@ -24,7 +26,12 @@ export interface GitHubBrokerRequest {
   branch?: string;
   commitSha?: string;
   commitMessage?: string;
-  files?: Array<{ path: string; content: string | null; encoding?: 'utf-8' | 'base64' }>;
+  files?: Array<{
+    path: string;
+    content: string | null;
+    encoding?: 'utf-8' | 'base64';
+    mode?: GitHubFileMode;
+  }>;
   pullRequestNumber?: number;
   pullRequestTitle?: string;
   pullRequestBody?: string;
@@ -96,8 +103,10 @@ export function decideGitHubBrokerOperation(
     || request.files.reduce(
       (size, { content }) => size + (content === null ? 0 : Buffer.byteLength(content)), 0
     ) > 5_000_000
-    || request.files.some(({ path }) =>
-      !isSafeRepositoryPath(path) || path.toLowerCase().startsWith('.github/workflows/')
+    || request.files.some(({ path, mode }) =>
+      !isSafeRepositoryPath(path)
+      || path.toLowerCase().startsWith('.github/workflows/')
+      || (mode !== undefined && mode !== '100644' && mode !== '100755')
     )
   )) return deny('invalid_commit_content');
   return { decision: 'allow', reason: 'operation_allowed', assignedBranch };

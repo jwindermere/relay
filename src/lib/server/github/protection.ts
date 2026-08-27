@@ -36,15 +36,22 @@ export interface GitHubRepositoryEvidence {
     }>;
     rulesets: Array<{
       id: number;
+      updatedAt?: string;
       bypassActorAppIds?: number[];
     }>;
   }>;
+}
+
+export interface RulesetBypassAttestation {
+  rulesetId: number;
+  rulesetUpdatedAt: string;
 }
 
 export interface RepositoryProtectionResult {
   readyForAutonomousWork: boolean;
   failures: string[];
   branches: Array<{ name: string; protected: boolean; failures: string[] }>;
+  bypassAttestations?: RulesetBypassAttestation[];
 }
 
 const REQUIRED_PERMISSIONS: Record<string, string> = {
@@ -64,7 +71,8 @@ function hasExactRequiredPermissions(permissions: GitHubAppPermissions): boolean
 
 function evaluateBranch(
   evidence: GitHubRepositoryEvidence,
-  branchName: string
+  branchName: string,
+  bypassAttestations: RulesetBypassAttestation[]
 ): { name: string; protected: boolean; failures: string[] } {
   const branch = evidence.branches.find(({ name }) => name === branchName);
   if (!branch) {
@@ -95,7 +103,11 @@ function evaluateBranch(
   if (!branch.rules.some(({ type }) => type === 'deletion')) {
     failures.push('branch deletion is not blocked');
   }
-  if (branch.rulesets.some(({ bypassActorAppIds }) => bypassActorAppIds === undefined)) {
+  if (branch.rulesets.some(({ id, updatedAt, bypassActorAppIds }) =>
+    bypassActorAppIds === undefined && !bypassAttestations.some((attestation) =>
+      attestation.rulesetId === id && attestation.rulesetUpdatedAt === updatedAt
+    )
+  )) {
     failures.push('ruleset bypass actors could not be verified');
   } else if (branch.rulesets.some(({ bypassActorAppIds }) =>
     bypassActorAppIds?.includes(evidence.appId)
@@ -106,9 +118,30 @@ function evaluateBranch(
   return { name: branchName, protected: failures.length === 0, failures };
 }
 
+export function createRulesetBypassAttestations(
+  evidence: GitHubRepositoryEvidence
+): RulesetBypassAttestation[] {
+  const attestations = new Map<string, RulesetBypassAttestation>();
+  for (const { rulesets } of evidence.branches) {
+    for (const ruleset of rulesets) {
+      if (!ruleset.updatedAt || ruleset.bypassActorAppIds !== undefined) continue;
+      const attestation = {
+        rulesetId: ruleset.id,
+        rulesetUpdatedAt: ruleset.updatedAt
+      };
+      attestations.set(`${attestation.rulesetId}:${attestation.rulesetUpdatedAt}`, attestation);
+    }
+  }
+  return [...attestations.values()].sort((left, right) =>
+    left.rulesetId - right.rulesetId
+      || left.rulesetUpdatedAt.localeCompare(right.rulesetUpdatedAt)
+  );
+}
+
 export function evaluateRepositoryProtection(
   evidence: GitHubRepositoryEvidence,
-  releaseBranches: string[]
+  releaseBranches: string[],
+  bypassAttestations: RulesetBypassAttestation[] = []
 ): RepositoryProtectionResult {
   const failures: string[] = [];
   if (new Set(releaseBranches).size !== releaseBranches.length) {
@@ -139,10 +172,13 @@ export function evaluateRepositoryProtection(
     evidence.repository.defaultBranch,
     ...releaseBranches
   ])];
-  const branches = configuredBranches.map((branchName) => evaluateBranch(evidence, branchName));
+  const branches = configuredBranches.map((branchName) =>
+    evaluateBranch(evidence, branchName, bypassAttestations)
+  );
   return {
     readyForAutonomousWork: failures.length === 0 && branches.every(({ protected: value }) => value),
     failures,
-    branches
+    branches,
+    ...(bypassAttestations.length > 0 ? { bypassAttestations } : {})
   };
 }

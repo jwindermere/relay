@@ -8,6 +8,7 @@ import { handleApprovalReply } from './approvals.js';
 import { handleAgentRunCommand } from './agent-run-commands.js';
 import { handleWaitingAgentRunReply } from './clarifications.js';
 import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
+import { acceptAgentConversation } from './conversation.js';
 import { answerAgentProgressRequest } from './progress.js';
 
 export class ChannelMessageError extends Error {
@@ -30,6 +31,7 @@ export interface ChannelMessage {
   parentMessageId: string | null;
   body: string;
   createdAt: string;
+  deletedAt: string | null;
   author: {
     workspaceMemberId: string;
     kind: 'pilot' | 'agent';
@@ -42,6 +44,7 @@ export interface ChannelMessage {
 export interface SharedAgentChannel {
   workspace: WorkspaceAccess['workspace'];
   viewerMembershipId: string;
+  viewerWorkspaceMemberId: string;
   project: { id: string; name: string };
   channel: { id: string; name: string };
   members: SharedChannelMember[];
@@ -53,32 +56,39 @@ interface MessageRow {
   parent_message_id: string | null;
   body: string;
   created_at: Date;
+  deleted_at: Date | null;
   author_workspace_member_id: string;
   author_kind: 'pilot' | 'agent';
   author_name: string;
   author_role_label: string;
-  agent_mention_status: 'communication' | 'accepted' | 'rejected';
+  agent_mention_status: 'communication' | 'conversation' | 'accepted' | 'rejected';
   mentioned_agent_id: string | null;
   agent_mention_reason: string | null;
   task_id: string | null;
   agent_run_id: string | null;
+  conversation_turn_id: string | null;
+  conversation_turn_status: 'queued' | 'working' | 'completed' | 'failed' | null;
 }
 
 const MESSAGE_PROJECTION = `
-  SELECT m.id, m.parent_message_id, m.body, m.created_at,
+  SELECT m.id, m.parent_message_id, m.body, m.created_at, m.deleted_at,
          author.id AS author_workspace_member_id, author.kind AS author_kind,
          COALESCE(pilot_user.name, agent.name) AS author_name,
          CASE WHEN author.kind = 'pilot' THEN 'Pilot member' ELSE agent.role_label END
            AS author_role_label,
          m.agent_mention_status, m.mentioned_agent_id, m.agent_mention_reason,
-         task.id AS task_id, run.id AS agent_run_id
+         task.id AS task_id, run.id AS agent_run_id,
+         conversation_turn.id AS conversation_turn_id,
+         conversation_turn.status AS conversation_turn_status
   FROM public.message m
   JOIN public.workspace_member author ON author.id = m.author_workspace_member_id
   LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
   LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
   LEFT JOIN public.agent agent ON agent.id = author.agent_id
   LEFT JOIN public.task task ON task.source_message_id = m.id
-  LEFT JOIN public.agent_run run ON run.task_id = task.id AND run.attempt_number = 1`;
+  LEFT JOIN public.agent_run run ON run.task_id = task.id AND run.attempt_number = 1
+  LEFT JOIN public.agent_conversation_turn conversation_turn
+    ON conversation_turn.request_message_id = m.id`;
 
 function toChannelMessage(row: MessageRow): ChannelMessage {
   return {
@@ -86,6 +96,7 @@ function toChannelMessage(row: MessageRow): ChannelMessage {
     parentMessageId: row.parent_message_id,
     body: row.body,
     createdAt: row.created_at.toISOString(),
+    deletedAt: row.deleted_at?.toISOString() ?? null,
     author: {
       workspaceMemberId: row.author_workspace_member_id,
       kind: row.author_kind,
@@ -99,6 +110,13 @@ function toChannelMessage(row: MessageRow): ChannelMessage {
           taskId: row.task_id!,
           agentRunId: row.agent_run_id!
         }
+      : row.agent_mention_status === 'conversation'
+        ? {
+            status: 'conversation',
+            agentId: row.mentioned_agent_id!,
+            conversationTurnId: row.conversation_turn_id!,
+            turnStatus: row.conversation_turn_status!
+          }
       : row.agent_mention_status === 'rejected'
         ? {
             status: 'rejected',
@@ -129,9 +147,11 @@ export async function loadSharedAgentChannel(
     project_name: string;
     channel_id: string;
     channel_name: string;
+    viewer_workspace_member_id: string;
   }>(
     `SELECT p.id AS project_id, p.name AS project_name,
-            c.id AS channel_id, c.name AS channel_name
+            c.id AS channel_id, c.name AS channel_name,
+            member.id AS viewer_workspace_member_id
      FROM public.project p
      JOIN public.channel c ON c.project_id = p.id AND c.workspace_id = p.workspace_id
      JOIN public.project_membership pm ON pm.project_id = p.id
@@ -182,6 +202,7 @@ export async function loadSharedAgentChannel(
   return {
     workspace: access.workspace,
     viewerMembershipId: access.membership.id,
+    viewerWorkspaceMemberId: selected.viewer_workspace_member_id,
     project: { id: selected.project_id, name: selected.project_name },
     channel: { id: selected.channel_id, name: selected.channel_name },
     members: members.rows.map((member) => ({
@@ -326,13 +347,22 @@ export async function postChannelMessage(
         : false;
       if (!agentProgressAnswered && !agentRunCommandHandled
         && !approvalAnswered && !waitingAgentRunReply) {
-        await acceptEligibleAgentMention(client, {
+        const conversation = await acceptAgentConversation(client, {
           messageId,
           workspaceId: access.workspace.id,
           channelId: input.channelId,
-          body,
-          getRepositoryGateway: dependencies.getRepositoryGateway
+          parentMessageId,
+          body
         });
+        if (!conversation) {
+          await acceptEligibleAgentMention(client, {
+            messageId,
+            workspaceId: access.workspace.id,
+            channelId: input.channelId,
+            body,
+            getRepositoryGateway: dependencies.getRepositoryGateway
+          });
+        }
       }
     }
     const row = await readMessage(client, storedMessageId);

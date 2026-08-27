@@ -27,7 +27,7 @@ incompatible.
 
 Deployment replacement, backup restoration, migration compatibility, and independent
 secret-rotation procedures are documented in [`ops/README.md`](ops/README.md).
-The final two-member acceptance journey is driven by
+The initial acceptance journey is driven by
 [`ops/pilot-journey.sh`](ops/pilot-journey.sh); it combines the automated safety
 contracts with real Pilot-member delegation and a durable evidence report.
 
@@ -43,12 +43,23 @@ Compose service before web or worker starts:
 DATABASE_URL=postgres://relay:relay@localhost:5432/relay npm run db:migrate
 ```
 
-For local development, run `npm run dev:web` and `npm run dev:worker` separately
-after migrating PostgreSQL. Useful checks are `npm run check`, `npm run build`, and
-`npm test`. Database integration tests use a disposable PostgreSQL container, or an
-existing disposable database supplied with `TEST_DATABASE_URL`. A missing database
-runtime fails the check; use `SKIP_DATABASE_TESTS=true` only when intentionally
-running the non-database checks.
+For local development, put `DATABASE_URL`, `BETTER_AUTH_SECRET`,
+`BETTER_AUTH_URL`, and `RELAY_REALTIME_SECRET` in `.env`, then run
+`npm run dev:web` and `npm run dev:worker` separately after migrating PostgreSQL.
+Calls use `https://meet.jit.si` in a separate browser tab by default so hosted iframe
+limits do not interrupt meetings. A self-hosted deployment can instead be shown
+inline or in a floating panel by setting both `RELAY_JITSI_BASE_URL` and
+`RELAY_JITSI_EMBED_ENABLED=true`. Relay refuses to embed the public service. The
+planned `hades.ws` topology and remaining host provisioning are documented in
+[`ops/jitsi/README.md`](ops/jitsi/README.md).
+The local development, migration, bootstrap, smoke, and verification scripts load
+`.env` automatically when it exists; exported environment variables take precedence.
+The same scripts can be launched with `bun run` without an extra `--env-file` flag.
+Useful checks are `npm run check`, `npm run build`, and `npm test`. Database
+integration tests use a disposable PostgreSQL container, or an existing disposable
+database supplied with `TEST_DATABASE_URL`. A missing database runtime fails the
+check; use `SKIP_DATABASE_TESTS=true` only when intentionally running the non-database
+checks.
 
 ## Bootstrap and authentication
 
@@ -71,11 +82,11 @@ in at <http://localhost:3000/sign-in>. Browser sessions are opaque PostgreSQL-ba
 Better Auth sessions; protected HTTP endpoints and the `/realtime` WebSocket resolve
 the active Workspace membership on the server for each protected interaction.
 
-The owner creates the second Pilot member's 24-hour invitation through
-`POST /api/workspace/invitations`. The returned registration path creates only an
-unverified account for the invited email. Relay then asks the configured email
+The owner can create any number of 24-hour invitations from Workspace settings or
+through `POST /api/workspace/invitations`. The returned invitation link guides each
+teammate through creating an unverified account for the invited email. Relay then asks the configured email
 delivery gateway to send Better Auth's one-hour verification link; the collaborator
-must follow that link, sign in, and call the returned acceptance path. Acceptance
+must follow that link, sign in, return to the invitation, and accept it. Acceptance
 rechecks the verified session email and atomically creates the membership while
 consuming the invitation.
 

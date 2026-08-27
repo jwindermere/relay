@@ -17,7 +17,20 @@ import {
   loadSharedAgentChannel,
   postChannelMessage
 } from '../src/lib/server/collaboration/channel.js';
+import {
+  endChannelCall,
+  joinChannelCall,
+  loadActiveChannelCall,
+  startChannelCall
+} from '../src/lib/server/collaboration/calls.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
+import { deleteChannelMessage } from '../src/lib/server/collaboration/messages.js';
+import {
+  createWorkspace,
+  loadAvailableWorkspaces,
+  renameWorkspace,
+  requireAvailableWorkspace
+} from '../src/lib/server/collaboration/workspaces.js';
 import {
   beginProviderConnectionLogin,
   disableProviderConnection,
@@ -145,6 +158,8 @@ if (connectionString) {
       { table_schema: 'auth', table_name: 'user' },
       { table_schema: 'auth', table_name: 'verification' },
       { table_schema: 'public', table_name: 'agent' },
+      { table_schema: 'public', table_name: 'agent_conversation' },
+      { table_schema: 'public', table_name: 'agent_conversation_turn' },
       { table_schema: 'public', table_name: 'agent_run' },
       { table_schema: 'public', table_name: 'agent_run_cancellation_request' },
       { table_schema: 'public', table_name: 'agent_run_clarification' },
@@ -153,6 +168,8 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'artifact' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
+      { table_schema: 'public', table_name: 'channel_call' },
+      { table_schema: 'public', table_name: 'channel_call_participant' },
       { table_schema: 'public', table_name: 'github_broker_decision' },
       { table_schema: 'public', table_name: 'github_connection' },
       { table_schema: 'public', table_name: 'github_webhook_delivery' },
@@ -174,26 +191,35 @@ if (connectionString) {
   });
 
   test('a runtime accepts additive mixed-version schemas and rejects unsafe contracts', async () => {
+    const compatibleVersion = REQUIRED_MIGRATION_STREAM_VERSIONS.relay + 1;
+    const incompatibleVersion = compatibleVersion + 1;
     await pool.query(
       `INSERT INTO public.schema_migrations (version, name, minimum_runtime_version)
-       VALUES (15, '0015_expand_only.sql', 14)`
+       VALUES ($1, $2, $3)`,
+      [compatibleVersion, `${compatibleVersion}_expand_only.sql`, REQUIRED_MIGRATION_STREAM_VERSIONS.relay]
     );
     await assert.doesNotReject(assertCompatibleSchema(pool));
 
     await pool.query(
       `INSERT INTO public.schema_migrations (version, name, minimum_runtime_version)
-       VALUES (16, '0016_contract.sql', 16)`
+       VALUES ($1, $2, $3)`,
+      [incompatibleVersion, `${incompatibleVersion}_contract.sql`, incompatibleVersion]
     );
 
     try {
       await assert.rejects(assertCompatibleSchema(pool), (error: unknown) => {
         assert.ok(error instanceof IncompatibleSchemaError);
-        assert.match(error.message, /relay schema version 16 requires runtime schema interface 16/);
+        assert.equal(
+          error.message,
+          `relay schema version ${incompatibleVersion} requires runtime schema interface ${incompatibleVersion}`
+        );
         assert.deepEqual(error.requiredVersions, REQUIRED_MIGRATION_STREAM_VERSIONS);
         return true;
       });
     } finally {
-      await pool.query('DELETE FROM public.schema_migrations WHERE version IN (15, 16)');
+      await pool.query('DELETE FROM public.schema_migrations WHERE version = ANY($1)', [
+        [compatibleVersion, incompatibleVersion]
+      ]);
     }
   });
 
@@ -451,11 +477,6 @@ if (connectionString) {
       issueWorkspaceInvitation(pool, memberAccess, { email: 'third@example.com' }),
       /Workspace owner access is required/
     );
-    await assert.rejects(
-      issueWorkspaceInvitation(pool, ownerAccess, { email: 'third@example.com' }),
-      /already has both Pilot members/
-    );
-
     const audit = await pool.query<{
       actor_user_id: string;
       actor_membership_id: string;
@@ -499,6 +520,19 @@ if (connectionString) {
     assert.doesNotMatch(
       JSON.stringify(audit.rows),
       new RegExp(`${invitation.token}|${replacementInvitation.token}`, 'i')
+    );
+
+    const thirdInvitation = await issueWorkspaceInvitation(pool, ownerAccess, {
+      email: 'third@example.com'
+    });
+    const fourthInvitation = await issueWorkspaceInvitation(pool, ownerAccess, {
+      email: 'fourth@example.com'
+    });
+    assert.equal(thirdInvitation.email, 'third@example.com');
+    assert.equal(fourthInvitation.email, 'fourth@example.com');
+    await assert.rejects(
+      issueWorkspaceInvitation(pool, ownerAccess, { email: 'third@example.com' }),
+      /already has an active invitation/
     );
   });
 
@@ -884,8 +918,14 @@ if (connectionString) {
     assert.equal(memberView.configuration, undefined);
 
     evidence = structuredClone(evidence);
-    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [];
-    const verified = await verifyLinkedRepository(pool, ownerAccess, gateway);
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = undefined;
+    evidence.branches[0]!.rulesets[0]!.updatedAt = '2026-08-26T19:00:00Z';
+    const verified = await verifyLinkedRepository(
+      pool,
+      ownerAccess,
+      gateway,
+      { confirmNoAppBypass: true }
+    );
     assert.equal(verified.readyForAutonomousWork, true);
     const executionRepository = await requireAutonomousLinkedRepository(
       pool,
@@ -904,6 +944,23 @@ if (connectionString) {
     });
 
     evidence = structuredClone(evidence);
+    evidence.branches[0]!.rulesets[0]!.updatedAt = '2026-08-26T20:00:00Z';
+    await assert.rejects(
+      requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
+      /verified Linked pilot repository is required/
+    );
+    assert.equal((await loadLinkedRepository(pool, ownerAccess)).readyForAutonomousWork, false);
+    assert.equal(
+      (await verifyLinkedRepository(
+        pool,
+        ownerAccess,
+        gateway,
+        { confirmNoAppBypass: true }
+      )).readyForAutonomousWork,
+      true
+    );
+
+    evidence = structuredClone(evidence);
     evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [17];
     await assert.rejects(
       requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
@@ -911,7 +968,7 @@ if (connectionString) {
     );
     assert.equal((await loadLinkedRepository(pool, ownerAccess)).readyForAutonomousWork, false);
     evidence = structuredClone(evidence);
-    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = [];
+    evidence.branches[0]!.rulesets[0]!.bypassActorAppIds = undefined;
     assert.equal(
       (await verifyLinkedRepository(pool, ownerAccess, gateway)).readyForAutonomousWork,
       true
@@ -948,7 +1005,7 @@ if (connectionString) {
     assert.equal(disabledVerification.linkState, 'linked');
     assert.equal(disabledVerification.githubConnectionState, 'disabled');
     assert.equal(disabledVerification.readyForAutonomousWork, false);
-    assert.equal(inspected.length, 6);
+    assert.equal(inspected.length, 8);
 
     const stored = await pool.query<{
       installation_id: string;
@@ -1512,6 +1569,165 @@ if (connectionString) {
     assert.equal(taskAfterIdleProgress.rows[0]?.count, taskBefore.rows[0]?.count);
   });
 
+  test('Channel Calls use one durable Jitsi room and retain participant history', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const ownerSignIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const ownerCookie = ownerSignIn.headers.get('set-cookie');
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, ownerAccess);
+
+    assert.equal(await loadActiveChannelCall(pool, ownerAccess, channel.channel.id), null);
+    const started = await startChannelCall(pool, ownerAccess, channel.channel.id);
+    assert.match(started.url, /^https:\/\/meet\.jit\.si\/relay-[a-f0-9]{32}$/);
+    assert.equal(started.startedBy.name, 'Relay Owner');
+    assert.equal(started.participants.length, 1);
+    assert.equal(started.canEnd, true);
+    assert.equal((await startChannelCall(pool, memberAccess, channel.channel.id)).id, started.id);
+
+    const joined = await joinChannelCall(pool, memberAccess, channel.channel.id);
+    assert.equal(joined.id, started.id);
+    assert.equal(joined.participants.length, 2);
+    assert.equal(joined.canEnd, false);
+    await assert.rejects(
+      endChannelCall(pool, memberAccess, channel.channel.id),
+      /Only the Call starter or a Workspace owner/
+    );
+
+    await endChannelCall(pool, ownerAccess, channel.channel.id);
+    assert.equal(await loadActiveChannelCall(pool, memberAccess, channel.channel.id), null);
+    const history = await pool.query<{
+      status: string;
+      participant_count: number;
+      notification_count: number;
+    }>(
+      `SELECT call.status,
+              count(DISTINCT participant.workspace_member_id)::integer AS participant_count,
+              count(DISTINCT outbox.id)::integer AS notification_count
+       FROM public.channel_call call
+       LEFT JOIN public.channel_call_participant participant ON participant.channel_call_id = call.id
+       LEFT JOIN public.notification_outbox outbox ON outbox.channel_call_id = call.id
+       WHERE call.id = $1
+       GROUP BY call.id`,
+      [started.id]
+    );
+    assert.deepEqual(history.rows[0], {
+      status: 'ended',
+      participant_count: 2,
+      notification_count: 3
+    });
+  });
+
+  test('Message redaction preserves threads and Workspace selection remains isolated', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const ownerSignIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({
+        email: 'owner@example.com',
+        password: 'correct horse battery staple'
+      })
+    }));
+    const ownerCookie = ownerSignIn.headers.get('set-cookie');
+    assert.ok(ownerCookie);
+    const ownerHeaders = new Headers({ cookie: ownerCookie.split(';', 1)[0] });
+    const ownerAccess = await authorizeWorkspaceRequest(pool, auth, ownerHeaders);
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, ownerAccess);
+    const root = await postChannelMessage(pool, ownerAccess, {
+      channelId: channel.channel.id,
+      body: 'A removable root with a durable thread.',
+      submissionId: 'deletion-root'
+    });
+    const reply = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      parentMessageId: root.id,
+      body: 'A removable reply.',
+      submissionId: 'deletion-reply'
+    });
+
+    await assert.rejects(
+      deleteChannelMessage(pool, memberAccess, root.id),
+      /Only the Message author or a Workspace owner/
+    );
+    await deleteChannelMessage(pool, memberAccess, reply.id);
+    await deleteChannelMessage(pool, ownerAccess, root.id);
+    const messageNotifications = await pool.query<{ message_id: string; notifications: number }>(
+      `SELECT message_id, count(*)::integer AS notifications
+       FROM public.notification_outbox
+       WHERE message_id = ANY($1::text[])
+       GROUP BY message_id ORDER BY message_id`,
+      [[root.id, reply.id]]
+    );
+    assert.deepEqual(messageNotifications.rows, [root.id, reply.id]
+      .sort()
+      .map((message_id) => ({ message_id, notifications: 2 })));
+    const redacted = await loadSharedAgentChannel(pool, ownerAccess);
+    assert.deepEqual(
+      redacted.messages
+        .filter(({ id }) => id === root.id || id === reply.id)
+        .map(({ id, parentMessageId, body, deletedAt }) => ({
+          id, parentMessageId, body, deleted: Boolean(deletedAt)
+        })),
+      [
+        { id: root.id, parentMessageId: null, body: 'Message deleted', deleted: true },
+        { id: reply.id, parentMessageId: root.id, body: 'Message deleted', deleted: true }
+      ]
+    );
+
+    const secondWorkspace = await createWorkspace(pool, ownerAccess, { name: 'Second Workspace' });
+    assert.equal((await loadAvailableWorkspaces(pool, ownerAccess)).length, 2);
+    await assert.rejects(
+      renameWorkspace(pool, memberAccess, ownerAccess.workspace.id, { name: 'Not allowed' }),
+      /Workspace owner access is required/
+    );
+    const renamedWorkspace = await renameWorkspace(pool, ownerAccess, secondWorkspace.id, {
+      name: 'Renamed Workspace'
+    });
+    assert.equal(renamedWorkspace.name, 'Renamed Workspace');
+    assert.equal(
+      (await loadAvailableWorkspaces(pool, ownerAccess)).find(({ id }) => id === secondWorkspace.id)?.name,
+      'Renamed Workspace'
+    );
+    const selectedHeaders = new Headers({
+      cookie: `${ownerCookie.split(';', 1)[0]}; relay_workspace_id=${secondWorkspace.id}`
+    });
+    const selectedAccess = await authorizeWorkspaceRequest(pool, auth, selectedHeaders);
+    assert.equal(selectedAccess.workspace.id, secondWorkspace.id);
+    assert.equal(selectedAccess.workspace.name, 'Renamed Workspace');
+    assert.equal((await loadSharedAgentChannel(pool, selectedAccess)).messages.length, 0);
+    await assert.rejects(
+      requireAvailableWorkspace(pool, memberAccess, secondWorkspace.id),
+      /Active Workspace membership is required/
+    );
+
+    const audit = await pool.query<{ event_type: string }>(
+      `SELECT event_type FROM public.audit_event
+       WHERE subject_id = ANY($1::text[]) ORDER BY id`,
+      [[root.id, reply.id, secondWorkspace.id]]
+    );
+    assert.deepEqual(audit.rows.map(({ event_type }) => event_type), [
+      'message.deleted',
+      'message.deleted',
+      'workspace.created',
+      'workspace.renamed'
+    ]);
+  });
+
   test('revocation immediately denies protected HTTP and realtime access', async () => {
     const auth = createTestAuth();
     const signInResponse = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
@@ -1617,6 +1833,26 @@ if (connectionString) {
         channelId: channel.channel.id
       });
     }
+
+    const typingUpdate = new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('typing update was not delivered')), 2_000);
+      memberWebsocket.once('message', (data) => {
+        clearTimeout(timeout);
+        resolve(data.toString());
+      });
+    });
+    websocket.send(JSON.stringify({
+      type: 'typing',
+      channelId: channel.channel.id,
+      active: true
+    }));
+    assert.deepEqual(JSON.parse(await typingUpdate), {
+      type: 'typing',
+      channelId: channel.channel.id,
+      memberId: channel.viewerWorkspaceMemberId,
+      memberName: channel.members.find(({ id }) => id === channel.viewerWorkspaceMemberId)?.name,
+      active: true
+    });
 
     const messageWake = new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Message wake-up was not delivered')), 2_000);

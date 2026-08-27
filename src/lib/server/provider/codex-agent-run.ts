@@ -30,6 +30,11 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
 
   async execute(input: AgentRunProviderInput, observer: AgentRunProviderObserver): Promise<void> {
     const session = this.createSession(this.binary);
+    const approvalPolicy = serializeApprovalPolicy(input.approvalPolicy);
+    const sandboxPolicy = serializeSandboxPolicy(input.sandboxPolicy);
+    const sandbox = input.sandboxPolicy.type === 'workspaceWrite'
+      ? 'workspace-write'
+      : 'read-only';
     let releaseNotifications!: () => void;
     const referencesPersisted = new Promise<void>((resolve) => { releaseNotifications = resolve; });
     let notificationChain = Promise.resolve();
@@ -135,8 +140,8 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
           ? { threadId: input.providerThreadId }
           : {
               cwd: input.workspaceDirectory,
-              approvalPolicy: input.approvalPolicy,
-              sandbox: 'workspaceWrite',
+              approvalPolicy,
+              sandbox,
               serviceName: 'relay-worker'
             }
       ));
@@ -151,8 +156,8 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
         threadId,
         input: [{ type: 'text', text: input.prompt }],
         cwd: input.workspaceDirectory,
-        approvalPolicy: input.approvalPolicy,
-        sandboxPolicy: input.sandboxPolicy
+        approvalPolicy,
+        sandboxPolicy
       }));
       const turnId = readId(asRecord(turnResult.turn), 'Codex turn');
       providerTurnId = turnId;
@@ -212,6 +217,34 @@ export class LocalCodexAgentRunProvider implements AgentRunProvider {
       session.close();
     }
   }
+}
+
+function serializeApprovalPolicy(
+  policy: AgentRunProviderInput['approvalPolicy']
+): 'on-request' {
+  if (policy !== 'onRequest') throw new Error('Unsupported Relay approval policy');
+  return 'on-request';
+}
+
+function serializeSandboxPolicy(
+  policy: AgentRunProviderInput['sandboxPolicy']
+):
+  | {
+      type: 'workspaceWrite';
+      writableRoots: string[];
+      networkAccess: false;
+      excludeTmpdirEnvVar: true;
+      excludeSlashTmp: true;
+    }
+  | { type: 'readOnly'; networkAccess: false } {
+  if (policy.type === 'readOnly') return policy;
+  return {
+    type: policy.type,
+    writableRoots: policy.writableRoots,
+    networkAccess: policy.networkAccess,
+    excludeTmpdirEnvVar: true,
+    excludeSlashTmp: true
+  };
 }
 
 function parseApprovalRequest(

@@ -2,10 +2,19 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import type { GitHubRepositoryGateway } from '../github/connection.js';
-import { evaluateRepositoryProtection } from '../github/protection.js';
+import {
+  evaluateRepositoryProtection,
+  type RepositoryProtectionResult
+} from '../github/protection.js';
 
 export type AgentMentionResult =
   | { status: 'accepted'; agentId: string; taskId: string; agentRunId: string }
+  | {
+      status: 'conversation';
+      agentId: string;
+      conversationTurnId: string;
+      turnStatus: 'queued' | 'working' | 'completed' | 'failed';
+    }
   | { status: 'rejected'; agentId: string; reason: string }
   | null;
 
@@ -187,10 +196,11 @@ export async function acceptEligibleAgentMention(
     installation_id: string;
     repository_id: string;
     release_branches: string[];
+    verification: RepositoryProtectionResult;
     connection_status: string;
   }>(
     `SELECT repository.id, connection.app_id, connection.installation_id,
-            repository.repository_id, repository.release_branches,
+            repository.repository_id, repository.release_branches, repository.verification,
             connection.status AS connection_status
      FROM public.linked_repository repository
      JOIN public.github_connection connection
@@ -240,7 +250,8 @@ export async function acceptEligibleAgentMention(
   }
   const repositoryProtection = evaluateRepositoryProtection(
     repositoryEvidence,
-    linkedRepository.release_branches
+    linkedRepository.release_branches,
+    linkedRepository.verification.bypassAttestations ?? []
   );
   await client.query(
     `UPDATE public.linked_repository

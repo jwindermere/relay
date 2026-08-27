@@ -40,6 +40,8 @@ services:
       RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID in .env}
       RELAY_GITHUB_PRIVATE_KEY_FILE: /run/secrets/github_private_key
       RELAY_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/github_webhook_secret
+      RELAY_JITSI_BASE_URL: ${RELAY_JITSI_BASE_URL:-https://meet.jit.si}
+      RELAY_JITSI_EMBED_ENABLED: ${RELAY_JITSI_EMBED_ENABLED:-false}
       HOST: 0.0.0.0
       PORT: 3000
     secrets:

@@ -25,8 +25,10 @@ and mount an off-host filesystem at `RELAY_BACKUP_DIRECTORY`. The database URL f
 must use the password in the PostgreSQL password file. Do not put a credential value
 in `.env`; Compose mounts each file only into its listed consumers.
 
-The TLS certificate must cover `RELAY_HOSTNAME`. Port 443 must be the only ingress
-allowed by the host firewall. Start the stack with:
+The TLS certificate must cover `RELAY_HOSTNAME`. Without the optional Jitsi deployment,
+port 443 must be the only ingress allowed by the host firewall. Self-hosted Calls add
+UDP 10000 and a dedicated hostname as described in [`jitsi/README.md`](jitsi/README.md).
+Start the stack with:
 
 For first-time bootstrap only:
 

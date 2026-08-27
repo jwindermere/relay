@@ -4,6 +4,7 @@ import {
   decideGitHubBrokerOperation,
   type GitHubBrokerDecision,
   type GitHubBrokerDecisionReason,
+  type GitHubFileMode,
   type GitHubBrokerRequest
 } from './broker-policy.js';
 
@@ -32,7 +33,12 @@ export interface GitHubBrokerRemote {
     request: GitHubBrokerRequest;
   }): Promise<{
     commitSha?: string;
-    files?: Array<{ path: string; content: string; encoding: 'base64' }>;
+    files?: Array<{
+      path: string;
+      content: string;
+      encoding: 'base64';
+      mode?: GitHubFileMode;
+    }>;
     pullRequestNumber?: number;
     pullRequestUrl?: string;
   }>;

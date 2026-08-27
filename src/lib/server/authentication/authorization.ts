@@ -3,6 +3,8 @@ import type { Pool, PoolClient } from 'pg';
 import type { RelayAuth } from '../auth.js';
 import { publishAccessRevoked } from './access-revocation.js';
 
+export const ACTIVE_WORKSPACE_COOKIE = 'relay_workspace_id';
+
 export interface WorkspaceAccess {
   identity: {
     userId: string;
@@ -66,6 +68,8 @@ export async function authorizeWorkspaceRequest(
   });
   if (!authenticated?.user.emailVerified) throw new WorkspaceAccessError();
 
+  const selectedWorkspaceId = readCookie(headers, ACTIVE_WORKSPACE_COOKIE);
+
   const result = await pool.query<{
     membership_id: string;
     workspace_id: string;
@@ -84,9 +88,9 @@ export async function authorizeWorkspaceRequest(
      FROM public.workspace_membership m
      JOIN public.workspace w ON w.id = m.workspace_id
      WHERE m.user_id = $1 AND m.revoked_at IS NULL
-     ORDER BY m.joined_at
+     ORDER BY (m.workspace_id = $2) DESC, m.joined_at, m.workspace_id
      LIMIT 1`,
-    [authenticated.user.id]
+    [authenticated.user.id, selectedWorkspaceId]
   );
   const row = result.rows[0];
   if (!row) throw new WorkspaceAccessError();
@@ -105,6 +109,21 @@ export async function authorizeWorkspaceRequest(
       joinedAt: row.joined_at
     }
   };
+}
+
+function readCookie(headers: Headers, name: string): string | null {
+  const cookie = headers.get('cookie');
+  if (!cookie) return null;
+  for (const entry of cookie.split(';')) {
+    const separator = entry.indexOf('=');
+    if (separator < 0 || entry.slice(0, separator).trim() !== name) continue;
+    try {
+      return decodeURIComponent(entry.slice(separator + 1).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 export async function revokeWorkspaceMembership(

@@ -15,6 +15,8 @@ import { verifyRealtimeTicket } from './realtime-ticket.js';
 
 interface RealtimeClient {
   headers: Headers;
+  memberId: string;
+  memberName: string;
   subscriptions: Set<string>;
   websocket: WebSocket;
   workspaceId: string;
@@ -56,7 +58,8 @@ export function attachAuthenticatedRealtime(
   server: HttpServer,
   pool: Pool,
   auth: RelayAuth,
-  ticketSecret: string
+  ticketSecret: string,
+  options: { ignoreUnknownUpgrades?: boolean } = {}
 ): WebSocketServer {
   const realtime = new WebSocketServer({ noServer: true });
   const clients = new Set<RealtimeClient>();
@@ -94,10 +97,31 @@ export function attachAuthenticatedRealtime(
     void wakeupsReady.then((unsubscribe) => unsubscribe());
   });
 
+  const broadcastTyping = (
+    sender: RealtimeClient,
+    channelId: string,
+    active: boolean
+  ) => {
+    const payload = JSON.stringify({
+      type: 'typing',
+      channelId,
+      memberId: sender.memberId,
+      memberName: sender.memberName,
+      active
+    });
+    for (const client of clients) {
+      if (client.websocket.readyState !== WebSocket.OPEN
+        || client.workspaceId !== sender.workspaceId
+        || client.memberId === sender.memberId
+        || !client.subscriptions.has(channelId)) continue;
+      client.websocket.send(payload);
+    }
+  };
+
   server.on('upgrade', async (request, socket, head) => {
     const url = new URL(request.url ?? '/', 'http://relay.local');
     if (url.pathname !== '/realtime') {
-      socket.destroy();
+      if (!options.ignoreUnknownUpgrades) socket.destroy();
       return;
     }
     if (!isSameOrigin(request)) {
@@ -117,6 +141,22 @@ export function attachAuthenticatedRealtime(
         rejectUpgrade(socket);
         return;
       }
+      const identity = await pool.query<{ member_id: string; member_name: string }>(
+        `SELECT member.id AS member_id, pilot_user.name AS member_name
+         FROM public.workspace_member member
+         JOIN public.workspace_membership membership
+           ON membership.id = member.pilot_membership_id
+         JOIN auth."user" pilot_user ON pilot_user.id = membership.user_id
+         WHERE member.workspace_id = $1
+           AND membership.id = $2
+           AND membership.revoked_at IS NULL`,
+        [access.workspace.id, access.membership.id]
+      );
+      const member = identity.rows[0];
+      if (!member) {
+        rejectUpgrade(socket);
+        return;
+      }
       realtime.handleUpgrade(request, socket, head, (websocket) => {
         realtime.emit('connection', websocket, request);
         const membershipKey = access.membership.id;
@@ -128,12 +168,17 @@ export function attachAuthenticatedRealtime(
         socketsBySession.set(access.identity.sessionId, sessionSockets);
         const client: RealtimeClient = {
           headers,
+          memberId: member.member_id,
+          memberName: member.member_name,
           subscriptions: new Set(),
           websocket,
           workspaceId: access.workspace.id
         };
         clients.add(client);
         websocket.once('close', () => {
+          for (const channelId of client.subscriptions) {
+            broadcastTyping(client, channelId, false);
+          }
           clients.delete(client);
           membershipSockets.delete(websocket);
           sessionSockets.delete(websocket);
@@ -144,21 +189,33 @@ export function attachAuthenticatedRealtime(
 
         websocket.on('message', async (data) => {
           try {
-            const message = JSON.parse(data.toString()) as { type?: unknown; channelId?: unknown };
-            if (message.type !== 'subscribe' || typeof message.channelId !== 'string') {
-              throw new Error('invalid realtime subscription');
+            const message = JSON.parse(data.toString()) as {
+              type?: unknown;
+              channelId?: unknown;
+              active?: unknown;
+            };
+            if (typeof message.channelId !== 'string') {
+              throw new Error('invalid realtime message');
             }
             const currentAccess = await authorizeWorkspaceRequest(pool, auth, headers);
-            if (!await hasActivePilotChannelAccess(
-              pool,
-              currentAccess,
-              message.channelId
-            )) throw new Error('Channel access is required');
-            client.subscriptions.add(message.channelId);
-            websocket.send(JSON.stringify({
-              type: 'subscribed',
-              channelId: message.channelId
-            }));
+            if (!await hasActivePilotChannelAccess(pool, currentAccess, message.channelId)) {
+              throw new Error('Channel access is required');
+            }
+            if (message.type === 'subscribe') {
+              client.subscriptions.add(message.channelId);
+              websocket.send(JSON.stringify({
+                type: 'subscribed',
+                channelId: message.channelId
+              }));
+            } else if (
+              message.type === 'typing'
+              && typeof message.active === 'boolean'
+              && client.subscriptions.has(message.channelId)
+            ) {
+              broadcastTyping(client, message.channelId, message.active);
+            } else {
+              throw new Error('invalid realtime message');
+            }
           } catch {
             websocket.close(1008, 'Workspace access revoked');
           }

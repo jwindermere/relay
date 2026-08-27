@@ -2,31 +2,43 @@
 
 ## Workspace
 
-The top-level collaboration, ownership, and authorization boundary. Projects, Channels, Agents, AgentRuns, Tasks, Artifacts, provider connections, approvals, and linked repositories belong to exactly one Workspace and may not cross its boundary. The MVP pilot operates one Workspace, but that operational constraint does not redefine the concept.
+The top-level collaboration, ownership, and authorization boundary. Projects, Channels, Agents, AgentRuns, Tasks, Artifacts, provider connections, approvals, and linked repositories belong to exactly one Workspace and may not cross its boundary. A User may participate in multiple Workspaces without weakening those boundaries.
 
-## MVP pilot workspace
+## Active Workspace
 
-The first real Relay workspace operated by the existing two-person business. It is the reference operating context for MVP decisions and validation, rather than a hypothetical generic startup or a multi-team organisation.
+The one Workspace selected by a User for the current Relay interaction. A User may hold active memberships in multiple Workspaces, but authorization, realtime subscriptions, navigation, and all collaboration data remain scoped to the Active Workspace.
+
+## Pilot workspace
+
+The first real Relay Workspace, operated by the existing business and any teammates its owner invites. It is the reference operating context for product decisions and validation, rather than a hypothetical generic organisation.
 
 ## Workspace member
 
 A Workspace-local participant identity used for authorship, mentions, Project membership, and attribution. Every Workspace member is exactly one of a Pilot member or an Agent; the shared identity does not imply shared authentication, configuration, permissions, or lifecycle.
 
-## MVP engineering agent
+## Engineering Agent
 
 The first specialised agent role in the MVP. It receives engineering requests, performs persistent work against a linked GitHub repository, and returns a reviewable artifact, initially expected to be a pull request.
 
-## Shared agent channel
+## Shared Agent Channel
 
-The MVP's primary collaboration surface: both pilot members can mention the MVP engineering agent, see concise execution status, and review its resulting artifact. It is not a separate task dashboard.
+The primary collaboration surface where Pilot members and specialist Agents communicate, see concise execution status, and review resulting Artifacts. It is not a separate task dashboard.
 
 ## Pilot member
 
-The human kind of Workspace member, linked to an authenticated human identity. Each of the two business collaborators has a separate account, membership, and attributable actions; the membership is distinct from the human's login identity.
+The human kind of Workspace member, linked to an authenticated human identity. Every invited collaborator has a separate account, membership, and attributable actions; the membership is distinct from the human's login identity.
 
 ## Agent
 
-The active or disabled agent kind of Workspace member, linked to its role, instructions, runtime configuration, and permissions. The MVP pilot has one Agent; disabling prevents new work without erasing its authorship or execution history.
+The active or disabled agent kind of Workspace member, linked to its configurable name, type, role, instructions, participation policy, runtime configuration, and permissions. A Workspace may have multiple specialist Agents. Disabling prevents new work without erasing authorship or execution history.
+
+## Ambient Agent participation
+
+An Agent's permission to consider an untagged Message when the Message matches its configured topics or concerns work it owns. Relay selects at most one relevant Agent, supplies recent authorized Channel context, and permits the Agent to remain silent. Ambient participation must not create uncontrolled Agent-to-Agent conversation.
+
+## Agent reply placement
+
+The Agent's configured choice of channel, Thread, or adaptive response placement. Adaptive placement responds to a channel-root Message in the Channel and keeps direct replies in their Thread.
 
 ## Project
 
@@ -34,7 +46,7 @@ A Workspace-owned context boundary for a goal, its participating members and Age
 
 ## Project membership
 
-The participation of one Workspace member in one Project. The MVP Project includes both Pilot members and the MVP engineering Agent; the Agent may be invoked only from a Channel linked to a Project where it is a member.
+The participation of one Workspace member in one Project. An Agent may be invoked or participate ambiently only from a Channel linked to a Project where it is a member.
 
 ## Channel
 
@@ -42,11 +54,31 @@ A Workspace-owned communication surface. A Channel may be linked to at most one 
 
 ## Message
 
-A communication posted by exactly one Workspace member in exactly one Channel, either as a channel root or a reply to a root in that Channel. A Message inherits Project context through its Channel; editing its text cannot create, retarget, or retract a Task already snapshotted from it.
+A communication posted by exactly one Workspace member in exactly one Channel, either as a channel root or a reply to a root in that Channel. A Message inherits Project context through its Channel; changing its visible text cannot create, retarget, or retract a Task already snapshotted from it.
+
+## Deleted Message
+
+A Message whose visible body has been redacted by its author or a Workspace owner. Its identity, authorship, place in a Thread, replies, and existing work provenance remain durable; deletion is not Task cancellation and does not erase collaboration history.
+
+## Call
+
+A durable Channel-associated coordination session backed by an external voice/video room. A Channel has at most one active Call; ending it preserves its history and allows another Call to begin. The Call starter or a Workspace owner may end it.
+
+## Call participant
+
+A Pilot member who requested to join a Call. Participation records Relay's durable join history, not authoritative presence in the external voice/video room.
 
 ## Accepted Agent mention
 
-An explicit Agent mention that passes the Agent, Project, provider, repository, and safety readiness checks and therefore creates a Task and initial AgentRun atomically. A Message whose mention fails readiness remains communication but creates no work.
+An explicit Agent mention that Relay accepts for either conversation or engineering delegation after the relevant Agent, Project, and provider readiness checks pass. A Message whose mention fails readiness remains communication but creates no work.
+
+## Agent conversation
+
+An explicit mention, continued reply, or relevant ambient Message accepted for ordinary discussion, explanation, or an underspecified request. It creates a durable conversational turn and, unless the Agent chooses silence during ambient consideration, an attributable reply Message. It creates no Task, AgentRun, repository branch, or Artifact. Recent authorized Channel Messages provide scoped memory, while a continued conversation also resumes its Provider thread.
+
+## Engineering delegation
+
+An Accepted Agent mention that requests a concrete repository outcome. It creates a Task and initial AgentRun atomically after repository and safety readiness checks also pass. Ambiguous intent remains conversational until a concrete outcome is established.
 
 ## Thread
 
@@ -112,10 +144,10 @@ An AgentRun that has posted a concise clarification request to the shared agent 
 
 An AgentRun stopped at an uncertain execution boundary that requires human review before it may resume from a known safe boundary.
 
-## Single-agent MVP
+## Multi-Agent collaboration
 
-The MVP validates only the shared MVP engineering agent. Additional specialist agents and agent-to-agent coordination are deferred until this single-agent collaboration loop is reliable.
+A Workspace may configure multiple named specialist Agents. Relay routes each Message to at most one conversational Agent and retains a single Engineering AgentRun assignee, preventing fan-out and uncontrolled social loops while preserving distinct Agent identities and specialties.
 
 ## MVP pilot success
 
-Both pilot members independently delegate real repository work through the shared agent channel; the MVP engineering agent completes at least one reviewable pull request; and its run remains understandable and recoverable through visible status, clarification, and a restart.
+Invited Pilot members can collaborate with configured Agents through the Shared Agent Channel; an Engineering Agent completes at least one reviewable pull request; and its run remains understandable and recoverable through visible status, clarification, and a restart.

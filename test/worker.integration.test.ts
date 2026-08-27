@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, afterEach, test } from 'node:test';
@@ -27,6 +27,7 @@ import {
   type ProviderReconciliation
 } from '../src/lib/server/provider/agent-run.js';
 import { processNextAgentRun } from '../src/worker/execution.js';
+import { processNextConversationTurn } from '../src/worker/conversation.js';
 
 let container: StartedPostgreSqlContainer | undefined;
 let connectionString = process.env.TEST_DATABASE_URL;
@@ -301,6 +302,128 @@ if (skipDatabaseTests) {
     assert.doesNotMatch(JSON.stringify(decisions.rows), /before|after|installation/);
   });
 
+  test('a mode-only executable change is published through the GitHub broker', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-mode-publication');
+    const operations: string[] = [];
+    const remote: GitHubBrokerRemote = {
+      async execute(input) {
+        operations.push(input.request.operation);
+        if (input.request.operation === 'clone') {
+          return {
+            commitSha: 'e'.repeat(40),
+            files: [{
+              path: 'script.sh',
+              content: Buffer.from('#!/bin/sh\n').toString('base64'),
+              encoding: 'base64',
+              mode: '100644'
+            }]
+          };
+        }
+        if (input.request.operation === 'create_branch') return { commitSha: 'e'.repeat(40) };
+        if (input.request.operation === 'commit') {
+          assert.deepEqual(input.request.files, [{
+            path: 'script.sh',
+            content: Buffer.from('#!/bin/sh\n').toString('base64'),
+            encoding: 'base64',
+            mode: '100755'
+          }]);
+          return { commitSha: 'f'.repeat(40) };
+        }
+        if (input.request.operation === 'update_branch') return { commitSha: 'f'.repeat(40) };
+        if (input.request.operation === 'pull_request_upsert') {
+          return {
+            commitSha: 'f'.repeat(40),
+            pullRequestNumber: 27,
+            pullRequestUrl: 'https://github.test/relay-owner/pilot/pull/27'
+          };
+        }
+        throw new Error('unexpected broker operation');
+      }
+    };
+    const provider = new FixtureProvider(async (input, observer) => {
+      await chmod(join(input.workspaceDirectory, 'script.sh'), 0o700);
+      await observer.threadStarted('thread-github-mode-publication');
+      await observer.turnStarted('turn-github-mode-publication');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-github-mode-publication:completed',
+        turn: { id: 'turn-github-mode-publication', status: 'completed' }
+      });
+    });
+
+    const result = await processNextAgentRun(pool, provider, {
+      workerId: 'worker-github-mode-publication',
+      workspaceRoot,
+      leaseDurationMs: 10_000,
+      githubWorkspaceBroker: new AgentRunGitHubWorkspaceBroker(pool, remote)
+    });
+
+    assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+    assert.deepEqual(operations, [
+      'clone', 'create_branch', 'commit', 'update_branch', 'pull_request_upsert'
+    ]);
+  });
+
+  test('a completed Provider turn without repository changes replies visibly once', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'github-no-changes');
+    const operations: string[] = [];
+    const remote: GitHubBrokerRemote = {
+      async execute(input) {
+        operations.push(input.request.operation);
+        if (input.request.operation === 'clone') {
+          return {
+            commitSha: '1'.repeat(40),
+            files: [{
+              path: 'README.md',
+              content: Buffer.from('unchanged\n').toString('base64'),
+              encoding: 'base64',
+              mode: '100644'
+            }]
+          };
+        }
+        if (input.request.operation === 'create_branch') return { commitSha: '1'.repeat(40) };
+        throw new Error('unexpected broker operation');
+      }
+    };
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-github-no-changes');
+      await observer.turnStarted('turn-github-no-changes');
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-github-no-changes:completed',
+        turn: { id: 'turn-github-no-changes', status: 'completed' }
+      });
+    });
+
+    const result = await processNextAgentRun(pool, provider, {
+      workerId: 'worker-github-no-changes',
+      workspaceRoot,
+      leaseDurationMs: 10_000,
+      githubWorkspaceBroker: new AgentRunGitHubWorkspaceBroker(pool, remote)
+    });
+
+    assert.deepEqual(result, { kind: 'executed', agentRunId: ids.runId, status: 'failed' });
+    assert.deepEqual(operations, ['clone', 'create_branch']);
+    const reply = await pool.query<{
+      author_workspace_member_id: string;
+      body: string;
+      notifications: number;
+    }>(
+      `SELECT message.author_workspace_member_id, message.body,
+              count(outbox.id)::integer AS notifications
+       FROM public.message message
+       LEFT JOIN public.notification_outbox outbox ON outbox.message_id = message.id
+       WHERE message.id = $1
+       GROUP BY message.id`,
+      [`agent-run-result:${ids.runId}`]
+    );
+    assert.deepEqual(reply.rows[0], {
+      author_workspace_member_id: ids.agentMemberId,
+      body: 'I finished checking the repository, but there were no changes to publish, so no pull request was created.',
+      notifications: 1
+    });
+  });
+
   test('a pull-request result is not exposed unless AgentRun completion is durable', async () => {
     const ids = await seedQueuedAgentRun(pool, 'github-finalization-failure');
     await pool.query(`
@@ -486,6 +609,190 @@ if (skipDatabaseTests) {
       [ids.runId]
     );
     assert.deepEqual(outbox.rows[0], { events: 7, outbox: 7 });
+  });
+
+  test('ordinary Agent conversation replies naturally and continues without another mention', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'conversation');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'completed', completed_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query("UPDATE public.task SET status = 'completed' WHERE id = $1", [
+      'task-conversation'
+    ]);
+    await pool.query("UPDATE public.agent SET status = 'idle' WHERE id = $1", [ids.agentId]);
+
+    const root = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex hello, how are you?',
+      submissionId: 'conversation-root'
+    });
+    assert.equal(root.agentMention?.status, 'conversation');
+    assert.equal(await countTasksForMessage(pool, root.id), 0);
+
+    const firstProvider = new FixtureProvider(async (input, observer) => {
+      assert.equal(input.providerThreadId, undefined);
+      assert.deepEqual(input.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+      assert.match(input.prompt, /@Alex hello, how are you\?/);
+      await observer.threadStarted('thread-conversation');
+      await observer.turnStarted('turn-conversation-1');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-1:message:completed',
+        item: { id: 'message-conversation-1', type: 'agentMessage', text: 'Doing well—how can I help?' }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-1:completed',
+        turn: { id: 'turn-conversation-1', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextConversationTurn(pool, firstProvider, {
+      workerId: 'worker-conversation-1', workspaceRoot, leaseDurationMs: 10_000
+    }), {
+      kind: 'conversation',
+      conversationTurnId: root.agentMention?.status === 'conversation'
+        ? root.agentMention.conversationTurnId
+        : '',
+      status: 'completed'
+    });
+
+    const followUp = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: root.id,
+      body: 'What can you help with?',
+      submissionId: 'conversation-follow-up'
+    });
+    assert.equal(followUp.agentMention?.status, 'conversation');
+    assert.equal(await countTasksForMessage(pool, followUp.id), 0);
+    const secondProvider = new FixtureProvider(async (input, observer) => {
+      assert.equal(input.providerThreadId, 'thread-conversation');
+      assert.match(input.prompt, /What can you help with\?/);
+      await observer.threadStarted('thread-conversation');
+      await observer.turnStarted('turn-conversation-2');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-2:message:completed',
+        item: {
+          id: 'message-conversation-2',
+          type: 'agentMessage',
+          text: 'I can discuss ideas or take on a concrete repository task.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-2:completed',
+        turn: { id: 'turn-conversation-2', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, secondProvider, {
+      workerId: 'worker-conversation-2', workspaceRoot, leaseDurationMs: 10_000
+    });
+
+    const replies = await pool.query<{
+      body: string;
+      author_workspace_member_id: string;
+      parent_message_id: string | null;
+    }>(
+      `SELECT body, author_workspace_member_id, parent_message_id FROM public.message
+       WHERE id = ANY($1::text[]) AND author_workspace_member_id = $2
+       ORDER BY created_at, id`,
+      [[
+        `conversation-result:${root.agentMention?.status === 'conversation' ? root.agentMention.conversationTurnId : ''}`,
+        `conversation-result:${followUp.agentMention?.status === 'conversation' ? followUp.agentMention.conversationTurnId : ''}`
+      ], ids.agentMemberId]
+    );
+    assert.deepEqual(replies.rows, [
+      {
+        body: 'Doing well—how can I help?',
+        author_workspace_member_id: ids.agentMemberId,
+        parent_message_id: null
+      },
+      {
+        body: 'I can discuss ideas or take on a concrete repository task.',
+        author_workspace_member_id: ids.agentMemberId,
+        parent_message_id: root.id
+      }
+    ]);
+    const broker = await pool.query<{ decisions: number }>(
+      `SELECT count(*)::integer AS decisions FROM public.github_broker_decision
+       WHERE requested_agent_run_id LIKE '%conversation%'`
+    );
+    assert.equal(broker.rows[0]?.decisions, 0);
+
+    const ambient = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: 'The repository bug may be related to our earlier discussion.',
+      submissionId: 'conversation-ambient'
+    });
+    assert.equal(ambient.agentMention?.status, 'conversation');
+    const ambientProvider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /You were not tagged/);
+      assert.match(input.prompt, /Doing well—how can I help\?/);
+      assert.match(input.prompt, /Recent authorized Channel context/);
+      await observer.threadStarted('thread-conversation-ambient');
+      await observer.turnStarted('turn-conversation-ambient');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-ambient:message:completed',
+        item: { id: 'message-conversation-ambient', type: 'agentMessage', text: '[RELAY_SILENT]' }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-ambient:completed',
+        turn: { id: 'turn-conversation-ambient', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextConversationTurn(pool, ambientProvider, {
+      workerId: 'worker-conversation-ambient', workspaceRoot, leaseDurationMs: 10_000
+    }), {
+      kind: 'conversation',
+      conversationTurnId: ambient.agentMention?.status === 'conversation'
+        ? ambient.agentMention.conversationTurnId
+        : '',
+      status: 'completed'
+    });
+    const ambientResponse = await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count FROM public.message WHERE id = $1`,
+      [`conversation-result:${ambient.agentMention?.status === 'conversation' ? ambient.agentMention.conversationTurnId : ''}`]
+    );
+    assert.equal(ambientResponse.rows[0]?.count, 0);
+
+    const interrupted = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      parentMessageId: root.id,
+      body: 'Tell me one more thing.',
+      submissionId: 'conversation-interrupted'
+    });
+    assert.equal(interrupted.agentMention?.status, 'conversation');
+    const interruptedTurnId = interrupted.agentMention?.status === 'conversation'
+      ? interrupted.agentMention.conversationTurnId
+      : '';
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'working', lease_owner = 'lost-worker', lease_token = 'lost-lease',
+           lease_expires_at = now() - interval '1 minute', started_at = now() - interval '2 minutes'
+       WHERE id = $1`,
+      [interruptedTurnId]
+    );
+    const providerMustNotReplay = new FixtureProvider(async () => {
+      assert.fail('an uncertain conversational turn must not be replayed');
+    });
+    assert.deepEqual(await processNextConversationTurn(pool, providerMustNotReplay, {
+      workerId: 'worker-conversation-recovery', workspaceRoot, leaseDurationMs: 10_000
+    }), {
+      kind: 'conversation', conversationTurnId: interruptedTurnId, status: 'failed'
+    });
+    const recoveryReply = await pool.query<{ body: string }>(
+      'SELECT body FROM public.message WHERE id = $1',
+      [`conversation-result:${interruptedTurnId}`]
+    );
+    assert.equal(
+      recoveryReply.rows[0]?.body,
+      'I lost the active response during a worker restart. Please send that message again.'
+    );
   });
 
   test('a Provider clarification waits visibly for durable Pilot input and continues the same turn', async () => {
@@ -1643,6 +1950,14 @@ async function insertQueuedEvent(pool: Pool, workspaceId: string, runId: string)
        ) FROM event`,
     [workspaceId, runId]
   );
+}
+
+async function countTasksForMessage(pool: Pool, messageId: string): Promise<number> {
+  const result = await pool.query<{ count: number }>(
+    'SELECT count(*)::integer AS count FROM public.task WHERE source_message_id = $1',
+    [messageId]
+  );
+  return result.rows[0]?.count ?? 0;
 }
 
 async function waitForRow<T>(

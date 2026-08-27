@@ -1,0 +1,12 @@
+# Merge this site block into ../Caddyfile after the Jitsi web service is attached to
+# Relay's edge network as `jitsi-web`. Caddy forwards WebSocket upgrades automatically.
+meet.hades.ws {
+	tls /run/secrets/tls_certificate /run/secrets/tls_private_key
+	encode zstd gzip
+	reverse_proxy jitsi-web:80
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+	}
+}
