@@ -15,8 +15,30 @@ interface ConversationContext {
 interface AgentCandidate {
   id: string;
   name: string;
+  agent_type: 'engineering' | 'research' | 'product' | 'support' | 'general';
+  role_label: string;
+  instructions: string;
+  participation_mode: 'reactive' | 'ambient';
+  ambient_triggers: string[];
+  reply_mode: 'adaptive' | 'channel' | 'thread';
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
+}
+
+function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean {
+  const normalized = trigger.trim().toLocaleLowerCase();
+  if (!normalized) return false;
+  if (/^[\p{L}\p{N}_-]+$/u.test(normalized)) {
+    const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}($|[^\\p{L}\\p{N}_-])`, 'u')
+      .test(normalizedBody);
+  }
+  return normalizedBody.includes(normalized);
+}
+
+export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
+  const normalizedBody = body.toLocaleLowerCase();
+  return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
 }
 
 export function isConcreteEngineeringRequest(body: string, agentName: string): boolean {
@@ -38,7 +60,8 @@ export async function acceptAgentConversation(
   context: ConversationContext
 ): Promise<AgentMentionResult> {
   const agents = await client.query<AgentCandidate>(
-    `SELECT id, name, enabled, status
+    `SELECT id, name, agent_type, role_label, instructions, participation_mode,
+            ambient_triggers, reply_mode, enabled, status
      FROM public.agent WHERE workspace_id = $1
      ORDER BY length(name) DESC, id`,
     [context.workspaceId]
@@ -49,17 +72,65 @@ export async function acceptAgentConversation(
   const rootMessageId = context.parentMessageId ?? context.messageId;
   const existing = context.parentMessageId
     ? await client.query<{ id: string; agent_id: string }>(
-        `SELECT id, agent_id FROM public.agent_conversation
-         WHERE workspace_id = $1 AND channel_id = $2 AND root_message_id = $3`,
+        `SELECT conversation.id, conversation.agent_id
+         FROM public.agent_conversation conversation
+         WHERE conversation.workspace_id = $1 AND conversation.channel_id = $2
+           AND (
+             conversation.root_message_id = $3
+             OR EXISTS (
+               SELECT 1 FROM public.agent_conversation_turn turn
+               WHERE turn.conversation_id = conversation.id
+                 AND turn.response_message_id = $3
+             )
+           )
+         ORDER BY conversation.updated_at DESC, conversation.id
+         LIMIT 1`,
         [context.workspaceId, context.channelId, rootMessageId]
       )
     : { rows: [] as Array<{ id: string; agent_id: string }> };
   const inherited = existing.rows[0]
     ? agents.rows.find(({ id }) => id === existing.rows[0]!.agent_id)
     : undefined;
-  const agent = mentioned ?? inherited;
+  let ambient = false;
+  let agent = mentioned ?? inherited;
+  if (!agent) {
+    const taskOwner = context.parentMessageId
+      ? await client.query<{ assigned_agent_id: string }>(
+          `SELECT task.assigned_agent_id
+           FROM public.task task
+           JOIN public.message source ON source.id = task.source_message_id
+           WHERE source.workspace_id = $1 AND source.channel_id = $2
+             AND COALESCE(source.parent_message_id, source.id) = $3
+           ORDER BY task.created_at DESC, task.id
+           LIMIT 1`,
+          [context.workspaceId, context.channelId, rootMessageId]
+        )
+      : { rows: [] as Array<{ assigned_agent_id: string }> };
+    const ambientCandidates = agents.rows.filter((candidate) =>
+      candidate.participation_mode === 'ambient'
+      && candidate.enabled
+      && candidate.status !== 'disabled'
+    );
+    agent = ambientCandidates.find((candidate) =>
+      candidate.id === taskOwner.rows[0]?.assigned_agent_id
+    ) ?? ambientCandidates
+      .map((candidate) => ({
+        candidate,
+        score: candidate.ambient_triggers.reduce(
+          (score, trigger) => score + (ambientTriggerMatches(context.body.toLocaleLowerCase(), trigger)
+            ? trigger.trim().length
+            : 0),
+          0
+        )
+      }))
+      .filter(({ score }) => score > 0)
+      .sort((left, right) => right.score - left.score || left.candidate.id.localeCompare(right.candidate.id))[0]
+      ?.candidate;
+    ambient = Boolean(agent);
+  }
   if (!agent) return null;
-  if (mentioned && isConcreteEngineeringRequest(context.body, agent.name)) return null;
+  if (mentioned && agent.agent_type === 'engineering'
+    && isConcreteEngineeringRequest(context.body, agent.name)) return null;
 
   const readiness = await client.query<{
     author_is_active_pilot: boolean;
@@ -103,6 +174,7 @@ export async function acceptAgentConversation(
             ? 'A ready Codex Provider connection is required before Agent conversation.'
             : undefined;
   if (rejection) {
+    if (ambient) return null;
     await client.query(
       `UPDATE public.message
        SET agent_mention_status = 'rejected', mentioned_agent_id = $2,
@@ -130,25 +202,36 @@ export async function acceptAgentConversation(
       ]
     );
   }
-  const storedConversation = await client.query<{ id: string }>(
+  const storedConversationId = existing.rows[0]?.id ?? (await client.query<{ id: string }>(
     `SELECT id FROM public.agent_conversation
      WHERE workspace_id = $1 AND root_message_id = $2 AND agent_id = $3`,
     [context.workspaceId, rootMessageId, agent.id]
-  );
-  const storedConversationId = storedConversation.rows[0]?.id;
+  )).rows[0]?.id;
   if (!storedConversationId) throw new Error('Agent conversation could not be created');
 
   const turnId = randomUUID();
+  const responsePlacement = agent.reply_mode === 'thread'
+    ? 'thread'
+    : agent.reply_mode === 'channel'
+      ? 'channel'
+      : context.parentMessageId ? 'thread' : 'channel';
+  const responseParentMessageId = responsePlacement === 'thread'
+    ? (context.parentMessageId ?? context.messageId)
+    : null;
   const turn = await client.query<{ id: string }>(
     `INSERT INTO public.agent_conversation_turn (
        id, workspace_id, conversation_id, request_message_id,
-       requested_by_workspace_member_id, status
+       requested_by_workspace_member_id, status, response_placement,
+       response_parent_message_id, ambient
      )
-     SELECT $1, $2, $3, message.id, message.author_workspace_member_id, 'queued'
+     SELECT $1, $2, $3, message.id, message.author_workspace_member_id, 'queued', $5, $6, $7
      FROM public.message message WHERE message.id = $4 AND message.workspace_id = $2
      ON CONFLICT (request_message_id) DO NOTHING
      RETURNING id`,
-    [turnId, context.workspaceId, storedConversationId, context.messageId]
+    [
+      turnId, context.workspaceId, storedConversationId, context.messageId,
+      responsePlacement, responseParentMessageId, ambient
+    ]
   );
   const storedTurnId = turn.rows[0]?.id ?? (await client.query<{ id: string }>(
     'SELECT id FROM public.agent_conversation_turn WHERE request_message_id = $1',

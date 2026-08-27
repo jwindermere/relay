@@ -112,16 +112,6 @@ export async function issueWorkspaceInvitation(
     );
     if (!workspace.rows[0]) throw new WorkspaceAccessError();
 
-    const members = await client.query<{ count: number }>(
-      `SELECT count(*)::integer AS count
-       FROM public.workspace_membership
-       WHERE workspace_id = $1 AND revoked_at IS NULL`,
-      [actor.workspace.id]
-    );
-    if ((members.rows[0]?.count ?? 0) >= 2) {
-      throw new WorkspaceInvitationError('Workspace already has both Pilot members');
-    }
-
     const existingMember = await client.query(
       `SELECT 1
        FROM public.workspace_membership m
@@ -137,13 +127,14 @@ export async function issueWorkspaceInvitation(
       `SELECT 1
        FROM public.workspace_invitation
        WHERE workspace_id = $1
+         AND email = $2
          AND accepted_at IS NULL
          AND revoked_at IS NULL
          AND expires_at > now()`,
-      [actor.workspace.id]
+      [actor.workspace.id, email]
     );
     if (pendingInvitation.rows[0]) {
-      throw new WorkspaceInvitationError('Workspace already has an active invitation');
+      throw new WorkspaceInvitationError('This email already has an active invitation');
     }
 
     await client.query(
@@ -276,16 +267,6 @@ export async function acceptWorkspaceInvitation(
     await client.query('SELECT id FROM public.workspace WHERE id = $1 FOR UPDATE', [
       pending.workspace_id
     ]);
-    const members = await client.query<{ count: number }>(
-      `SELECT count(*)::integer AS count
-       FROM public.workspace_membership
-       WHERE workspace_id = $1 AND revoked_at IS NULL`,
-      [pending.workspace_id]
-    );
-    if ((members.rows[0]?.count ?? 0) >= 2) {
-      throw new WorkspaceInvitationError('Workspace already has both Pilot members');
-    }
-
     const membership = await client.query<{
       id: string;
       user_id: string;

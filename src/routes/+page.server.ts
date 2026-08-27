@@ -11,8 +11,12 @@ import {
   loadSharedAgentChannel,
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
+import { loadWorkspaceAgents } from '$lib/server/collaboration/agents.js';
+import { loadActiveChannelCall } from '$lib/server/collaboration/calls.js';
+import { loadAvailableWorkspaces } from '$lib/server/collaboration/workspaces.js';
 import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliation.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
+import { isJitsiEmbeddingEnabled } from '$lib/server/configuration.js';
 import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 import { loadLinkedRepository } from '$lib/server/github/connection.js';
 import { loadProviderConnection } from '$lib/server/provider/connection.js';
@@ -25,24 +29,38 @@ export async function load({ request }) {
       getRelayAuth(),
       request.headers
     );
-    const [sharedChannel, providerConnection, linkedRepository] = await Promise.all([
+    const [sharedChannel, providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces] = await Promise.all([
       loadSharedAgentChannel(pool, access),
       loadProviderConnection(pool, access),
-      loadLinkedRepository(pool, access)
+      loadLinkedRepository(pool, access),
+      pool.query<{ name: string }>(
+        `SELECT name FROM auth."user" WHERE id = $1`,
+        [access.identity.userId]
+      ),
+      loadWorkspaceAgents(pool, access),
+      loadAvailableWorkspaces(pool, access)
+    ]);
+    const [reconciliation, activeCall] = await Promise.all([
+      loadChannelReconciliation(pool, access, sharedChannel.channel.id, {}),
+      loadActiveChannelCall(pool, access, sharedChannel.channel.id)
     ]);
     return {
       email: access.identity.email,
       role: access.membership.role,
+      currentUser: {
+        name: currentUserResult.rows[0]?.name ?? access.identity.email,
+        email: access.identity.email,
+        role: access.membership.role
+      },
       workspaceName: access.workspace.name,
       sharedChannel,
       providerConnection,
       linkedRepository,
-      reconciliation: await loadChannelReconciliation(
-        pool,
-        access,
-        sharedChannel.channel.id,
-        {}
-      ),
+      agentConfiguration,
+      workspaces,
+      reconciliation,
+      activeCall,
+      jitsiEmbeddingEnabled: isJitsiEmbeddingEnabled(),
       messageSubmissionId: randomUUID(),
       readyForAgentExecution:
         providerConnection.readyForExecution && linkedRepository.readyForAutonomousWork

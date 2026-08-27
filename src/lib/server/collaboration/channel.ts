@@ -31,6 +31,7 @@ export interface ChannelMessage {
   parentMessageId: string | null;
   body: string;
   createdAt: string;
+  deletedAt: string | null;
   author: {
     workspaceMemberId: string;
     kind: 'pilot' | 'agent';
@@ -43,6 +44,7 @@ export interface ChannelMessage {
 export interface SharedAgentChannel {
   workspace: WorkspaceAccess['workspace'];
   viewerMembershipId: string;
+  viewerWorkspaceMemberId: string;
   project: { id: string; name: string };
   channel: { id: string; name: string };
   members: SharedChannelMember[];
@@ -54,6 +56,7 @@ interface MessageRow {
   parent_message_id: string | null;
   body: string;
   created_at: Date;
+  deleted_at: Date | null;
   author_workspace_member_id: string;
   author_kind: 'pilot' | 'agent';
   author_name: string;
@@ -68,7 +71,7 @@ interface MessageRow {
 }
 
 const MESSAGE_PROJECTION = `
-  SELECT m.id, m.parent_message_id, m.body, m.created_at,
+  SELECT m.id, m.parent_message_id, m.body, m.created_at, m.deleted_at,
          author.id AS author_workspace_member_id, author.kind AS author_kind,
          COALESCE(pilot_user.name, agent.name) AS author_name,
          CASE WHEN author.kind = 'pilot' THEN 'Pilot member' ELSE agent.role_label END
@@ -93,6 +96,7 @@ function toChannelMessage(row: MessageRow): ChannelMessage {
     parentMessageId: row.parent_message_id,
     body: row.body,
     createdAt: row.created_at.toISOString(),
+    deletedAt: row.deleted_at?.toISOString() ?? null,
     author: {
       workspaceMemberId: row.author_workspace_member_id,
       kind: row.author_kind,
@@ -143,9 +147,11 @@ export async function loadSharedAgentChannel(
     project_name: string;
     channel_id: string;
     channel_name: string;
+    viewer_workspace_member_id: string;
   }>(
     `SELECT p.id AS project_id, p.name AS project_name,
-            c.id AS channel_id, c.name AS channel_name
+            c.id AS channel_id, c.name AS channel_name,
+            member.id AS viewer_workspace_member_id
      FROM public.project p
      JOIN public.channel c ON c.project_id = p.id AND c.workspace_id = p.workspace_id
      JOIN public.project_membership pm ON pm.project_id = p.id
@@ -196,6 +202,7 @@ export async function loadSharedAgentChannel(
   return {
     workspace: access.workspace,
     viewerMembershipId: access.membership.id,
+    viewerWorkspaceMemberId: selected.viewer_workspace_member_id,
     project: { id: selected.project_id, name: selected.project_name },
     channel: { id: selected.channel_id, name: selected.channel_name },
     members: members.rows.map((member) => ({

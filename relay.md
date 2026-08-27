@@ -447,7 +447,7 @@ Do not intervene for:
 - resolved questions
 ```
 
-Ambient behaviour is **not required for the initial MVP**, but the architecture should avoid making it impossible.
+Ambient behaviour is available per Agent through explicit topic cues and work ownership. A relevance check lets the selected Agent remain silent, and routing must prevent uncontrolled Agent-to-Agent loops.
 
 ---
 
@@ -1354,7 +1354,7 @@ Do not initially build:
 * enterprise administration
 * custom WebRTC infrastructure
 * voice AI agents
-* autonomous agents responding everywhere
+* unrestricted agents responding to every message
 * elaborate workflow builder
 * plugin marketplace
 * dozens of predefined agents
@@ -1422,7 +1422,7 @@ Capabilities:
 
 ---
 
-The system should also eventually support custom agents.
+The system supports named custom specialist agents with configurable roles, instructions, participation policies, and reply placement.
 
 ---
 
@@ -1521,7 +1521,7 @@ If the architecture cannot support this journey cleanly, reconsider it.
 
 # 36. Second Validation Journey — Coordination
 
-After the single-agent journey works, validate cross-agent coordination.
+After each single-Agent work journey is reliable, validate bounded cross-Agent coordination.
 
 Example:
 
@@ -1553,7 +1553,7 @@ Alex has prepared an OAuth fix.
 Ada has attached the funnel analysis.
 ```
 
-This should be considered a later milestone than reliable single-agent execution.
+This should remain later than reliable execution by each individually assigned Agent.
 
 ---
 

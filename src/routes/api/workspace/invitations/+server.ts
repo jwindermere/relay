@@ -25,6 +25,7 @@ export async function POST({ request }) {
         id: invitation.id,
         email: invitation.email,
         expiresAt: invitation.expiresAt,
+        invitationPath: `/join/${invitation.token}`,
         registrationPath: `/api/workspace/invitations/${invitation.token}/register`,
         acceptancePath: `/api/workspace/invitations/${invitation.token}/accept`
       }

@@ -691,17 +691,29 @@ if (skipDatabaseTests) {
       workerId: 'worker-conversation-2', workspaceRoot, leaseDurationMs: 10_000
     });
 
-    const replies = await pool.query<{ body: string; author_workspace_member_id: string }>(
-      `SELECT body, author_workspace_member_id FROM public.message
-       WHERE parent_message_id = $1 AND author_workspace_member_id = $2
+    const replies = await pool.query<{
+      body: string;
+      author_workspace_member_id: string;
+      parent_message_id: string | null;
+    }>(
+      `SELECT body, author_workspace_member_id, parent_message_id FROM public.message
+       WHERE id = ANY($1::text[]) AND author_workspace_member_id = $2
        ORDER BY created_at, id`,
-      [root.id, ids.agentMemberId]
+      [[
+        `conversation-result:${root.agentMention?.status === 'conversation' ? root.agentMention.conversationTurnId : ''}`,
+        `conversation-result:${followUp.agentMention?.status === 'conversation' ? followUp.agentMention.conversationTurnId : ''}`
+      ], ids.agentMemberId]
     );
     assert.deepEqual(replies.rows, [
-      { body: 'Doing well—how can I help?', author_workspace_member_id: ids.agentMemberId },
+      {
+        body: 'Doing well—how can I help?',
+        author_workspace_member_id: ids.agentMemberId,
+        parent_message_id: null
+      },
       {
         body: 'I can discuss ideas or take on a concrete repository task.',
-        author_workspace_member_id: ids.agentMemberId
+        author_workspace_member_id: ids.agentMemberId,
+        parent_message_id: root.id
       }
     ]);
     const broker = await pool.query<{ decisions: number }>(
@@ -709,6 +721,44 @@ if (skipDatabaseTests) {
        WHERE requested_agent_run_id LIKE '%conversation%'`
     );
     assert.equal(broker.rows[0]?.decisions, 0);
+
+    const ambient = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: 'The repository bug may be related to our earlier discussion.',
+      submissionId: 'conversation-ambient'
+    });
+    assert.equal(ambient.agentMention?.status, 'conversation');
+    const ambientProvider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /You were not tagged/);
+      assert.match(input.prompt, /Doing well—how can I help\?/);
+      assert.match(input.prompt, /Recent authorized Channel context/);
+      await observer.threadStarted('thread-conversation-ambient');
+      await observer.turnStarted('turn-conversation-ambient');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-ambient:message:completed',
+        item: { id: 'message-conversation-ambient', type: 'agentMessage', text: '[RELAY_SILENT]' }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-ambient:completed',
+        turn: { id: 'turn-conversation-ambient', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextConversationTurn(pool, ambientProvider, {
+      workerId: 'worker-conversation-ambient', workspaceRoot, leaseDurationMs: 10_000
+    }), {
+      kind: 'conversation',
+      conversationTurnId: ambient.agentMention?.status === 'conversation'
+        ? ambient.agentMention.conversationTurnId
+        : '',
+      status: 'completed'
+    });
+    const ambientResponse = await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count FROM public.message WHERE id = $1`,
+      [`conversation-result:${ambient.agentMention?.status === 'conversation' ? ambient.agentMention.conversationTurnId : ''}`]
+    );
+    assert.equal(ambientResponse.rows[0]?.count, 0);
 
     const interrupted = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
