@@ -10,6 +10,11 @@ import { handleWaitingAgentRunReply } from './clarifications.js';
 import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
 import { acceptAgentConversation } from './conversation.js';
 import { answerAgentProgressRequest } from './progress.js';
+import { acceptAgentRunSteering } from './steering.js';
+import {
+  classifyMessageIntent,
+  type MessageRoutingDecision
+} from './message-intent.js';
 
 export class ChannelMessageError extends Error {
   constructor(message: string) {
@@ -39,6 +44,7 @@ export interface ChannelMessage {
     roleLabel: string;
   };
   agentMention: AgentMentionResult;
+  routingDecision: MessageRoutingDecision | null;
 }
 
 export interface SharedAgentChannel {
@@ -68,6 +74,14 @@ interface MessageRow {
   agent_run_id: string | null;
   conversation_turn_id: string | null;
   conversation_turn_status: 'queued' | 'working' | 'completed' | 'failed' | null;
+  selected_intent: MessageRoutingDecision['intent'] | null;
+  corrected_intent: MessageRoutingDecision['intent'] | null;
+  routing_target_agent_id: string | null;
+  corrected_target_agent_id: string | null;
+  routing_confidence: string | null;
+  routing_policy_version: string | null;
+  routing_rationale: string | null;
+  routing_corrected_at: Date | null;
 }
 
 const MESSAGE_PROJECTION = `
@@ -79,7 +93,14 @@ const MESSAGE_PROJECTION = `
          m.agent_mention_status, m.mentioned_agent_id, m.agent_mention_reason,
          task.id AS task_id, run.id AS agent_run_id,
          conversation_turn.id AS conversation_turn_id,
-         conversation_turn.status AS conversation_turn_status
+         conversation_turn.status AS conversation_turn_status,
+         decision.selected_intent, decision.corrected_intent,
+         decision.target_agent_id AS routing_target_agent_id,
+         decision.corrected_target_agent_id,
+         decision.confidence AS routing_confidence,
+         decision.policy_version AS routing_policy_version,
+         decision.rationale AS routing_rationale,
+         decision.corrected_at AS routing_corrected_at
   FROM public.message m
   JOIN public.workspace_member author ON author.id = m.author_workspace_member_id
   LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
@@ -88,7 +109,8 @@ const MESSAGE_PROJECTION = `
   LEFT JOIN public.task task ON task.source_message_id = m.id
   LEFT JOIN public.agent_run run ON run.task_id = task.id AND run.attempt_number = 1
   LEFT JOIN public.agent_conversation_turn conversation_turn
-    ON conversation_turn.request_message_id = m.id`;
+    ON conversation_turn.request_message_id = m.id
+  LEFT JOIN public.message_intent_decision decision ON decision.message_id = m.id`;
 
 function toChannelMessage(row: MessageRow): ChannelMessage {
   return {
@@ -103,6 +125,16 @@ function toChannelMessage(row: MessageRow): ChannelMessage {
       name: row.author_name,
       roleLabel: row.author_role_label
     },
+    routingDecision: row.selected_intent ? {
+      intent: row.corrected_intent ?? row.selected_intent,
+      targetAgentId: row.routing_corrected_at
+        ? row.corrected_target_agent_id
+        : row.routing_target_agent_id,
+      confidence: Number(row.routing_confidence),
+      policyVersion: row.routing_policy_version!,
+      rationale: row.routing_rationale!,
+      correctedAt: row.routing_corrected_at?.toISOString() ?? null
+    } : null,
     agentMention: row.agent_mention_status === 'accepted'
       ? {
           status: 'accepted',
@@ -310,14 +342,28 @@ export async function postChannelMessage(
          ) VALUES ($1, $2, 'channel.message', $3)`,
         [access.workspace.id, messageId, { messageId }]
       );
-      const agentProgressAnswered = await answerAgentProgressRequest(client, {
+      await classifyMessageIntent(client, {
         messageId,
         workspaceId: access.workspace.id,
         channelId: input.channelId,
         parentMessageId,
         body
       });
-      const agentRunCommandHandled = !agentProgressAnswered && parentMessageId
+      const steeringAccepted = await acceptAgentRunSteering(client, {
+        messageId,
+        workspaceId: access.workspace.id,
+        channelId: input.channelId,
+        parentMessageId,
+        body
+      });
+      const agentProgressAnswered = !steeringAccepted && await answerAgentProgressRequest(client, {
+        messageId,
+        workspaceId: access.workspace.id,
+        channelId: input.channelId,
+        parentMessageId,
+        body
+      });
+      const agentRunCommandHandled = !steeringAccepted && !agentProgressAnswered && parentMessageId
         ? await handleAgentRunCommand(client, {
             messageId,
             workspaceId: access.workspace.id,
@@ -326,7 +372,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      const approvalAnswered = !agentProgressAnswered && !agentRunCommandHandled && parentMessageId
+      const approvalAnswered = !steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled && parentMessageId
         ? await handleApprovalReply(client, {
             messageId,
             workspaceId: access.workspace.id,
@@ -335,7 +381,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      const waitingAgentRunReply = !agentProgressAnswered && !agentRunCommandHandled
+      const waitingAgentRunReply = !steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
         && !approvalAnswered && parentMessageId
         ? await handleWaitingAgentRunReply(client, {
             messageId,
@@ -345,7 +391,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      if (!agentProgressAnswered && !agentRunCommandHandled
+      if (!steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
         && !approvalAnswered && !waitingAgentRunReply) {
         const conversation = await acceptAgentConversation(client, {
           messageId,

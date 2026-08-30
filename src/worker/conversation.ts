@@ -10,10 +10,21 @@ import {
 } from '../lib/server/provider/agent-run.js';
 import { acceptAgentConversation } from '../lib/server/collaboration/conversation.js';
 import { enqueueAgentHandoffStatus } from '../lib/server/collaboration/handoffs.js';
+import {
+  activateNextCoordinationStep,
+  completeCoordinationStep,
+  parseCoordinationPlanProposal,
+  proposeCoordinationPlan
+} from '../lib/server/collaboration/coordination.js';
+import {
+  createFindingFromAgentResult,
+  parseFindingResult
+} from '../lib/server/collaboration/findings.js';
 
 interface ClaimedConversationTurn {
   id: string;
   workspace_id: string;
+  project_id: string;
   conversation_id: string;
   request_body: string;
   root_message_id: string;
@@ -32,6 +43,7 @@ interface ClaimedConversationTurn {
   credential_store_reference: string;
   lease_token: string;
   recovering: boolean;
+  routing_intent: string | null;
 }
 
 export type ConversationWorkerResult =
@@ -44,6 +56,7 @@ export async function processNextConversationTurn(
   options: { workerId: string; workspaceRoot: string; leaseDurationMs?: number }
 ): Promise<ConversationWorkerResult> {
   const leaseDurationMs = options.leaseDurationMs ?? 30_000;
+  await activateNextCoordinationStep(pool);
   const claim = await claimNextConversationTurn(
     pool,
     options.workerId,
@@ -94,6 +107,12 @@ export async function processNextConversationTurn(
         claim.handoff_depth === 1
           ? 'This is a bounded Agent handoff. Answer the requested input directly and do not @mention another Agent.'
           : 'Do not start social or open-ended agent-to-agent chatter.',
+        claim.routing_intent === 'coordination_candidate' && claim.handoff_depth === 0
+          ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Do not start plan work; a Pilot member must approve it.'
+          : '',
+        claim.agent_type === 'research'
+          ? 'Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'
+          : '',
         'Do not repeat an answer already present in the recent context.',
         'Do not inspect files, run commands, modify a repository, or use tools.',
         'If the request is ambiguous, ask a concise conversational follow-up question.',
@@ -176,7 +195,7 @@ async function claimNextConversationTurn(
     const candidate = await client.query<Omit<ClaimedConversationTurn, 'lease_token'> & {
       provider_connection_id: string;
     }>(
-      `SELECT turn.id, turn.workspace_id, turn.conversation_id,
+      `SELECT turn.id, turn.workspace_id, channel.project_id, turn.conversation_id,
               request.body AS request_body, conversation.root_message_id,
               conversation.channel_id, conversation.agent_id,
               agent_member.id AS agent_member_id, agent.name AS agent_name,
@@ -199,12 +218,15 @@ async function claimNextConversationTurn(
                   AND collaborator.enabled = true AND collaborator.status <> 'disabled'
               ), '') AS collaborator_roster,
               turn.response_parent_message_id, turn.ambient, turn.handoff_depth,
+              COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
               connection.credential_store_reference,
               (turn.lease_expires_at IS NOT NULL AND turn.lease_expires_at <= $1) AS recovering
        FROM public.agent_conversation_turn turn
        JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
        JOIN public.message request ON request.id = turn.request_message_id
+       JOIN public.channel channel ON channel.id = request.channel_id
+       LEFT JOIN public.message_intent_decision decision ON decision.message_id = request.id
        JOIN public.provider_connection connection
          ON connection.id = conversation.provider_connection_id AND connection.status = 'ready'
        JOIN public.workspace_member agent_member
@@ -363,11 +385,21 @@ async function finishConversationTurn(
   status: 'completed' | 'failed',
   errorCode: string | null
 ): Promise<void> {
+  let proposal: ReturnType<typeof parseCoordinationPlanProposal> = null;
+  let findingResult: ReturnType<typeof parseFindingResult> = null;
+  if (body !== null && status === 'completed' && claim.routing_intent === 'coordination_candidate'
+    && claim.handoff_depth === 0) {
+    try { proposal = parseCoordinationPlanProposal(body); } catch { proposal = null; }
+  }
+  if (body !== null && status === 'completed' && claim.agent_type === 'research') {
+    try { findingResult = parseFindingResult(body); } catch { findingResult = null; }
+  }
+  const visibleBody = proposal?.message || findingResult?.message || body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const messageId = body === null ? null : `conversation-result:${claim.id}`;
-    if (body !== null && messageId) {
+    const messageId = visibleBody === null ? null : `conversation-result:${claim.id}`;
+    if (visibleBody !== null && messageId) {
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO public.message (
            id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
@@ -385,7 +417,7 @@ async function finishConversationTurn(
           claim.channel_id,
           claim.agent_member_id,
           claim.response_parent_message_id,
-          body,
+          visibleBody,
           claim.id,
           claim.lease_token
         ]
@@ -420,7 +452,7 @@ async function finishConversationTurn(
         {
           kind: status,
           resultMessageId: messageId,
-          body,
+          body: visibleBody,
           errorCode
         }
       ]
@@ -433,17 +465,42 @@ async function finishConversationTurn(
         status
       );
     }
-    if (status === 'completed' && body !== null && messageId) {
+    await completeCoordinationStep(client, {
+      workspaceId: claim.workspace_id,
+      conversationTurnId: claim.id,
+      status,
+      resultMessageId: messageId
+    });
+    if (status === 'completed' && visibleBody !== null && messageId) {
       await acceptAgentConversation(client, {
         messageId,
         workspaceId: claim.workspace_id,
         channelId: claim.channel_id,
         parentMessageId: claim.response_parent_message_id,
-        body
+        body: visibleBody
       });
     }
     await restoreAgentStatus(client, claim.agent_id);
     await client.query('COMMIT');
+    if (proposal && messageId) {
+      await proposeCoordinationPlan(pool, {
+        ...proposal.plan,
+        workspaceId: claim.workspace_id,
+        projectId: claim.project_id,
+        coordinatingAgentId: claim.agent_id,
+        sourceMessageId: messageId
+      }).catch(() => undefined);
+    }
+    if (findingResult && messageId) {
+      await createFindingFromAgentResult(pool, {
+        ...findingResult.finding,
+        workspaceId: claim.workspace_id,
+        projectId: claim.project_id,
+        authorAgentId: claim.agent_id,
+        resultMessageId: messageId,
+        ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
+      }).catch(() => undefined);
+    }
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
@@ -456,7 +513,8 @@ async function loadConversationMemory(
   pool: Pool,
   claim: Pick<ClaimedConversationTurn, 'workspace_id' | 'channel_id' | 'id'>
 ): Promise<string> {
-  const messages = await pool.query<{ author_name: string; body: string }>(
+  const [messages, projectMemory] = await Promise.all([
+    pool.query<{ author_name: string; body: string }>(
     `SELECT memory.author_name, memory.body
      FROM (
        SELECT COALESCE(pilot_user.name, agent.name) AS author_name, message.body,
@@ -475,12 +533,27 @@ async function loadConversationMemory(
        LIMIT 30
      ) memory
      ORDER BY memory.created_at, memory.id`,
-    [claim.id, claim.workspace_id, claim.channel_id]
-  );
+      [claim.id, claim.workspace_id, claim.channel_id]
+    ),
+    pool.query<{ memory_type: string; statement: string }>(
+      `SELECT memory.memory_type, memory.statement
+       FROM public.project_memory memory
+       JOIN public.channel channel ON channel.project_id = memory.project_id
+       WHERE channel.id = $1 AND memory.workspace_id = $2 AND memory.lifecycle = 'active'
+       ORDER BY memory.created_at DESC, memory.id DESC LIMIT 20`,
+      [claim.channel_id, claim.workspace_id]
+    )
+  ]);
   const rendered = messages.rows
     .map(({ author_name, body }) => `${author_name}: ${body.slice(0, 1200)}`)
     .join('\n');
-  return rendered.slice(-12_000) || '(No earlier Channel messages.)';
+  const durable = projectMemory.rows.reverse()
+    .map(({ memory_type, statement }) => `[${memory_type}] ${statement.slice(0, 1000)}`)
+    .join('\n');
+  return [
+    rendered.slice(-12_000) || '(No earlier Channel messages.)',
+    durable ? `\nActive authorised Project memory:\n${durable}` : ''
+  ].filter(Boolean).join('\n').slice(-16_000);
 }
 
 async function restoreAgentStatus(client: PoolClient, agentId: string): Promise<void> {

@@ -49,6 +49,7 @@
   let agentTopics = $state('');
   let agentReplyMode = $state<'adaptive' | 'channel' | 'thread'>('adaptive');
   let agentEnabled = $state(true);
+  let agentTemplateKey = $state('');
   let newWorkspaceName = $state('');
   let workspaceBusy = $state(false);
   let workspaceMessage = $state('');
@@ -58,6 +59,7 @@
   let realtimeRuns = $state<VisibleAgentRuns>({});
   let realtimeMessages = $state<typeof data.sharedChannel.messages>([]);
   let realtimeHandoffs = $state<typeof data.reconciliation.handoffs>([]);
+  let realtimeAccountability = $state<typeof data.accountability | null>(null);
   let activeCall = $state<typeof data.activeCall>(null);
   let callBusy = $state(false);
   let callMessage = $state('');
@@ -71,6 +73,13 @@
   let humanTypers = $state<Record<string, { name: string; expiresAt: number }>>({});
   let githubConfiguration = $derived(data.linkedRepository.configuration);
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
+  let accountability = $derived(realtimeAccountability ?? data.accountability);
+  let selectedAgentTemplate = $derived(
+    data.agentTemplates.find((template) => template.key === agentTemplateKey)
+  );
+  let selectedTemplateOverlap = $derived(selectedAgentTemplate?.ambientTriggers.find((topic) =>
+    data.agentConfiguration.agents.some((agent) => agent.ambientTriggers.includes(topic))
+  ));
   let agentHandoffs = $derived(
     realtimeHandoffs.length > 0 ? realtimeHandoffs : data.reconciliation.handoffs
   );
@@ -103,6 +112,7 @@
 
   $effect(() => {
     activeCall = data.activeCall;
+    realtimeAccountability = data.accountability;
   });
 
   function repliesFor(rootId: string) {
@@ -111,6 +121,14 @@
 
   function handoffForSource(sourceMessageId: string) {
     return agentHandoffs.find((handoff) => handoff.sourceMessageId === sourceMessageId);
+  }
+
+  function planForSource(sourceMessageId: string) {
+    return accountability.plans.find((plan) => plan.sourceMessageId === sourceMessageId);
+  }
+
+  function steeringForSource(sourceMessageId: string) {
+    return accountability.steering.find((steering) => steering.sourceMessageId === sourceMessageId);
   }
 
   function initials(name: string) {
@@ -415,6 +433,10 @@
         realtimeMessages = mergeChannelMessages(realtimeMessages, update.messages);
         realtimeRuns = applyChannelReconciliation(agentRuns, update);
         realtimeHandoffs = update.handoffs;
+        const accountabilityResponse = await fetch(
+          `/api/workspace/accountability?projectId=${encodeURIComponent(data.sharedChannel.project.id)}`
+        );
+        if (accountabilityResponse.ok) realtimeAccountability = await accountabilityResponse.json();
         await refreshActiveCall();
       }
     })().catch(() => {
@@ -708,6 +730,30 @@
     }
   }
 
+  async function instantiateTemplate() {
+    if (!selectedAgentTemplate) return;
+    agentBusy = true;
+    agentMessage = '';
+    try {
+      const response = await fetch('/api/workspace/agent-templates', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: selectedAgentTemplate.key, availableCapabilities: [] })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message ?? 'Agent template could not be instantiated');
+      agentMessage = result.disabledCapabilities.length > 0
+        ? `Agent added with unavailable capabilities disabled: ${result.disabledCapabilities.join(', ')}.`
+        : 'Agent added from template.';
+      agentTemplateKey = '';
+      await invalidateAll();
+    } catch (error) {
+      agentMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      agentBusy = false;
+    }
+  }
+
   async function deleteMessage(message: (typeof data.sharedChannel.messages)[number]) {
     if (!canDeleteMessage(message)) return;
     if (!window.confirm('Delete this message? Replies and work history will be preserved.')) return;
@@ -734,6 +780,20 @@
       return;
     }
     await requestReconciliation();
+  }
+
+  async function decidePlan(planId: string, action: 'approve' | 'reject' | 'pause' | 'cancel') {
+    const response = await fetch(`/api/workspace/coordination/${encodeURIComponent(planId)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action })
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      window.alert(result.message ?? 'Coordination plan could not be updated');
+      return;
+    }
+    await invalidateAll();
   }
 
   async function switchWorkspace(workspaceId: string) {
@@ -812,6 +872,15 @@
 
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
   {@const handoff = handoffForSource(message.id)}
+  {@const plan = planForSource(message.id)}
+  {@const steering = steeringForSource(message.id)}
+  {#if message.routingDecision}
+    <p class="mt-2 flex flex-wrap items-center gap-2 text-xs text-base-content/55">
+      <span class="badge badge-ghost badge-xs">{message.routingDecision.intent.replaceAll('_', ' ')}</span>
+      <span>{Math.round(message.routingDecision.confidence * 100)}% · {message.routingDecision.rationale}</span>
+      {#if message.routingDecision.correctedAt}<span class="text-info">Pilot corrected</span>{/if}
+    </p>
+  {/if}
   {#if message.agentMention?.status === 'accepted'}
     {@const run = latestVisibleAgentRunForSource(agentRuns, message.id)}
     <p class="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-success" role="status">
@@ -865,6 +934,39 @@
         {/if}
       </div>
       <p class="mt-1 text-base-content/55">{handoff.question}</p>
+    </div>
+  {/if}
+  {#if steering}
+    <p class="mt-2 text-xs text-info" role="status">
+      Steering {steering.status}: {steering.guidance}
+    </p>
+  {/if}
+  {#if plan}
+    <div class="mt-3 border border-primary/25 bg-primary/5 p-3 text-xs" role="status">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="badge badge-sm badge-primary">Plan · {plan.status}</span>
+        <strong>{plan.goal}</strong>
+      </div>
+      <p class="mt-1 text-base-content/55">
+        {plan.steps.length} steps · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs · depth {plan.budget.maxDepth}
+        · provider usage {plan.budget.providerUsage.known ? plan.budget.providerUsage.consumed : 'unknown'}
+      </p>
+      <ol class="mt-2 list-inside list-decimal space-y-1">
+        {#each plan.steps as step}
+          <li>{step.agentName}: {step.instruction} <span class="text-base-content/45">({step.status})</span></li>
+        {/each}
+      </ol>
+      {#if plan.status === 'proposed'}
+        <div class="mt-2 flex gap-2">
+          <button class="btn btn-primary btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'approve')}>Approve</button>
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'reject')}>Reject</button>
+        </div>
+      {:else if ['approved', 'active'].includes(plan.status)}
+        <div class="mt-2 flex gap-2">
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'pause')}>Pause</button>
+          <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
+        </div>
+      {/if}
     </div>
   {/if}
 {/snippet}
@@ -935,6 +1037,20 @@
               </span>
             </div>
           {/if}
+        </li>
+      {/each}
+    </ul>
+
+    <div class="eyebrow mt-8">Agent workload</div>
+    <ul class="mt-2 space-y-1 text-xs text-base-content/55">
+      {#each data.agentConfiguration.agents as agent (agent.id)}
+        {@const items = accountability.inbox.filter((item) => item.agentId === agent.id)}
+        {@const activeItems = items.filter((item) => !['completed'].includes(item.state))}
+        <li class="flex items-center justify-between border-b border-white/6 py-1.5">
+          <span>{agent.name}</span>
+          <span class:badge-warning={activeItems.some((item) => item.requiresHumanAction)} class="badge badge-ghost badge-xs">
+            {agent.enabled ? `${activeItems.length} active` : 'disabled'}
+          </span>
         </li>
       {/each}
     </ul>
@@ -1519,6 +1635,27 @@
       </div>
       {#if data.agentConfiguration.canManage}
         <div class="mt-5 space-y-3 border-t border-white/10 pt-5">
+          <div class="space-y-2 border border-white/10 p-3">
+            <label class="text-xs text-base-content/60" for="agent-template">Optional bounded template</label>
+            <select id="agent-template" class="select select-sm w-full border-white/18 bg-transparent" bind:value={agentTemplateKey}>
+              <option value="">Choose a specialist template</option>
+              {#each data.agentTemplates as template (template.key)}
+                <option value={template.key}>{template.name} · v{template.version}</option>
+              {/each}
+            </select>
+            {#if selectedAgentTemplate}
+              <div class="text-xs leading-5 text-base-content/55">
+                <strong class="text-[#f1efe8]">{selectedAgentTemplate.roleLabel}</strong>
+                <p>{selectedAgentTemplate.instructions}</p>
+                <p>Permission ceiling: {selectedAgentTemplate.permissionCeiling.replaceAll('_', ' ')}.</p>
+                <p>Does not own: {selectedAgentTemplate.nonResponsibilities.join(', ')}.</p>
+                {#if selectedTemplateOverlap}<p class="text-warning">Ambient topic “{selectedTemplateOverlap}” overlaps an existing Agent.</p>{/if}
+              </div>
+              <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy} onclick={() => void instantiateTemplate()}>
+                Add from template
+              </button>
+            {/if}
+          </div>
           <div class="flex items-center justify-between gap-2">
             <strong class="text-sm">{editingAgentId ? 'Edit Agent' : 'Add an Agent'}</strong>
             {#if editingAgentId}<button class="btn btn-ghost btn-xs" type="button" onclick={resetAgentForm}>New instead</button>{/if}

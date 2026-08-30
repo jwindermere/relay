@@ -19,6 +19,11 @@ import { AgentRunGitHubWorkspaceBroker } from '../src/lib/server/github/workspac
 import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
 import { acceptAgentConversation } from '../src/lib/server/collaboration/conversation.js';
 import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js';
+import {
+  claimCoordinationStep,
+  decideCoordinationPlan,
+  proposeCoordinationPlan
+} from '../src/lib/server/collaboration/coordination.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
@@ -2135,6 +2140,180 @@ if (skipDatabaseTests) {
     assert.equal(stored.rows[0]?.task_count, 1);
     assert.ok(stored.rows[0]?.delivery_attempted_at);
     assert.ok(stored.rows[0]?.delivered_at);
+  });
+
+  test('Pilot steering is ordered, visible, and delivered at the next Provider boundary', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'steering-guidance');
+    const steering = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-steering-guidance',
+      body: 'steer: add regression coverage and do not change deployment files',
+      submissionId: 'steering-guidance-input'
+    });
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /add regression coverage and do not change deployment files/);
+      await observer.threadStarted('thread-steering-guidance');
+      await observer.turnStarted('turn-steering-guidance');
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'steering-guidance:completed',
+        turn: { id: 'turn-steering-guidance', status: 'completed' }
+      });
+    });
+    assert.equal((await processNextAgentRun(pool, provider, {
+      workerId: 'worker-steering-guidance', workspaceRoot
+    })).kind, 'executed');
+    const stored = await pool.query<{
+      source_message_id: string; ordinal: number; status: string;
+      provider_thread_id: string; provider_turn_id: string;
+    }>(
+      `SELECT source_message_id, ordinal, status, provider_thread_id, provider_turn_id
+       FROM public.agent_run_steering WHERE agent_run_id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(stored.rows, [{
+      source_message_id: steering.id, ordinal: 1, status: 'delivered',
+      provider_thread_id: 'thread-steering-guidance', provider_turn_id: 'turn-steering-guidance'
+    }]);
+  });
+
+  test('coordination remains inert until Pilot approval and cannot create engineering AgentRuns', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-approval');
+    const researchAgentId = 'research-coordination-approval';
+    const researchMemberId = `${researchAgentId}:member`;
+    await pool.query(
+      `INSERT INTO public.agent (id, workspace_id, name, role_label, agent_type)
+       VALUES ($1, $2, 'Riley', 'Research agent', 'research')`,
+      [researchAgentId, ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ($1, $2, 'agent', $3)`,
+      [researchMemberId, ids.workspaceId, researchAgentId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ids.workspaceId, ids.projectId, researchMemberId]
+    );
+    const conversationId = 'conversation-coordination-approval';
+    const turnId = 'turn-coordination-approval-source';
+    const resultMessageId = 'message-coordination-approval-plan';
+    await pool.query(
+      `INSERT INTO public.agent_conversation (
+         id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [conversationId, ids.workspaceId, ids.channelId, 'message-coordination-approval',
+        ids.agentId, ids.providerConnectionId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES ($1, $2, $3, $4, $5, 'I propose a bounded research step.')`,
+      [resultMessageId, ids.workspaceId, ids.channelId, ids.agentMemberId,
+        'message-coordination-approval']
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, response_message_id, status,
+         response_placement, response_parent_message_id, completed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      [turnId, ids.workspaceId, conversationId, 'message-coordination-approval',
+        ids.pilotMemberId, resultMessageId]
+    );
+    const planId = await proposeCoordinationPlan(pool, {
+      workspaceId: ids.workspaceId, projectId: ids.projectId,
+      coordinatingAgentId: ids.agentId, sourceMessageId: resultMessageId,
+      goal: 'Assess evidence', allowParallel: false,
+      budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 },
+      steps: [{ key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] }]
+    });
+    assert.equal(await claimCoordinationStep(pool, planId), null);
+    await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
+    assert.ok(await claimCoordinationStep(pool, planId));
+    const created = await pool.query<{ turns: number; runs: number; depth: number }>(
+      `SELECT
+         count(*) FILTER (WHERE turn.id IS NOT NULL)::integer AS turns,
+         (SELECT count(*)::integer FROM public.agent_run WHERE workspace_id = $1) AS runs,
+         max(turn.handoff_depth)::integer AS depth
+       FROM public.coordination_plan_step step
+       LEFT JOIN public.agent_conversation_turn turn ON turn.id = step.conversation_turn_id
+       WHERE step.plan_id = $2`,
+      [ids.workspaceId, planId]
+    );
+    assert.deepEqual(created.rows[0], { turns: 1, runs: 1, depth: 1 });
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+       WHERE id IN (
+         SELECT conversation_turn_id FROM public.coordination_plan_step WHERE plan_id = $1
+       ) AND status = 'queued'`,
+      [planId]
+    );
+  });
+
+  test('Research Agents persist source-backed findings and reusable Project memory', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'structured-finding');
+    const researchAgentId = 'research-structured-finding';
+    const researchMemberId = `${researchAgentId}:member`;
+    await pool.query(
+      `INSERT INTO public.agent (
+         id, workspace_id, name, role_label, agent_type, participation_mode
+       ) VALUES ($1, $2, 'Riley', 'Research agent', 'research', 'reactive')`,
+      [researchAgentId, ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ($1, $2, 'agent', $3)`,
+      [researchMemberId, ids.workspaceId, researchAgentId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ids.workspaceId, ids.projectId, researchMemberId]
+    );
+    const request = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Riley research the release evidence.',
+      submissionId: 'structured-finding-request'
+    });
+    assert.equal(request.routingDecision?.intent, 'research_request');
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-structured-finding');
+      await observer.turnStarted('turn-structured-finding');
+      await observer.notification({
+        method: 'item/completed', providerEventId: 'structured-finding:message',
+        item: {
+          id: 'structured-finding-message', type: 'agentMessage',
+          text: `The release evidence is current.
+
+\`\`\`relay-finding
+{"summary":"The release evidence is current.","confidence":0.9,"observedEvidence":["The release record is dated today."],"inferences":[],"assumptions":[],"openQuestions":[],"evidence":[{"type":"external","stableReference":"https://example.test/release","title":"Release record","retrievedAt":"2026-08-30T12:00:00.000Z","claim":"The release record is current."}]}
+\`\`\``
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'structured-finding:completed',
+        turn: { id: 'turn-structured-finding', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextConversationTurn(pool, provider, {
+      workerId: 'worker-structured-finding', workspaceRoot
+    }), {
+      kind: 'conversation',
+      conversationTurnId: request.agentMention?.status === 'conversation'
+        ? request.agentMention.conversationTurnId : '',
+      status: 'completed'
+    });
+    const stored = await pool.query<{ findings: number; evidence: number; memory: number }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.agent_finding WHERE project_id = $1) AS findings,
+         (SELECT count(*)::integer FROM public.finding_evidence WHERE project_id = $1) AS evidence,
+         (SELECT count(*)::integer FROM public.project_memory
+          WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory`,
+      [ids.projectId]
+    );
+    assert.deepEqual(stored.rows[0], { findings: 1, evidence: 1, memory: 1 });
   });
 }
 

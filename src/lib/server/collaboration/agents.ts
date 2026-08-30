@@ -22,6 +22,9 @@ export interface ConfigurableAgent {
   replyMode: AgentReplyMode;
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
+  templateProvenance: { key: string; version: number } | null;
+  permissionCeiling: 'none' | 'read_only' | 'repository_write';
+  disabledCapabilities: string[];
 }
 
 export class AgentConfigurationError extends Error {
@@ -113,9 +116,14 @@ export async function loadWorkspaceAgents(
     reply_mode: AgentReplyMode;
     enabled: boolean;
     status: ConfigurableAgent['status'];
+    template_key: string | null;
+    template_version: number | null;
+    permission_ceiling: ConfigurableAgent['permissionCeiling'];
+    disabled_capabilities: string[];
   }>(
     `SELECT id, name, agent_type, role_label, instructions, participation_mode,
-            ambient_triggers, reply_mode, enabled, status
+            ambient_triggers, reply_mode, enabled, status, template_key, template_version,
+            permission_ceiling, disabled_capabilities
      FROM public.agent WHERE workspace_id = $1 ORDER BY created_at, id`,
     [access.workspace.id]
   );
@@ -130,7 +138,12 @@ export async function loadWorkspaceAgents(
       ambientTriggers: agent.ambient_triggers,
       replyMode: agent.reply_mode,
       enabled: agent.enabled,
-      status: agent.status
+      status: agent.status,
+      templateProvenance: agent.template_key && agent.template_version
+        ? { key: agent.template_key, version: agent.template_version }
+        : null,
+      permissionCeiling: agent.permission_ceiling,
+      disabledCapabilities: agent.disabled_capabilities
     })),
     canManage: access.membership.role === 'owner'
   };
@@ -139,7 +152,12 @@ export async function loadWorkspaceAgents(
 export async function createWorkspaceAgent(
   pool: Pool,
   access: WorkspaceAccess,
-  input: AgentInput
+  input: AgentInput,
+  provenance?: {
+    key: string; version: number; snapshot: object;
+    permissionCeiling: ConfigurableAgent['permissionCeiling'];
+    requiredCapabilities: string[]; disabledCapabilities: string[];
+  }
 ): Promise<ConfigurableAgent> {
   if (access.membership.role !== 'owner') throw new WorkspaceAccessError('Workspace owner access is required');
   const agent = normalizeInput(input);
@@ -159,13 +177,19 @@ export async function createWorkspaceAgent(
     }>(
       `INSERT INTO public.agent (
          id, workspace_id, name, agent_type, role_label, instructions,
-         participation_mode, ambient_triggers, reply_mode, enabled, status
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         participation_mode, ambient_triggers, reply_mode, enabled, status,
+         template_key, template_version, template_snapshot, permission_ceiling,
+         required_capabilities, disabled_capabilities
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+         $12, $13, $14, $15, $16, $17)
        RETURNING status`,
       [
         id, access.workspace.id, agent.name, agent.agentType, agent.roleLabel,
         agent.instructions, agent.participationMode, agent.ambientTriggers,
-        agent.replyMode, agent.enabled, agent.enabled ? 'idle' : 'disabled'
+        agent.replyMode, agent.enabled, agent.enabled ? 'idle' : 'disabled',
+        provenance?.key ?? null, provenance?.version ?? null,
+        provenance?.snapshot ?? null, provenance?.permissionCeiling ?? 'none',
+        provenance?.requiredCapabilities ?? [], provenance?.disabledCapabilities ?? []
       ]
     );
     await client.query(
@@ -187,7 +211,12 @@ export async function createWorkspaceAgent(
       [access.workspace.id, access.identity.userId, access.membership.id, id, agent.name, agent.agentType]
     );
     await client.query('COMMIT');
-    return { id, ...agent, status: inserted.rows[0]!.status };
+    return {
+      id, ...agent, status: inserted.rows[0]!.status,
+      templateProvenance: provenance ? { key: provenance.key, version: provenance.version } : null,
+      permissionCeiling: provenance?.permissionCeiling ?? 'none',
+      disabledCapabilities: provenance?.disabledCapabilities ?? []
+    };
   } catch (error) {
     await client.query('ROLLBACK');
     if ((error as { code?: string }).code === '23505') {

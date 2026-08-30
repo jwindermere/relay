@@ -82,6 +82,20 @@ export function explicitAgentMentionPattern(agentName: string): RegExp {
   return new RegExp(`(?<![\\p{L}\\p{N}_.+@-])@${escaped}(?![\\p{L}\\p{N}_-])`, 'iu');
 }
 
+export function isConcreteEngineeringRequest(body: string, agentName: string): boolean {
+  const request = body
+    .replace(explicitAgentMentionPattern(agentName), ' ')
+    .trim()
+    .replace(/^[\s,.:;!?-]+/u, '')
+    .replace(
+      /^(?:(?:hey|hi)\s+)?(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|i\s+(?:need|want)\s+you\s+to\s+|go\s+ahead\s+and\s+)*/iu,
+      ''
+    )
+    .trim();
+  return /^(?:implement|build|create|fix|change|refactor|add|remove|test|debug|investigate|inspect|document|update|write|rename|repair|cover|prove|deploy|merge|administer|destroy|truncate|delete|wipe|erase|purge|push|publish|release|force[- ]?push|git\s+)\s*\S+/iu.test(request)
+    || /^run\s+(?:the\s+)?(?:tests?|checks?|build|lint|typecheck)\b/iu.test(request);
+}
+
 function evaluateAgentRequestSafety(body: string, agentName: string): AgentRequestSafetyDecision {
   const request = body
     .replace(explicitAgentMentionPattern(agentName), ' ')

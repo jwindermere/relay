@@ -24,6 +24,7 @@ import {
   startChannelCall
 } from '../src/lib/server/collaboration/calls.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
+import { correctMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
 import { deleteChannelMessage } from '../src/lib/server/collaboration/messages.js';
 import {
   createWorkspace,
@@ -160,25 +161,35 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'agent_conversation' },
       { table_schema: 'public', table_name: 'agent_conversation_turn' },
+      { table_schema: 'public', table_name: 'agent_finding' },
       { table_schema: 'public', table_name: 'agent_handoff' },
       { table_schema: 'public', table_name: 'agent_run' },
       { table_schema: 'public', table_name: 'agent_run_cancellation_request' },
       { table_schema: 'public', table_name: 'agent_run_clarification' },
       { table_schema: 'public', table_name: 'agent_run_event' },
+      { table_schema: 'public', table_name: 'agent_run_steering' },
       { table_schema: 'public', table_name: 'approval' },
       { table_schema: 'public', table_name: 'artifact' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
       { table_schema: 'public', table_name: 'channel_call' },
       { table_schema: 'public', table_name: 'channel_call_participant' },
+      { table_schema: 'public', table_name: 'collaboration_evaluation_event' },
+      { table_schema: 'public', table_name: 'collaboration_feedback' },
+      { table_schema: 'public', table_name: 'coordination_budget_reservation' },
+      { table_schema: 'public', table_name: 'coordination_plan' },
+      { table_schema: 'public', table_name: 'coordination_plan_step' },
+      { table_schema: 'public', table_name: 'finding_evidence' },
       { table_schema: 'public', table_name: 'github_broker_decision' },
       { table_schema: 'public', table_name: 'github_connection' },
       { table_schema: 'public', table_name: 'github_webhook_delivery' },
       { table_schema: 'public', table_name: 'linked_repository' },
       { table_schema: 'public', table_name: 'message' },
+      { table_schema: 'public', table_name: 'message_intent_decision' },
       { table_schema: 'public', table_name: 'notification_outbox' },
       { table_schema: 'public', table_name: 'project' },
       { table_schema: 'public', table_name: 'project_membership' },
+      { table_schema: 'public', table_name: 'project_memory' },
       { table_schema: 'public', table_name: 'provider_connection' },
       { table_schema: 'public', table_name: 'runtime_state' },
       { table_schema: 'public', table_name: 'schema_migrations' },
@@ -634,6 +645,35 @@ if (connectionString) {
       body: 'Email support@Alex.com; Alex has useful context, but this is not a delegation.'
     });
     assert.equal(message.agentMention, null);
+    assert.deepEqual(message.routingDecision, {
+      intent: 'ordinary_communication',
+      targetAgentId: null,
+      confidence: 1,
+      policyVersion: 'rules-v1',
+      rationale: 'No eligible Agent mention or active Agent conversation was found.',
+      correctedAt: null
+    });
+
+    const reloaded = await loadSharedAgentChannel(pool, memberAccess);
+    assert.deepEqual(
+      reloaded.messages.find(({ id }) => id === message.id)?.routingDecision,
+      message.routingDecision
+    );
+    await correctMessageIntent(pool, memberAccess, message.id, {
+      intent: 'conversation',
+      targetAgentId: `${memberAccess.workspace.id}:alex`
+    });
+    const corrected = await loadSharedAgentChannel(pool, memberAccess);
+    assert.deepEqual(
+      corrected.messages.find(({ id }) => id === message.id)?.routingDecision,
+      {
+        ...message.routingDecision,
+        intent: 'conversation',
+        targetAgentId: `${memberAccess.workspace.id}:alex`,
+        correctedAt: corrected.messages.find(({ id }) => id === message.id)
+          ?.routingDecision?.correctedAt
+      }
+    );
 
     const work = await pool.query<{ tasks: number; runs: number }>(`
       SELECT

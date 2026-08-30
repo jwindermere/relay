@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import type { AgentMentionResult } from './delegation.js';
-import { explicitAgentMentionPattern } from './delegation.js';
+import {
+  explicitAgentMentionPattern,
+  isConcreteEngineeringRequest
+} from './delegation.js';
+
+export { isConcreteEngineeringRequest } from './delegation.js';
 
 interface ConversationContext {
   messageId: string;
@@ -47,20 +52,6 @@ function handoffQuestion(body: string, agentName: string): string {
 export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
   const normalizedBody = body.toLocaleLowerCase();
   return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
-}
-
-export function isConcreteEngineeringRequest(body: string, agentName: string): boolean {
-  const request = body
-    .replace(explicitAgentMentionPattern(agentName), ' ')
-    .trim()
-    .replace(/^[\s,.:;!?-]+/u, '')
-    .replace(
-      /^(?:(?:hey|hi)\s+)?(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|i\s+(?:need|want)\s+you\s+to\s+|go\s+ahead\s+and\s+)*/iu,
-      ''
-    )
-    .trim();
-  return /^(?:implement|build|create|fix|change|refactor|add|remove|test|debug|investigate|inspect|document|update|write|rename|repair|cover|prove|deploy|merge|administer|destroy|truncate|delete|wipe|erase|purge|push|publish|release|force[- ]?push|git\s+)\s*\S+/iu.test(request)
-    || /^run\s+(?:the\s+)?(?:tests?|checks?|build|lint|typecheck)\b/iu.test(request);
 }
 
 export async function acceptAgentConversation(
