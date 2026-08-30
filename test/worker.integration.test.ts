@@ -25,6 +25,7 @@ import {
   decideCoordinationPlan,
   proposeCoordinationPlan
 } from '../src/lib/server/collaboration/coordination.js';
+import { loadCollaborationAccountability } from '../src/lib/server/collaboration/accountability.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
@@ -2281,7 +2282,7 @@ if (skipDatabaseTests) {
     );
   });
 
-  test('Research Agents persist source-backed findings and reusable Project memory', async () => {
+  test('Research Agents preserve inaccessible cross-Project evidence as visible provenance', async () => {
     const ids = await seedQueuedAgentRun(pool, 'structured-finding');
     const researchAgentId = 'research-structured-finding';
     const researchMemberId = `${researchAgentId}:member`;
@@ -2307,6 +2308,25 @@ if (skipDatabaseTests) {
       submissionId: 'structured-finding-request'
     });
     assert.equal(request.routingDecision?.intent, 'research_request');
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ('project-structured-finding-other', $1, 'Other Project')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.channel (id, workspace_id, project_id, name)
+       VALUES ('channel-structured-finding-other', $1, 'project-structured-finding-other', 'other-project')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES (
+         'message-structured-finding-other', $1, 'channel-structured-finding-other', $2,
+         'The other Project chose a phased release.'
+       )`,
+      [ids.workspaceId, ids.pilotMemberId]
+    );
     const researchTurnId = request.agentMention?.status === 'conversation'
       ? request.agentMention.conversationTurnId : '';
     await pool.query(
@@ -2325,7 +2345,7 @@ if (skipDatabaseTests) {
           text: `The release evidence is current.
 
 \`\`\`relay-finding
-{"summary":"The release evidence is current.","confidence":0.9,"observedEvidence":["The release record is dated today."],"inferences":[],"assumptions":[],"openQuestions":[],"evidence":[{"type":"external","stableReference":"https://example.test/release","title":"Release record","retrievedAt":"2026-08-30T12:00:00.000Z","claim":"The release record is current."}]}
+{"summary":"The release evidence is current.","confidence":0.9,"observedEvidence":["The release record is dated today."],"inferences":[],"assumptions":[],"openQuestions":[],"evidence":[{"type":"external","stableReference":"https://example.test/release","title":"Release record","retrievedAt":"2026-08-30T12:00:00.000Z","claim":"The release record is current."},{"type":"message","stableReference":"message-structured-finding-other","title":"Release decision","retrievedAt":"2026-08-30T12:00:00.000Z","claim":"The other Project chose a phased release."}]}
 \`\`\``
         }
       });
@@ -2349,7 +2369,23 @@ if (skipDatabaseTests) {
           WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory`,
       [ids.projectId]
     );
-    assert.deepEqual(stored.rows[0], { findings: 1, evidence: 1, memory: 1 });
+    assert.deepEqual(stored.rows[0], { findings: 1, evidence: 2, memory: 1 });
+    const accountability = await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    );
+    assert.deepEqual(
+      accountability.findings[0]?.evidence.find(({ stableReference }) =>
+        stableReference === 'message-structured-finding-other'
+      ),
+      {
+        type: 'message',
+        stableReference: 'message-structured-finding-other',
+        title: 'Release decision',
+        retrievedAt: '2026-08-30T12:00:00+00:00',
+        claim: 'The other Project chose a phased release.',
+        accessible: false
+      }
+    );
   });
 }
 

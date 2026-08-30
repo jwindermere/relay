@@ -5,6 +5,7 @@
   import BrandMark from '$lib/BrandMark.svelte';
   import JitsiCall from '$lib/JitsiCall.svelte';
   import MarkdownMessage from '$lib/MarkdownMessage.svelte';
+  import { presentFindingEvidence } from '$lib/finding-presentation.js';
   import { highlightMarkdownInput } from '$lib/markdown.js';
   import {
     applyChannelReconciliation,
@@ -951,12 +952,6 @@
     else await invalidateAll();
   }
 
-  function safeEvidenceUrl(reference: string) {
-    try {
-      const url = new URL(reference);
-      return url.protocol === 'https:' ? url.toString() : null;
-    } catch { return null; }
-  }
 </script>
 
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
@@ -1192,10 +1187,12 @@
             {#if finding.openQuestions.length}<p class="mt-1 text-info">Open: {finding.openQuestions.join('; ')}</p>{/if}
             <ul class="mt-1 space-y-1">
               {#each finding.evidence as evidence}
-                {@const evidenceUrl = safeEvidenceUrl(evidence.stableReference)}
+                {@const presentedEvidence = presentFindingEvidence(evidence)}
                 <li>
-                  {#if evidence.type === 'external' && evidenceUrl}<a class="link link-primary" href={evidenceUrl} target="_blank" rel="noopener noreferrer">{evidence.title}</a>{:else}<span>{evidence.title} · {evidence.stableReference}</span>{/if}
-                  <span class="block text-base-content/45">{evidence.claim}</span>
+                  {#if presentedEvidence.href}<a class="link link-primary" href={presentedEvidence.href} target="_blank" rel="noopener noreferrer">{presentedEvidence.title}</a>{:else}<span>{presentedEvidence.title}</span>{/if}
+                  {#if presentedEvidence.status === 'inaccessible'}<span class="badge badge-warning badge-xs ml-1">Source inaccessible</span>{/if}
+                  <span class="block text-base-content/45">{presentedEvidence.provenance}</span>
+                  <span class="block text-base-content/55">{presentedEvidence.claim}</span>
                 </li>
               {/each}
             </ul>

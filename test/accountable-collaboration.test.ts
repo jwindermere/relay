@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { presentFindingEvidence } from '../src/lib/finding-presentation.js';
 import {
   normalizeFindingInput,
   parseFindingResult,
@@ -13,6 +14,34 @@ import {
 } from '../src/lib/server/collaboration/coordination.js';
 import { decideMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
 import { detectCollaborationQualitySignals } from '../src/lib/server/collaboration/accountability.js';
+
+test('inaccessible Finding evidence renders retained provenance without an active link', () => {
+  assert.deepEqual(presentFindingEvidence({
+    type: 'message',
+    stableReference: 'message-other-project',
+    title: 'Release decision',
+    retrievedAt: '2026-08-30T12:00:00.000Z',
+    claim: 'The other Project chose a phased release.',
+    accessible: false
+  }), {
+    href: null,
+    status: 'inaccessible',
+    provenance: 'Message · message-other-project · retrieved 2026-08-30T12:00:00.000Z',
+    title: 'Release decision',
+    claim: 'The other Project chose a phased release.'
+  });
+});
+
+test('Finding evidence rendering only links available HTTPS sources', () => {
+  assert.equal(presentFindingEvidence({
+    type: 'external', stableReference: 'https://example.test/release', title: 'Release record',
+    retrievedAt: '2026-08-30T12:00:00.000Z', claim: 'The release is current.', accessible: true
+  }).href, 'https://example.test/release');
+  assert.equal(presentFindingEvidence({
+    type: 'external', stableReference: 'javascript:alert(1)', title: 'Unsafe',
+    retrievedAt: '2026-08-30T12:00:00.000Z', claim: 'An unsafe claim.', accessible: true
+  }).href, null);
+});
 
 test('source-backed findings reject unsafe and duplicate evidence', () => {
   assert.throws(() => normalizeFindingInput({
