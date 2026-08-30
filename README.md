@@ -186,9 +186,9 @@ repository, owner, and node identities, and verifies every configured branch. Th
 Workspace-owned GitHub connection remains a separate credential boundary from the
 Project's Linked pilot repository. Agent
 execution remains unavailable unless active rules require a pull request with at least
-one review by someone other than the last pusher, dismiss stale approvals, require at
-least one status check, block force pushes and deletion, and do not let the Relay App
-bypass the ruleset. The owner can re-verify or disable the link from the Channel
+one approving review, dismiss stale approvals, require at least one status check, block
+force pushes and deletion, and do not let the Relay App bypass the ruleset. The owner
+can re-verify or disable the link from the Channel
 sidebar; other Pilot members see readiness without sensitive connection configuration.
 
 The worker checks out repository content through the server-side broker into a

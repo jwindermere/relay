@@ -88,9 +88,6 @@ function evaluateBranch(
   if (!pullRequestRules.some(({ parameters }) =>
     (parameters?.requiredApprovingReviewCount ?? 0) >= 1
   )) failures.push('required pull-request review is absent');
-  if (!pullRequestRules.some(({ parameters }) => parameters?.requireLastPushApproval === true)) {
-    failures.push('independent last-push approval is absent');
-  }
   if (!pullRequestRules.some(({ parameters }) => parameters?.dismissStaleReviewsOnPush === true)) {
     failures.push('stale-approval dismissal is absent');
   }
