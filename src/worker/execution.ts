@@ -962,13 +962,41 @@ async function requestClarificationAndWait(
       [claim.id, request.providerRequestId]
     );
     if (answer.rows[0]) {
-      await pool.query(
-        `UPDATE public.agent_run_clarification
-         SET delivery_attempted_at = COALESCE(delivery_attempted_at, now())
-         WHERE id = $1`,
-        [answer.rows[0].id]
-      );
-      return answer.rows[0].answers;
+      const boundary = await pool.connect();
+      try {
+        await boundary.query('BEGIN');
+        await boundary.query(
+          `UPDATE public.agent_run_clarification
+           SET delivery_attempted_at = COALESCE(delivery_attempted_at, now())
+           WHERE id = $1`,
+          [answer.rows[0].id]
+        );
+        const steering = await boundary.query<{ id: string; guidance: string }>(
+          `SELECT id, guidance FROM public.agent_run_steering
+           WHERE agent_run_id = $1 AND status = 'pending'
+           ORDER BY ordinal FOR UPDATE`,
+          [claim.id]
+        );
+        if (steering.rows.length > 0) {
+          await boundary.query(
+            `UPDATE public.agent_run_steering
+             SET status = 'delivered', provider_thread_id = $2,
+                 provider_turn_id = $3, delivered_at = now()
+             WHERE id = ANY($1::text[]) AND status = 'pending'`,
+            [steering.rows.map(({ id }) => id), claim.provider_thread_id, claim.active_turn_id]
+          );
+        }
+        await boundary.query('COMMIT');
+        return steering.rows.length === 0 ? answer.rows[0].answers : {
+          ...answer.rows[0].answers,
+          relay_pilot_steering: steering.rows.map(({ guidance }) => guidance)
+        };
+      } catch (error) {
+        await boundary.query('ROLLBACK');
+        throw error;
+      } finally {
+        boundary.release();
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }

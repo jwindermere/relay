@@ -46,6 +46,7 @@ export interface AgentInboxItem {
   relatedId: string;
   summary: string;
   requiresHumanAction: boolean;
+  urgency: 'high' | 'normal' | 'low';
 }
 
 interface VisibleCoordinationStep {
@@ -105,13 +106,13 @@ export async function loadCollaborationAccountability(
       [access.workspace.id, projectId]
     ),
     pool.query<{
-      id: string; source_message_id: string; goal: string; status: string; allow_parallel: boolean;
+      id: string; source_message_id: string; goal: string; constraints: string[]; status: string; allow_parallel: boolean;
       max_participants: number; max_handoffs: number; max_depth: number; max_agent_runs: number;
       max_elapsed_seconds: number; provider_usage_limit: string | null;
       provider_usage_consumed: string | null; provider_usage_known: boolean;
       steps: VisibleCoordinationStep[]; consumed_handoffs: number;
     }>(
-      `SELECT plan.id, plan.source_message_id, plan.goal, plan.status, plan.allow_parallel,
+      `SELECT plan.id, plan.source_message_id, plan.goal, plan.constraints, plan.status, plan.allow_parallel,
               plan.max_participants, plan.max_handoffs, plan.max_depth, plan.max_agent_runs,
               plan.max_elapsed_seconds, plan.provider_usage_limit,
               plan.provider_usage_consumed, plan.provider_usage_known,
@@ -135,11 +136,18 @@ export async function loadCollaborationAccountability(
       id: string; result_message_id: string | null; source_handoff_id: string | null;
       summary: string; confidence: string; observed_evidence: string[]; inferences: string[];
       assumptions: string[]; open_questions: string[]; evidence_count: number;
+      evidence: Array<{ type: string; stableReference: string; title: string; retrievedAt: string; claim: string; accessible: boolean }>;
     }>(
       `SELECT finding.id, finding.result_message_id, finding.source_handoff_id,
               finding.summary, finding.confidence, finding.observed_evidence,
               finding.inferences, finding.assumptions, finding.open_questions,
-              count(evidence.id)::integer AS evidence_count
+              count(evidence.id)::integer AS evidence_count,
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'type', evidence.evidence_type, 'stableReference', evidence.stable_reference,
+                'title', evidence.title, 'retrievedAt', evidence.retrieved_at,
+                'claim', evidence.claim, 'accessible', evidence.accessible
+              ) ORDER BY evidence.created_at, evidence.id)
+                FILTER (WHERE evidence.id IS NOT NULL), '[]') AS evidence
        FROM public.agent_finding finding
        LEFT JOIN public.finding_evidence evidence ON evidence.finding_id = finding.id
        WHERE finding.workspace_id = $1 AND finding.project_id = $2
@@ -239,7 +247,7 @@ export async function loadCollaborationAccountability(
     })),
     plans: plans.rows.map((row) => ({
       id: row.id, sourceMessageId: row.source_message_id, goal: row.goal,
-      status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
+      constraints: row.constraints, status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
       budget: {
         maxParticipants: row.max_participants, maxHandoffs: row.max_handoffs,
         consumedHandoffs: row.consumed_handoffs, maxDepth: row.max_depth,
@@ -253,7 +261,8 @@ export async function loadCollaborationAccountability(
       id: row.id, resultMessageId: row.result_message_id, sourceHandoffId: row.source_handoff_id,
       summary: row.summary, confidence: Number(row.confidence), observedEvidence: row.observed_evidence,
       inferences: row.inferences, assumptions: row.assumptions, openQuestions: row.open_questions,
-      evidenceCount: row.evidence_count, evidenceStrength: row.evidence_count === 0 ? 'missing' : 'supported'
+      evidence: row.evidence, evidenceCount: row.evidence_count,
+      evidenceStrength: row.evidence_count === 0 ? 'missing' : 'supported'
     })),
     memory: memory.rows.map((row) => ({
       id: row.id, type: row.memory_type, statement: row.statement,
@@ -263,7 +272,9 @@ export async function loadCollaborationAccountability(
     inbox: inbox.rows.map((row): AgentInboxItem => ({
       id: row.id, agentId: row.agent_id, agentName: row.agent_name, state: row.state,
       kind: row.kind, sourceMessageId: row.source_message_id, relatedId: row.related_id,
-      summary: row.summary, requiresHumanAction: row.requires_human_action
+      summary: row.summary, requiresHumanAction: row.requires_human_action,
+      urgency: row.requires_human_action ? 'high'
+        : ['queued', 'active', 'blocked', 'review_ready'].includes(row.state) ? 'normal' : 'low'
     })),
     capacity: capacity.rows.map((row) => ({
       agentId: row.agent_id,

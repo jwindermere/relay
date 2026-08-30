@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import type { GitHubRepositoryGateway } from '../github/connection.js';
+import { acceptAgentConversation } from './conversation.js';
 import {
+  acceptEligibleAgentMention,
   explicitAgentMentionPattern,
   isConcreteEngineeringRequest
 } from './delegation.js';
@@ -97,7 +100,8 @@ export async function correctMessageIntent(
   pool: Pool,
   access: WorkspaceAccess,
   messageId: string,
-  correction: { intent: MessageIntent; targetAgentId?: string | null }
+  correction: { intent: MessageIntent; targetAgentId?: string | null },
+  dependencies: { getRepositoryGateway?: () => GitHubRepositoryGateway } = {}
 ): Promise<void> {
   if (!INTENTS.has(correction.intent)) throw new MessageIntentError('Message intent is invalid');
   const client = await pool.connect();
@@ -109,11 +113,77 @@ export async function correctMessageIntent(
        JOIN public.workspace_membership membership
          ON membership.id = member.pilot_membership_id
         AND membership.workspace_id = member.workspace_id
+       JOIN public.message message ON message.id = $3 AND message.workspace_id = member.workspace_id
+       JOIN public.channel channel ON channel.id = message.channel_id
+       JOIN public.project_membership project_member
+         ON project_member.project_id = channel.project_id
+        AND project_member.workspace_member_id = member.id
        WHERE member.workspace_id = $1 AND membership.id = $2
          AND membership.revoked_at IS NULL`,
-      [access.workspace.id, access.membership.id]
+      [access.workspace.id, access.membership.id, messageId]
     );
     if (!actor.rows[0]) throw new MessageIntentError('active Pilot membership is required');
+    const messageContext = await client.query<{
+      channel_id: string; parent_message_id: string | null; body: string;
+    }>(
+      `SELECT channel_id, parent_message_id, body FROM public.message
+       WHERE id = $1 AND workspace_id = $2`,
+      [messageId, access.workspace.id]
+    );
+    if (!messageContext.rows[0]) throw new MessageIntentError('Message routing decision was not found');
+    const existingWork = await client.query<{
+      task_id: string; run_id: string; run_status: string; assigned_agent_id: string;
+    }>(
+      `SELECT task.id AS task_id, run.id AS run_id, run.status AS run_status,
+              task.assigned_agent_id
+       FROM public.task task JOIN public.agent_run run ON run.task_id = task.id
+       WHERE task.source_message_id = $1 AND task.workspace_id = $2
+       ORDER BY run.attempt_number DESC LIMIT 1 FOR UPDATE OF task, run`,
+      [messageId, access.workspace.id]
+    );
+    const routed = existingWork.rows[0];
+    const changesEngineeringRoute = routed && (
+      correction.intent !== 'engineering_delegation'
+      || (correction.targetAgentId !== undefined
+        && correction.targetAgentId !== routed.assigned_agent_id)
+    );
+    if (changesEngineeringRoute && routed.run_status !== 'queued') {
+      throw new MessageIntentError('Message intent cannot be corrected after repository execution starts');
+    }
+    if (changesEngineeringRoute && correction.intent === 'engineering_delegation') {
+      const replacement = await client.query<{ allowed: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM public.agent agent
+           JOIN public.workspace_member member ON member.agent_id = agent.id
+           JOIN public.project_membership project_member ON project_member.workspace_member_id = member.id
+           JOIN public.message message ON message.id = $3
+           JOIN public.channel channel ON channel.id = message.channel_id
+           WHERE agent.id = $1 AND agent.workspace_id = $2 AND agent.agent_type = 'engineering'
+             AND agent.enabled AND agent.status <> 'disabled'
+             AND project_member.project_id = channel.project_id
+         ) AS allowed`,
+        [correction.targetAgentId, access.workspace.id, messageId]
+      );
+      if (!replacement.rows[0]?.allowed) throw new MessageIntentError('Corrected Engineering Agent is unavailable');
+      await client.query(`UPDATE public.task SET assigned_agent_id = $2, updated_at = now() WHERE id = $1`,
+        [routed.task_id, correction.targetAgentId]);
+      await client.query(`UPDATE public.agent_run SET agent_id = $2, updated_at = now() WHERE id = $1`,
+        [routed.run_id, correction.targetAgentId]);
+      await client.query(`UPDATE public.message SET mentioned_agent_id = $2 WHERE id = $1`,
+        [messageId, correction.targetAgentId]);
+    } else if (changesEngineeringRoute) {
+      await client.query(
+        `UPDATE public.agent_run SET status = 'cancelled', completed_at = now(), updated_at = now()
+         WHERE id = $1 AND status = 'queued'`, [routed.run_id]
+      );
+      await client.query(`UPDATE public.task SET status = 'cancelled', updated_at = now() WHERE id = $1`,
+        [routed.task_id]);
+      await client.query(
+        `UPDATE public.message SET agent_mention_status = 'communication',
+           mentioned_agent_id = NULL, agent_mention_reason = NULL
+         WHERE id = $1`, [messageId]
+      );
+    }
     const updated = await client.query(
       `UPDATE public.message_intent_decision decision
        SET corrected_intent = $4,
@@ -154,6 +224,35 @@ export async function correctMessageIntent(
        WHERE decision.message_id = $2 AND decision.workspace_id = $3`,
       [randomUUID(), messageId, access.workspace.id]
     );
+    if (!routed) {
+      const context = {
+        messageId, workspaceId: access.workspace.id,
+        channelId: messageContext.rows[0].channel_id,
+        parentMessageId: messageContext.rows[0].parent_message_id,
+        body: messageContext.rows[0].body
+      };
+      if (correction.intent === 'engineering_delegation') {
+        await acceptEligibleAgentMention(client, {
+          ...context, getRepositoryGateway: dependencies.getRepositoryGateway
+        });
+      } else if (['conversation', 'research_request', 'coordination_candidate'].includes(correction.intent)) {
+        await acceptAgentConversation(client, context);
+      }
+    }
+    await client.query(
+      `INSERT INTO public.collaboration_evaluation_event (
+         id, workspace_id, project_id, event_type, agent_id,
+         routing_policy_version, permission_policy_version, outcome_type, outcome_id, evidence
+       ) SELECT $1, decision.workspace_id, decision.project_id, 'routing.disagreement',
+                COALESCE(decision.corrected_target_agent_id, decision.target_agent_id),
+                decision.policy_version, 'pilot-authority-v1', 'message', decision.message_id,
+                jsonb_build_object('selectedIntent', decision.selected_intent,
+                                   'correctedIntent', decision.corrected_intent)
+         FROM public.message_intent_decision decision
+        WHERE decision.message_id = $2 AND decision.workspace_id = $3
+          AND decision.corrected_intent <> decision.selected_intent`,
+      [randomUUID(), messageId, access.workspace.id]
+    );
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -166,7 +265,7 @@ export async function correctMessageIntent(
 export async function classifyMessageIntent(
   client: PoolClient,
   context: IntentContext
-): Promise<void> {
+): Promise<Omit<MessageRoutingDecision, 'correctedAt'> | null> {
   const surface = await client.query<{
     project_id: string;
     author_kind: 'pilot' | 'agent';
@@ -182,7 +281,7 @@ export async function classifyMessageIntent(
     [context.messageId, context.workspaceId]
   );
   const projectId = surface.rows[0]?.project_id;
-  if (!projectId || surface.rows[0]?.author_kind !== 'pilot') return;
+  if (!projectId || surface.rows[0]?.author_kind !== 'pilot') return null;
 
   const agents = await client.query<{
     id: string;
@@ -224,4 +323,5 @@ export async function classifyMessageIntent(
     [randomUUID(), context.workspaceId, projectId, decision.targetAgentId,
       decision.policyVersion, context.messageId, decision.intent, decision.confidence]
   );
+  return decision;
 }

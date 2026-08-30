@@ -32,6 +32,14 @@ test('source-backed findings reject unsafe and duplicate evidence', () => {
       retrievedAt: '2026-08-30T12:00:00.000Z', claim: 'A claim'
     }))
   }), /duplicate evidence/);
+  assert.throws(() => normalizeFindingInput({
+    summary: 'Unsafe repository reference', confidence: 0.4,
+    observedEvidence: [], inferences: [], assumptions: [], openQuestions: [],
+    evidence: [{
+      type: 'repository', stableReference: 'https://other.example/repository/file.ts',
+      title: 'Unscoped repository', retrievedAt: '2026-08-30T12:00:00Z', claim: 'A claim'
+    }]
+  }), /relative repository path/);
 });
 
 test('structured findings keep a concise Channel Message', () => {
@@ -73,6 +81,24 @@ test('coordination plans reject hidden participants and recursive handoffs', () 
     budget: { maxParticipants: 2, maxHandoffs: 2, maxDepth: 2, maxAgentRuns: 0, maxElapsedSeconds: 600 },
     steps: [{ key: 'research', agentId: 'riley', instruction: 'Assess evidence', dependencies: [] }]
   }), /handoff depth cannot exceed 1/);
+
+  assert.throws(() => normalizeCoordinationPlan({
+    goal: 'Use the existing review artifact', allowParallel: false,
+    budget: { maxParticipants: 1, maxHandoffs: 0, maxDepth: 0, maxAgentRuns: 0, maxElapsedSeconds: 600 },
+    steps: [{
+      key: 'review', agentId: 'alex', instruction: 'Review the existing result',
+      dependencies: [], expectedOutput: 'artifact'
+    }]
+  }), /must reference an existing Artifact/);
+
+  assert.equal(normalizeCoordinationPlan({
+    goal: 'Use the existing review artifact', allowParallel: false,
+    budget: { maxParticipants: 1, maxHandoffs: 0, maxDepth: 0, maxAgentRuns: 1, maxElapsedSeconds: 600 },
+    steps: [{
+      key: 'review', agentId: 'alex', instruction: 'Review the existing result',
+      dependencies: [], expectedOutput: 'artifact', artifactId: 'artifact-1'
+    }]
+  }).steps[0]?.artifactId, 'artifact-1');
 });
 
 test('coordination budget reservations never overspend', () => {

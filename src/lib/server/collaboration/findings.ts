@@ -76,6 +76,11 @@ export function normalizeFindingInput(input: FindingInput): FindingInput {
       try { url = new URL(stableReference); } catch { throw new FindingError('External evidence requires a safe HTTPS URL'); }
       if (url.protocol !== 'https:') throw new FindingError('External evidence requires a safe HTTPS URL');
     }
+    if (item.type === 'repository' && (
+      stableReference.startsWith('/') || stableReference.includes('://')
+      || stableReference.split('/').includes('..')
+      || !/^[\p{L}\p{N}_.@+\-/ ]+(?::\d+)?$/u.test(stableReference)
+    )) throw new FindingError('Repository evidence requires a relative repository path');
     return { type: item.type, stableReference, title, claim, retrievedAt: retrievedAt.toISOString() };
   });
   const keys = evidence.map((item) => `${item.type}\u0000${item.stableReference}\u0000${item.claim}`);
@@ -168,16 +173,19 @@ export async function createFinding(
     );
     if (inserted.rowCount !== 1) throw new FindingError('Finding provenance is outside the Project');
     for (const evidence of finding.evidence) {
-      if (evidence.type === 'message' || evidence.type === 'artifact') {
+      if (evidence.type === 'message' || evidence.type === 'artifact' || evidence.type === 'repository') {
         const reference = await client.query<{ allowed: boolean }>(
           evidence.type === 'message'
             ? `SELECT EXISTS (
                  SELECT 1 FROM public.message message JOIN public.channel channel ON channel.id = message.channel_id
                  WHERE message.id = $1 AND message.workspace_id = $2 AND channel.project_id = $3
                ) AS allowed`
-            : `SELECT EXISTS (
+            : evidence.type === 'artifact' ? `SELECT EXISTS (
                  SELECT 1 FROM public.artifact
                  WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+               ) AS allowed` : `SELECT EXISTS (
+                 SELECT 1 FROM public.linked_repository
+                 WHERE workspace_id = $2 AND project_id = $3
                ) AS allowed`,
           [evidence.stableReference, access.workspace.id, input.projectId]
         );
@@ -236,16 +244,19 @@ export async function createFindingFromAgentResult(
     );
     for (const evidence of finding.evidence) {
       let accessible = true;
-      if (evidence.type === 'message' || evidence.type === 'artifact') {
+      if (evidence.type === 'message' || evidence.type === 'artifact' || evidence.type === 'repository') {
         const reference = await client.query<{ allowed: boolean }>(
           evidence.type === 'message'
             ? `SELECT EXISTS (
                  SELECT 1 FROM public.message message JOIN public.channel channel ON channel.id = message.channel_id
                  WHERE message.id = $1 AND message.workspace_id = $2 AND channel.project_id = $3
                ) AS allowed`
-            : `SELECT EXISTS (
+            : evidence.type === 'artifact' ? `SELECT EXISTS (
                  SELECT 1 FROM public.artifact
                  WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+               ) AS allowed` : `SELECT EXISTS (
+                 SELECT 1 FROM public.linked_repository
+                 WHERE workspace_id = $2 AND project_id = $3
                ) AS allowed`,
           [evidence.stableReference, input.workspaceId, input.projectId]
         );
@@ -277,6 +288,25 @@ export async function createFindingFromAgentResult(
            'conversation-v1', 'read-only-v1', 'finding', $5,
            jsonb_build_object('confidence', $6::numeric, 'evidenceCount', 0))`,
         [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId, id, finding.confidence]
+      );
+    }
+    const duplicate = await client.query<{ id: string }>(
+      `SELECT id FROM public.agent_finding
+       WHERE workspace_id = $1 AND project_id = $2 AND id <> $3
+         AND lower(trim(summary)) = lower(trim($4))
+       ORDER BY created_at, id LIMIT 1`,
+      [input.workspaceId, input.projectId, id, finding.summary]
+    );
+    if (duplicate.rows[0]) {
+      await client.query(
+        `INSERT INTO public.collaboration_evaluation_event (
+           id, workspace_id, project_id, event_type, agent_id,
+           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
+         ) VALUES ($1, $2, $3, 'duplicate.investigation', $4,
+           'conversation-v1', 'read-only-v1', 'finding', $5,
+           jsonb_build_object('duplicatesFindingId', $6::text))`,
+        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId,
+          id, duplicate.rows[0].id]
       );
     }
     await client.query('COMMIT');

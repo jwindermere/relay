@@ -4,13 +4,16 @@ import { getRelayAuth } from '$lib/server/auth.js';
 import { authorizeWorkspaceRequest, WorkspaceAccessError } from '$lib/server/authentication/authorization.js';
 import { correctMessageIntent, MessageIntentError } from '$lib/server/collaboration/message-intent.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
+import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 
 export async function PATCH({ params, request }) {
   try {
     const pool = getDatabasePool();
     const access = await authorizeWorkspaceRequest(pool, getRelayAuth(), request.headers);
     const input = await request.json();
-    await correctMessageIntent(pool, access, params.messageId, input);
+    await correctMessageIntent(pool, access, params.messageId, input, {
+      getRepositoryGateway: getGitHubRepositoryGateway
+    });
     return new Response(null, { status: 204 });
   } catch (error) {
     if (error instanceof WorkspaceAccessError) return json({ message: error.message }, { status: 403 });

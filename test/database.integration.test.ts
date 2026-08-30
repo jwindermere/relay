@@ -195,6 +195,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'task' },
       { table_schema: 'public', table_name: 'workspace' },
+      { table_schema: 'public', table_name: 'workspace_coordination_policy' },
       { table_schema: 'public', table_name: 'workspace_invitation' },
       { table_schema: 'public', table_name: 'workspace_member' },
       { table_schema: 'public', table_name: 'workspace_membership' }
@@ -696,16 +697,19 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex please investigate the reconnect failure.'
     });
-
-    assert.equal(message.agentMention?.status, 'rejected');
+    assert.equal(message.agentMention, null);
+    await correctMessageIntent(pool, memberAccess, message.id, { intent: 'engineering_delegation' });
+    const confirmed = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === message.id);
+    assert.equal(confirmed?.agentMention?.status, 'rejected');
     assert.match(
-      message.agentMention?.status === 'rejected' ? message.agentMention.reason : '',
+      confirmed?.agentMention?.status === 'rejected' ? confirmed.agentMention.reason : '',
       /ready Codex Provider connection/
     );
     const persisted = await loadSharedAgentChannel(pool, memberAccess);
     assert.deepEqual(
       persisted.messages.find(({ id }) => id === message.id)?.agentMention,
-      message.agentMention
+      confirmed?.agentMention
     );
     const work = await pool.query<{ tasks: number; runs: number; events: number; outbox: number }>(`
       SELECT
@@ -1100,10 +1104,14 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex investigate the reconnect failure.'
     }, mentionDependencies);
-    assert.equal(unsafeRepository.agentMention?.status, 'rejected');
+    await correctMessageIntent(pool, memberAccess, unsafeRepository.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const unsafeRepositoryAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === unsafeRepository.id);
+    assert.equal(unsafeRepositoryAfterConfirmation?.agentMention?.status, 'rejected');
     assert.match(
-      unsafeRepository.agentMention?.status === 'rejected'
-        ? unsafeRepository.agentMention.reason
+      unsafeRepositoryAfterConfirmation?.agentMention?.status === 'rejected'
+        ? unsafeRepositoryAfterConfirmation.agentMention.reason
         : '',
       /Current repository permissions and protected-branch controls/
     );
@@ -1113,9 +1121,13 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex please deploy this directly to production.'
     }, mentionDependencies);
-    assert.equal(unsafe.agentMention?.status, 'rejected');
+    await correctMessageIntent(pool, memberAccess, unsafe.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const unsafeAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === unsafe.id);
+    assert.equal(unsafeAfterConfirmation?.agentMention?.status, 'rejected');
     assert.match(
-      unsafe.agentMention?.status === 'rejected' ? unsafe.agentMention.reason : '',
+      unsafeAfterConfirmation?.agentMention?.status === 'rejected' ? unsafeAfterConfirmation.agentMention.reason : '',
       /cannot accept requests to merge, deploy, or administer/
     );
     for (const forbiddenRequest of [
@@ -1129,7 +1141,11 @@ if (connectionString) {
         channelId: channel.channel.id,
         body: forbiddenRequest
       }, mentionDependencies);
-      assert.equal(rejected.agentMention?.status, 'rejected', forbiddenRequest);
+      await correctMessageIntent(pool, memberAccess, rejected.id,
+        { intent: 'engineering_delegation' }, mentionDependencies);
+      const rejectedAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+        .messages.find(({ id }) => id === rejected.id);
+      assert.equal(rejectedAfterConfirmation?.agentMention?.status, 'rejected', forbiddenRequest);
     }
 
     await pool.query(
@@ -1140,9 +1156,13 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex investigate another reconnect failure.'
     }, mentionDependencies);
-    assert.equal(atCapacity.agentMention?.status, 'rejected');
+    await correctMessageIntent(pool, memberAccess, atCapacity.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const atCapacityAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === atCapacity.id);
+    assert.equal(atCapacityAfterConfirmation?.agentMention?.status, 'rejected');
     assert.match(
-      atCapacity.agentMention?.status === 'rejected' ? atCapacity.agentMention.reason : '',
+      atCapacityAfterConfirmation?.agentMention?.status === 'rejected' ? atCapacityAfterConfirmation.agentMention.reason : '',
       /no capacity/
     );
     await pool.query(
@@ -1166,8 +1186,16 @@ if (connectionString) {
     ]);
     assert.equal(first.id, retry.id);
     assert.equal(first.body, retry.body);
-    assert.equal(first.agentMention?.status, 'accepted');
+    assert.equal(first.routingDecision?.intent, 'engineering_delegation');
+    assert.equal(first.agentMention, null);
     assert.deepEqual(first.agentMention, retry.agentMention);
+    await correctMessageIntent(pool, memberAccess, first.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const confirmed = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === first.id);
+    assert.equal(confirmed?.agentMention?.status, 'accepted');
+    const confirmedAgentId = confirmed?.agentMention?.status === 'accepted'
+      ? confirmed.agentMention.agentId : undefined;
 
     const accepted = await pool.query<{
       task_id: string;
@@ -1259,7 +1287,7 @@ if (connectionString) {
     assert.deepEqual(accepted.rows[0]?.context_snapshot.project, channel.project);
     assert.deepEqual(accepted.rows[0]?.context_snapshot.channel, channel.channel);
     assert.deepEqual(accepted.rows[0]?.context_snapshot.agent, {
-      id: first.agentMention?.agentId,
+      id: confirmedAgentId,
       name: 'Alex',
       roleLabel: 'Engineering agent'
     });

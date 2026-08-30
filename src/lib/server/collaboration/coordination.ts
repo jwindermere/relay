@@ -18,6 +18,7 @@ export interface CoordinationStepInput {
   instruction: string;
   dependencies: string[];
   expectedOutput?: 'concise_text' | 'structured_finding' | 'artifact';
+  artifactId?: string;
 }
 
 export interface CoordinationPlanInput {
@@ -84,14 +85,15 @@ export function normalizeCoordinationPlan(input: CoordinationPlanInput): Coordin
     return {
       key, agentId, instruction,
       dependencies: [...new Set(step.dependencies ?? [])],
-      expectedOutput: step.expectedOutput ?? 'structured_finding'
+      expectedOutput: step.expectedOutput ?? 'structured_finding',
+      ...(step.artifactId?.trim() ? { artifactId: step.artifactId.trim() } : {})
     };
   });
+  if (steps.some((step) => step.expectedOutput === 'artifact' && !step.artifactId)) {
+    throw new CoordinationError('Artifact steps must reference an existing Artifact');
+  }
   if (participants.size > budget.maxParticipants) {
     throw new CoordinationError('Coordination plan exceeds its participant budget');
-  }
-  if (steps.filter(({ expectedOutput }) => expectedOutput === 'artifact').length > budget.maxAgentRuns) {
-    throw new CoordinationError('Coordination plan exceeds its AgentRun budget');
   }
   for (const [index, step] of steps.entries()) {
     if (step.dependencies.some((dependency) => !keys.has(dependency) || dependency === step.key)) {
@@ -155,11 +157,33 @@ export async function proposeCoordinationPlan(
            WHERE agent.id = requested.agent_id AND agent.workspace_id = $1
              AND project_member.project_id = $2 AND agent.enabled AND agent.status <> 'disabled'
          )
+       ) AND NOT EXISTS (
+         SELECT 1 FROM unnest($6::text[]) requested(artifact_id)
+         WHERE NOT EXISTS (
+           SELECT 1 FROM public.artifact artifact
+           WHERE artifact.id = requested.artifact_id AND artifact.workspace_id = $1
+             AND artifact.project_id = $2
+         )
        ) AS allowed`,
       [input.workspaceId, input.projectId, input.coordinatingAgentId, input.sourceMessageId,
-        [...new Set(plan.steps.map(({ agentId }) => agentId))]]
+        [...new Set(plan.steps.map(({ agentId }) => agentId))],
+        plan.steps.flatMap(({ artifactId }) => artifactId ? [artifactId] : [])]
     );
     if (!source.rows[0]?.allowed) throw new CoordinationError('Plan participants and source must belong to the Project');
+    const policy = await client.query<{ allowed: boolean }>(
+      `SELECT ($2 <= default_max_participants
+          AND $3 <= default_max_handoffs
+          AND $4 <= default_max_depth
+          AND $5 <= default_max_agent_runs
+          AND $6 <= default_max_elapsed_seconds
+          AND (default_provider_usage_limit IS NULL
+            OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))) AS allowed
+       FROM public.workspace_coordination_policy WHERE workspace_id = $1 FOR UPDATE`,
+      [input.workspaceId, plan.budget.maxParticipants, plan.budget.maxHandoffs,
+        plan.budget.maxDepth, plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
+        plan.budget.providerUsageLimit ?? null]
+    );
+    if (!policy.rows[0]?.allowed) throw new CoordinationError('Coordination plan exceeds Workspace defaults');
     await client.query(
       `INSERT INTO public.coordination_plan (
          id, workspace_id, project_id, coordinating_agent_id, source_message_id,
@@ -176,10 +200,10 @@ export async function proposeCoordinationPlan(
       await client.query(
         `INSERT INTO public.coordination_plan_step (
            id, workspace_id, project_id, plan_id, step_key, position,
-           target_agent_id, instruction, expected_output, dependencies
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+           target_agent_id, instruction, expected_output, dependencies, artifact_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [randomUUID(), input.workspaceId, input.projectId, id, step.key, position,
-          step.agentId, step.instruction, step.expectedOutput, step.dependencies]
+          step.agentId, step.instruction, step.expectedOutput, step.dependencies, step.artifactId ?? null]
       );
     }
     await client.query('COMMIT');
@@ -280,13 +304,33 @@ export async function editCoordinationPlan(
                AND agent_project.project_id = proposal.project_id
                AND agent.enabled AND agent.status <> 'disabled'
            )
+         ) AND NOT EXISTS (
+           SELECT 1 FROM unnest($5::text[]) requested(artifact_id)
+           WHERE NOT EXISTS (
+             SELECT 1 FROM public.artifact artifact
+             WHERE artifact.id = requested.artifact_id AND artifact.workspace_id = $2
+               AND artifact.project_id = proposal.project_id
+           )
          )
        FOR UPDATE`,
       [planId, access.workspace.id, access.membership.id,
-        [...new Set(plan.steps.map(({ agentId }) => agentId))]]
+        [...new Set(plan.steps.map(({ agentId }) => agentId))],
+        plan.steps.flatMap(({ artifactId }) => artifactId ? [artifactId] : [])]
     );
     const projectId = editable.rows[0]?.project_id;
     if (!projectId) throw new CoordinationError('Proposed coordination plan was not found');
+    const policy = await client.query<{ allowed: boolean }>(
+      `SELECT ($2 <= default_max_participants AND $3 <= default_max_handoffs
+          AND $4 <= default_max_depth AND $5 <= default_max_agent_runs
+          AND $6 <= default_max_elapsed_seconds
+          AND (default_provider_usage_limit IS NULL
+            OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))) AS allowed
+       FROM public.workspace_coordination_policy WHERE workspace_id = $1 FOR UPDATE`,
+      [access.workspace.id, plan.budget.maxParticipants, plan.budget.maxHandoffs,
+        plan.budget.maxDepth, plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
+        plan.budget.providerUsageLimit ?? null]
+    );
+    if (!policy.rows[0]?.allowed) throw new CoordinationError('Coordination plan exceeds Workspace defaults');
     await client.query(
       `UPDATE public.coordination_plan
        SET goal = $3, constraints = $4, allow_parallel = $5,
@@ -304,10 +348,10 @@ export async function editCoordinationPlan(
       await client.query(
         `INSERT INTO public.coordination_plan_step (
            id, workspace_id, project_id, plan_id, step_key, position,
-           target_agent_id, instruction, expected_output, dependencies
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+           target_agent_id, instruction, expected_output, dependencies, artifact_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [randomUUID(), access.workspace.id, projectId, planId, step.key, position,
-          step.agentId, step.instruction, step.expectedOutput, step.dependencies]
+          step.agentId, step.instruction, step.expectedOutput, step.dependencies, step.artifactId ?? null]
       );
     }
     await client.query('COMMIT');
@@ -329,8 +373,11 @@ export async function claimCoordinationStep(
     const plan = await client.query<{
       workspace_id: string; status: string; allow_parallel: boolean;
       max_handoffs: number; started_at: Date | null; max_elapsed_seconds: number;
+      max_agent_runs: number; provider_usage_limit: string | null;
+      provider_usage_consumed: string | null; provider_usage_known: boolean;
     }>(
-      `SELECT workspace_id, status, allow_parallel, max_handoffs, started_at, max_elapsed_seconds
+      `SELECT workspace_id, status, allow_parallel, max_handoffs, started_at, max_elapsed_seconds,
+              max_agent_runs, provider_usage_limit, provider_usage_consumed, provider_usage_known
        FROM public.coordination_plan WHERE id = $1 FOR UPDATE`,
       [planId]
     );
@@ -344,26 +391,32 @@ export async function claimCoordinationStep(
       await client.query('COMMIT');
       return null;
     }
-    const consumed = await client.query<{ count: number }>(
-      `SELECT count(*)::integer AS count FROM public.coordination_budget_reservation
-       WHERE plan_id = $1 AND reservation_kind = 'handoff'`,
-      [planId]
+    if (current.provider_usage_limit !== null && (
+      !current.provider_usage_known
+      || Number(current.provider_usage_consumed ?? 0) >= Number(current.provider_usage_limit)
+    )) {
+      await client.query(`UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`, [planId]);
+      await client.query('COMMIT');
+      return null;
+    }
+    const agentRunReservations = await client.query<{ count: number }>(
+      `SELECT COALESCE(sum(amount), 0)::integer AS count
+       FROM public.coordination_budget_reservation
+       WHERE plan_id = $1 AND reservation_kind = 'agent_run'`, [planId]
     );
-    if ((consumed.rows[0]?.count ?? 0) >= current.max_handoffs) {
-      await client.query(
-        `UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`,
-        [planId]
-      );
+    if ((agentRunReservations.rows[0]?.count ?? 0) > current.max_agent_runs) {
+      await client.query(`UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`, [planId]);
       await client.query('COMMIT');
       return null;
     }
     const step = await client.query<{
       id: string; target_agent_id: string; instruction: string; expected_output: string;
+      artifact_id: string | null;
       workspace_id: string; project_id: string; source_message_id: string;
       channel_id: string; root_message_id: string; coordinator_member_id: string;
       originating_pilot_member_id: string; provider_connection_id: string;
     }>(
-      `SELECT step.id, step.target_agent_id, step.instruction, step.expected_output,
+      `SELECT step.id, step.target_agent_id, step.instruction, step.expected_output, step.artifact_id,
               step.workspace_id, step.project_id, plan.source_message_id,
               source.channel_id, COALESCE(source.parent_message_id, source.id) AS root_message_id,
               coordinator_member.id AS coordinator_member_id,
@@ -371,6 +424,7 @@ export async function claimCoordinationStep(
               provider.id AS provider_connection_id
        FROM public.coordination_plan_step step
        JOIN public.coordination_plan plan ON plan.id = step.plan_id
+       JOIN public.agent target_agent ON target_agent.id = step.target_agent_id
        JOIN public.message source ON source.id = plan.source_message_id
        JOIN public.workspace_member coordinator_member
          ON coordinator_member.agent_id = plan.coordinating_agent_id
@@ -378,6 +432,7 @@ export async function claimCoordinationStep(
        JOIN public.provider_connection provider
          ON provider.workspace_id = plan.workspace_id AND provider.status = 'ready'
        WHERE step.plan_id = $1 AND step.status = 'ready'
+         AND target_agent.enabled AND target_agent.status <> 'disabled'
          AND ($2 OR NOT EXISTS (
            SELECT 1 FROM public.coordination_plan_step active
            WHERE active.plan_id = step.plan_id AND active.status = 'active'
@@ -391,10 +446,33 @@ export async function claimCoordinationStep(
     }
     if (step.rows[0].expected_output === 'artifact') {
       await client.query(
-        `UPDATE public.coordination_plan_step SET status = 'blocked'
-         WHERE id = $1 AND status = 'ready'`,
+        `UPDATE public.coordination_plan_step
+         SET status = 'completed', completed_at = now()
+         WHERE id = $1 AND status = 'ready' AND artifact_id IS NOT NULL`,
         [step.rows[0].id]
       );
+      await client.query(
+        `UPDATE public.coordination_plan_step candidate SET status = 'ready'
+         WHERE candidate.plan_id = $1 AND candidate.status = 'pending'
+           AND NOT EXISTS (
+             SELECT 1 FROM unnest(candidate.dependencies) dependency(step_key)
+             LEFT JOIN public.coordination_plan_step prerequisite
+               ON prerequisite.plan_id = candidate.plan_id
+              AND prerequisite.step_key = dependency.step_key
+             WHERE prerequisite.status IS DISTINCT FROM 'completed'
+           )`,
+        [planId]
+      );
+      await finishCoordinationPlanIfComplete(client, planId);
+      await client.query('COMMIT');
+      return null;
+    }
+    const consumed = await client.query<{ count: number }>(
+      `SELECT count(*)::integer AS count FROM public.coordination_budget_reservation
+       WHERE plan_id = $1 AND reservation_kind = 'handoff'`,
+      [planId]
+    );
+    if ((consumed.rows[0]?.count ?? 0) >= current.max_handoffs) {
       await client.query(
         `UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`,
         [planId]
@@ -519,6 +597,10 @@ export async function completeCoordinationStep(
        )`,
     [planId]
   );
+  await finishCoordinationPlanIfComplete(client, planId);
+}
+
+async function finishCoordinationPlanIfComplete(client: PoolClient, planId: string): Promise<void> {
   const remaining = await client.query<{ count: number }>(
     `SELECT count(*)::integer AS count FROM public.coordination_plan_step
      WHERE plan_id = $1 AND status <> 'completed'`,
@@ -527,13 +609,15 @@ export async function completeCoordinationStep(
   if (remaining.rows[0]?.count === 0) {
     const synthesis = await client.query<{
       workspace_id: string; channel_id: string; root_message_id: string;
-      coordinator_member_id: string; result_ids: string[];
+      coordinator_member_id: string; result_ids: string[]; artifact_ids: string[];
     }>(
       `SELECT plan.workspace_id, source.channel_id,
               COALESCE(source.parent_message_id, source.id) AS root_message_id,
               member.id AS coordinator_member_id,
               array_agg(step.result_message_id ORDER BY step.position)
-                FILTER (WHERE step.result_message_id IS NOT NULL) AS result_ids
+                FILTER (WHERE step.result_message_id IS NOT NULL) AS result_ids,
+              array_agg(step.artifact_id ORDER BY step.position)
+                FILTER (WHERE step.artifact_id IS NOT NULL) AS artifact_ids
        FROM public.coordination_plan plan
        JOIN public.message source ON source.id = plan.source_message_id
        JOIN public.workspace_member member ON member.agent_id = plan.coordinating_agent_id
@@ -552,7 +636,10 @@ export async function completeCoordinationStep(
          ON CONFLICT (id) DO NOTHING`,
         [synthesisMessageId, row.workspace_id, row.channel_id, row.coordinator_member_id,
           row.root_message_id,
-          `Coordination complete. Reviewed results: ${(row.result_ids ?? []).join(', ') || 'none'}.`]
+          `Coordination complete. Reviewed results: ${[
+            ...(row.result_ids ?? []).map((id) => `Message ${id}`),
+            ...(row.artifact_ids ?? []).map((id) => `Artifact ${id}`)
+          ].join(', ') || 'none'}.`]
       );
       await client.query(
         `INSERT INTO public.notification_outbox (workspace_id, message_id, topic, payload)

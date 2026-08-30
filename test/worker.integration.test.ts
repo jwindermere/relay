@@ -17,6 +17,7 @@ import {
 import { ingestGitHubWebhook } from '../src/lib/server/github/webhooks.js';
 import { AgentRunGitHubWorkspaceBroker } from '../src/lib/server/github/workspace.js';
 import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
+import { correctMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
 import { acceptAgentConversation } from '../src/lib/server/collaboration/conversation.js';
 import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js';
 import {
@@ -2176,6 +2177,34 @@ if (skipDatabaseTests) {
     }]);
   });
 
+  test('a Pilot intent correction stops queued repository work before execution', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'intent-correction');
+    const messageId = 'message-intent-correction';
+    await pool.query(
+      `INSERT INTO public.message_intent_decision (
+         id, workspace_id, project_id, message_id, selected_intent,
+         target_agent_id, confidence, policy_version, rationale
+       ) VALUES ($1, $2, $3, $4, 'engineering_delegation', $5, 1, 'rules-v1',
+         'A repository outcome was requested.')`,
+      ['decision-intent-correction', ids.workspaceId, ids.projectId, messageId, ids.agentId]
+    );
+    await correctMessageIntent(pool, ids.ownerAccess, messageId, { intent: 'conversation' });
+    const stopped = await pool.query<{ run_status: string; task_status: string; mention_status: string }>(
+      `SELECT run.status AS run_status, task.status AS task_status,
+              message.agent_mention_status AS mention_status
+       FROM public.agent_run run JOIN public.task task ON task.id = run.task_id
+       JOIN public.message message ON message.id = task.source_message_id
+       WHERE run.id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(stopped.rows[0], {
+      run_status: 'cancelled', task_status: 'cancelled', mention_status: 'communication'
+    });
+    assert.deepEqual(await processNextAgentRun(pool, new FixtureProvider(async () => {
+      assert.fail('corrected repository work must not reach the Provider');
+    }), { workerId: 'worker-intent-correction', workspaceRoot }), { kind: 'idle' });
+  });
+
   test('coordination remains inert until Pilot approval and cannot create engineering AgentRuns', async () => {
     const ids = await seedQueuedAgentRun(pool, 'coordination-approval');
     const researchAgentId = 'research-coordination-approval';
@@ -2278,6 +2307,14 @@ if (skipDatabaseTests) {
       submissionId: 'structured-finding-request'
     });
     assert.equal(request.routingDecision?.intent, 'research_request');
+    const researchTurnId = request.agentMention?.status === 'conversation'
+      ? request.agentMention.conversationTurnId : '';
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+       WHERE status = 'queued' AND id <> $1`,
+      [researchTurnId]
+    );
     const provider = new FixtureProvider(async (_input, observer) => {
       await observer.threadStarted('thread-structured-finding');
       await observer.turnStarted('turn-structured-finding');
@@ -2301,8 +2338,7 @@ if (skipDatabaseTests) {
       workerId: 'worker-structured-finding', workspaceRoot
     }), {
       kind: 'conversation',
-      conversationTurnId: request.agentMention?.status === 'conversation'
-        ? request.agentMention.conversationTurnId : '',
+      conversationTurnId: researchTurnId,
       status: 'completed'
     });
     const stored = await pool.query<{ findings: number; evidence: number; memory: number }>(

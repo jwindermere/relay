@@ -146,11 +146,55 @@ An AgentRun stopped at an uncertain execution boundary that requires human revie
 
 ## Multi-Agent collaboration
 
-A Workspace may configure multiple named specialist Agents. Relay routes each Message to at most one conversational Agent and retains a single Engineering AgentRun assignee, preventing fan-out and uncontrolled social loops while preserving distinct Agent identities and specialties.
+A Workspace may configure multiple named specialist Agents. Relay routes each ordinary Message to at most one conversational Agent and retains a single Engineering AgentRun assignee. A Pilot member may separately approve one explicit, bounded Coordination plan whose visible steps can involve several Agents; that exception is budgeted, dependency-ordered, and cannot grant engineering authority. This prevents implicit fan-out and uncontrolled social loops while preserving deliberate parallel work.
 
 ## Agent handoff
 
 A bounded request from an Agent answering a Pilot member to exactly one other specialist Agent for a concrete input. The receiving Agent may answer once but may not hand off again. An Agent handoff is conversational coordination: it creates no Task or AgentRun and cannot authorize engineering work.
+
+## Message intent decision
+
+Relay's durable, versioned interpretation of a Pilot member's Message, including its selected intent, target Agent, confidence, and rationale. A correction appends attributable Pilot-member judgment without rewriting the Message or erasing the original interpretation.
+
+## Agent finding
+
+A structured, attributable research result that separates observed evidence, inference, assumptions, open questions, and calibrated confidence. Finding evidence records stable source references and retrieval times; a high-confidence Finding without evidence is explicitly flagged.
+
+## Project memory
+
+A Project-scoped, source-backed statement promoted from a Finding or explicitly recorded by a Pilot member. Its lifecycle is active, superseded, archived, or deleted: supersession points to its replacement, archival withdraws it from active context while retaining ordinary visibility, and deletion retains only its durable audit identity. Project memory is context for later work, never hidden authority.
+
+## Steering input
+
+An ordered, durable constraint appended by a Pilot member to an active AgentRun. It is delivered at the next known Provider interaction boundary, is visible in the Shared Agent Channel, and cannot broaden the AgentRun's permissions.
+
+## Coordination plan
+
+A coordinating Agent's proposed goal, participants, steps, dependencies, execution policy, and explicit limits. It performs no work until a Project Pilot member approves it and may then be paused or cancelled by a Pilot member.
+
+## Coordination step
+
+One dependency-ordered assignment in an approved Coordination plan, targeting exactly one Agent and producing concise text, a structured Finding, or a reference to an existing Project Artifact. Conversational steps create no Task or AgentRun; repository-affecting work still requires an independently authorized Engineering delegation.
+
+## Coordination budget
+
+The approved participant, handoff, depth, AgentRun, elapsed-time, and optional Provider-usage limits attached to a Coordination plan. Relay reserves known capacity atomically before starting a step and pauses when a hard limit is exhausted; unknown Provider usage is displayed as unknown.
+
+## Workspace coordination policy
+
+The Workspace-owned default ceilings for Coordination plans: participants, handoffs, handoff depth, AgentRuns, elapsed time, and optional Provider usage. A proposed or edited plan's Coordination budget may be stricter but cannot exceed this policy; the approved per-plan budget remains the limit enforced while that plan runs.
+
+## Agent inbox
+
+A Project-scoped projection of an Agent's queued, active, waiting, blocked, review-ready, and completed work. Items identify their source Message and whether human action is required; the inbox grants no authority of its own.
+
+## Collaboration evaluation
+
+Versioned, Workspace-scoped evidence about routing decisions, policy rejections, Pilot overrides, unsupported certainty, duplicate investigation, and recursive coordination attempts. Pilot feedback is retained separately and can be analysed by Agent type and policy version.
+
+## Agent template
+
+A versioned starting configuration for a bounded specialist Agent. Instantiation records template provenance, previews role, instructions, permissions, and overlapping ambient triggers, and never grants permission beyond the Project and Workspace boundary.
 
 ## MVP pilot success
 

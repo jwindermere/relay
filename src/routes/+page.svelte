@@ -50,6 +50,10 @@
   let agentReplyMode = $state<'adaptive' | 'channel' | 'thread'>('adaptive');
   let agentEnabled = $state(true);
   let agentTemplateKey = $state('');
+  let inboxAgentFilter = $state('all');
+  let inboxStateFilter = $state('all');
+  let inboxUrgencyFilter = $state('all');
+  let inboxHumanOnly = $state(false);
   let newWorkspaceName = $state('');
   let workspaceBusy = $state(false);
   let workspaceMessage = $state('');
@@ -74,6 +78,12 @@
   let githubConfiguration = $derived(data.linkedRepository.configuration);
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
   let accountability = $derived(realtimeAccountability ?? data.accountability);
+  let filteredInbox = $derived(accountability.inbox.filter((item) =>
+    (inboxAgentFilter === 'all' || item.agentId === inboxAgentFilter)
+    && (inboxStateFilter === 'all' || item.state === inboxStateFilter)
+    && (inboxUrgencyFilter === 'all' || item.urgency === inboxUrgencyFilter)
+    && (!inboxHumanOnly || item.requiresHumanAction)
+  ));
   let selectedAgentTemplate = $derived(
     data.agentTemplates.find((template) => template.key === agentTemplateKey)
   );
@@ -868,6 +878,85 @@
       workspaceBusy = false;
     }
   }
+
+  async function correctIntent(messageId: string, intent: string) {
+    const response = await fetch(`/api/workspace/messages/${encodeURIComponent(messageId)}/intent`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ intent })
+    });
+    const result = response.status === 204 ? null : await response.json();
+    if (!response.ok) {
+      agentMessage = result?.message ?? 'Routing interpretation could not be corrected.';
+      return;
+    }
+    await invalidateAll();
+  }
+
+  async function setMemoryLifecycle(memoryId: string, lifecycle: 'archived' | 'deleted') {
+    const response = await fetch('/api/workspace/memory', {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ memoryId, lifecycle })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Memory could not be updated.';
+    else await invalidateAll();
+  }
+
+  async function correctMemory(memory: (typeof accountability.memory)[number]) {
+    const statement = window.prompt('Correct this Project memory entry', memory.statement)?.trim();
+    if (!statement || statement === memory.statement) return;
+    const response = await fetch('/api/workspace/memory', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: data.sharedChannel.project.id, type: memory.type, statement,
+        sourceReferences: memory.sourceReferences, supersedesId: memory.id
+      })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Memory correction could not be saved.';
+    else await invalidateAll();
+  }
+
+  async function submitFeedback(outcomeType: string, outcomeId: string, rating: string) {
+    const response = await fetch('/api/workspace/accountability', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: data.sharedChannel.project.id, outcomeType, outcomeId, rating })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Feedback could not be saved.';
+  }
+
+  async function editPlan(plan: (typeof accountability.plans)[number]) {
+    const editable = {
+      goal: plan.goal, constraints: plan.constraints, allowParallel: plan.allowParallel,
+      budget: {
+        maxParticipants: plan.budget.maxParticipants, maxHandoffs: plan.budget.maxHandoffs,
+        maxDepth: plan.budget.maxDepth, maxAgentRuns: plan.budget.maxAgentRuns,
+        maxElapsedSeconds: plan.budget.maxElapsedSeconds,
+        ...(plan.budget.providerUsage.limit === null ? {} : { providerUsageLimit: plan.budget.providerUsage.limit })
+      },
+      steps: plan.steps.map((step) => ({
+        key: step.key, agentId: step.agentId, instruction: step.instruction,
+        dependencies: step.dependencies, expectedOutput: step.expectedOutput,
+        ...(step.artifactId ? { artifactId: step.artifactId } : {})
+      }))
+    };
+    const source = window.prompt('Edit the proposed plan JSON', JSON.stringify(editable, null, 2));
+    if (!source) return;
+    let edited;
+    try { edited = JSON.parse(source); } catch { agentMessage = 'Plan JSON is invalid.'; return; }
+    const response = await fetch(`/api/workspace/coordination/${encodeURIComponent(plan.id)}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'edit', plan: edited })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Plan could not be edited.';
+    else await invalidateAll();
+  }
+
+  function safeEvidenceUrl(reference: string) {
+    try {
+      const url = new URL(reference);
+      return url.protocol === 'https:' ? url.toString() : null;
+    } catch { return null; }
+  }
 </script>
 
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
@@ -879,6 +968,10 @@
       <span class="badge badge-ghost badge-xs">{message.routingDecision.intent.replaceAll('_', ' ')}</span>
       <span>{Math.round(message.routingDecision.confidence * 100)}% · {message.routingDecision.rationale}</span>
       {#if message.routingDecision.correctedAt}<span class="text-info">Pilot corrected</span>{/if}
+      {#if message.routingDecision.intent === 'engineering_delegation' && !message.routingDecision.correctedAt}
+        <button class="btn btn-primary btn-xs" type="button" onclick={() => void correctIntent(message.id, 'engineering_delegation')}>Confirm engineering work</button>
+        <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctIntent(message.id, 'conversation')}>Treat as conversation</button>
+      {/if}
     </p>
   {/if}
   {#if message.agentMention?.status === 'accepted'}
@@ -948,23 +1041,40 @@
         <strong>{plan.goal}</strong>
       </div>
       <p class="mt-1 text-base-content/55">
-        {plan.steps.length} steps · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs · depth {plan.budget.maxDepth}
-        · provider usage {plan.budget.providerUsage.known ? plan.budget.providerUsage.consumed : 'unknown'}
+        {plan.steps.length} steps · {plan.allowParallel ? 'parallel when dependencies allow' : 'sequential'}
+        · {plan.budget.maxParticipants} participants max
+        · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs
+        · depth {plan.budget.maxDepth} · {plan.budget.maxAgentRuns} AgentRuns max
+        · {plan.budget.maxElapsedSeconds}s max
+        · provider usage {plan.budget.providerUsage.known ? `${plan.budget.providerUsage.consumed}/${plan.budget.providerUsage.limit ?? '∞'}` : 'unknown'}
       </p>
       <ol class="mt-2 list-inside list-decimal space-y-1">
         {#each plan.steps as step}
-          <li>{step.agentName}: {step.instruction} <span class="text-base-content/45">({step.status})</span></li>
+          <li>
+            {step.agentName}: {step.instruction}
+            <span class="text-base-content/45">
+              ({step.status}; depends on {step.dependencies.length ? step.dependencies.join(', ') : 'nothing'}; expects {step.expectedOutput.replaceAll('_', ' ')})
+            </span>
+          </li>
         {/each}
       </ol>
       {#if plan.status === 'proposed'}
         <div class="mt-2 flex gap-2">
           <button class="btn btn-primary btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'approve')}>Approve</button>
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void editPlan(plan)}>Edit</button>
           <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'reject')}>Reject</button>
         </div>
       {:else if ['approved', 'active'].includes(plan.status)}
         <div class="mt-2 flex gap-2">
           <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'pause')}>Pause</button>
           <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
+        </div>
+      {/if}
+      {#if ['completed', 'rejected', 'cancelled', 'failed'].includes(plan.status)}
+        <div class="mt-2 flex flex-wrap gap-1">
+          {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
+            <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('coordination_plan', plan.id, rating)}>{rating.replaceAll('_', ' ')}</button>
+          {/each}
         </div>
       {/if}
     </div>
@@ -1042,18 +1152,82 @@
     </ul>
 
     <div class="eyebrow mt-8">Agent workload</div>
-    <ul class="mt-2 space-y-1 text-xs text-base-content/55">
-      {#each data.agentConfiguration.agents as agent (agent.id)}
-        {@const items = accountability.inbox.filter((item) => item.agentId === agent.id)}
-        {@const activeItems = items.filter((item) => !['completed'].includes(item.state))}
-        <li class="flex items-center justify-between border-b border-white/6 py-1.5">
-          <span>{agent.name}</span>
-          <span class:badge-warning={activeItems.some((item) => item.requiresHumanAction)} class="badge badge-ghost badge-xs">
-            {agent.enabled ? `${activeItems.length} active` : 'disabled'}
-          </span>
+    <div class="mt-2 grid grid-cols-2 gap-1">
+      <select class="select select-xs bg-base-300" aria-label="Filter workload by Agent" bind:value={inboxAgentFilter}>
+        <option value="all">All Agents</option>
+        {#each data.agentConfiguration.agents as agent (agent.id)}<option value={agent.id}>{agent.name}</option>{/each}
+      </select>
+      <select class="select select-xs bg-base-300" aria-label="Filter workload by state" bind:value={inboxStateFilter}>
+        <option value="all">All states</option>
+        {#each ['queued', 'active', 'waiting', 'blocked', 'review_ready', 'completed'] as state}<option value={state}>{state.replaceAll('_', ' ')}</option>{/each}
+      </select>
+      <select class="select select-xs bg-base-300" aria-label="Filter workload by urgency" bind:value={inboxUrgencyFilter}>
+        <option value="all">All urgency</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option>
+      </select>
+      <label class="flex items-center gap-1 text-[0.65rem]"><input type="checkbox" class="checkbox checkbox-xs" bind:checked={inboxHumanOnly} /> Human action</label>
+    </div>
+    <p class="mt-1 text-[0.6rem] text-base-content/35">Project: {data.sharedChannel.project.name}</p>
+    <ul class="mt-1 max-h-40 space-y-1 overflow-y-auto text-xs text-base-content/55">
+      {#each filteredInbox as item (item.id)}
+        <li class="border-b border-white/6 py-1.5">
+          <a class="block hover:text-primary" href={`#message-${item.sourceMessageId}`}>
+            <span class:badge-warning={item.requiresHumanAction} class="badge badge-ghost badge-xs">{item.urgency}</span>
+            <strong>{item.agentName}</strong> · {item.state.replaceAll('_', ' ')}
+            <span class="block truncate">{item.summary}</span>
+          </a>
         </li>
+      {:else}
+        <li class="py-2 text-base-content/35">No matching work.</li>
       {/each}
     </ul>
+
+    {#if accountability.findings.length > 0}
+      <div class="eyebrow mt-6">Findings</div>
+      <ul class="mt-2 max-h-52 space-y-2 overflow-y-auto text-xs">
+        {#each accountability.findings as finding (finding.id)}
+          <li class="border border-white/8 p-2">
+            <strong>{finding.summary}</strong>
+            <span class="ml-1 text-base-content/45">{Math.round(finding.confidence * 100)}% confidence · {finding.evidenceStrength}</span>
+            {#if finding.assumptions.length}<p class="mt-1 text-warning">Assumptions: {finding.assumptions.join('; ')}</p>{/if}
+            {#if finding.openQuestions.length}<p class="mt-1 text-info">Open: {finding.openQuestions.join('; ')}</p>{/if}
+            <ul class="mt-1 space-y-1">
+              {#each finding.evidence as evidence}
+                {@const evidenceUrl = safeEvidenceUrl(evidence.stableReference)}
+                <li>
+                  {#if evidence.type === 'external' && evidenceUrl}<a class="link link-primary" href={evidenceUrl} target="_blank" rel="noopener noreferrer">{evidence.title}</a>{:else}<span>{evidence.title} · {evidence.stableReference}</span>{/if}
+                  <span class="block text-base-content/45">{evidence.claim}</span>
+                </li>
+              {/each}
+            </ul>
+            <div class="mt-1 flex flex-wrap gap-1">
+              {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
+                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('finding', finding.id, rating)}>{rating.replaceAll('_', ' ')}</button>
+              {/each}
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if accountability.memory.length > 0}
+      <div class="eyebrow mt-6">Project memory</div>
+      <ul class="mt-2 max-h-40 space-y-2 overflow-y-auto text-xs">
+        {#each accountability.memory as memory (memory.id)}
+          <li class="border border-white/8 p-2">
+            <span class="badge badge-ghost badge-xs">{memory.type} · {memory.lifecycle}</span>
+            <p class="mt-1">{memory.statement}</p>
+            <p class="mt-1 truncate text-base-content/35">Sources: {memory.sourceReferences.join(', ')}</p>
+            {#if memory.lifecycle === 'active'}
+              <div class="mt-1 flex gap-1">
+                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctMemory(memory)}>Correct / supersede</button>
+                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'archived')}>Archive</button>
+                <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'deleted')}>Delete</button>
+              </div>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
 
     <div class="mt-8 border-t border-white/10 pt-3 lg:mt-auto">
       <button
@@ -1221,7 +1395,7 @@
                 <span>{formatDateDivider(message.createdAt)}</span>
               </div>
             {/if}
-            <article class="border-b border-white/8 p-4 sm:p-5">
+            <article id={`message-${message.id}`} class="border-b border-white/8 p-4 sm:p-5">
               <div class="message-row relative flex gap-3 pr-10">
                 <div class="message-actions" aria-label="Message actions">
                   <button

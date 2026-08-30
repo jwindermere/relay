@@ -342,7 +342,7 @@ export async function postChannelMessage(
          ) VALUES ($1, $2, 'channel.message', $3)`,
         [access.workspace.id, messageId, { messageId }]
       );
-      await classifyMessageIntent(client, {
+      const routingDecision = await classifyMessageIntent(client, {
         messageId,
         workspaceId: access.workspace.id,
         channelId: input.channelId,
@@ -393,14 +393,16 @@ export async function postChannelMessage(
         : false;
       if (!steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
         && !approvalAnswered && !waitingAgentRunReply) {
-        const conversation = await acceptAgentConversation(client, {
-          messageId,
-          workspaceId: access.workspace.id,
-          channelId: input.channelId,
-          parentMessageId,
-          body
-        });
-        if (!conversation) {
+        const conversation = routingDecision?.intent === 'engineering_delegation'
+          ? null
+          : await acceptAgentConversation(client, {
+              messageId,
+              workspaceId: access.workspace.id,
+              channelId: input.channelId,
+              parentMessageId,
+              body
+            });
+        if (!conversation && routingDecision?.intent !== 'engineering_delegation') {
           await acceptEligibleAgentMention(client, {
             messageId,
             workspaceId: access.workspace.id,
