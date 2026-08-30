@@ -850,7 +850,7 @@ if (skipDatabaseTests) {
 
     const coordination = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
-      body: `@Alex help decide what ${suppliedArtifactUrl} must achieve.`,
+      body: '@Alex help decide what Artifact artifact-conversation must achieve.',
       submissionId: 'conversation-coordination'
     });
     assert.equal(coordination.agentMention?.status, 'conversation');

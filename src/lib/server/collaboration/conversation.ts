@@ -310,8 +310,10 @@ export async function acceptAgentConversation(
        FROM public.artifact artifact
        WHERE artifact.workspace_id = $1 AND artifact.project_id = $2
          AND (
-           strpos($3, artifact.url) > 0
+           strpos($3, artifact.id) > 0
+           OR strpos($3, artifact.url) > 0
            OR strpos($3, artifact.result_message_id) > 0
+           OR strpos(COALESCE($4, ''), artifact.id) > 0
            OR strpos(COALESCE($4, ''), artifact.url) > 0
            OR strpos(COALESCE($4, ''), artifact.result_message_id) > 0
          )
