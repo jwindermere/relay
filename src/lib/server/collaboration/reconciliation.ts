@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 
 import type { PullRequestArtifact, VisibleAgentRunStatus } from '../../reconciliation.js';
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import type { AgentHandoffStatus } from './handoffs.js';
 import {
   loadAuthorizedChannelMessages,
   type ChannelMessage
@@ -25,14 +26,6 @@ export interface ReconciledAgentRun {
   events: ReconciledAgentRunEvent[];
   artifact?: PullRequestArtifact;
 }
-
-export type AgentHandoffStatus =
-  | 'queued'
-  | 'working'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-  | 'expired';
 
 export interface ReconciledAgentHandoff {
   id: string;

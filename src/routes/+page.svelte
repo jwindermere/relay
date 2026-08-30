@@ -723,6 +723,19 @@
     await invalidateAll();
   }
 
+  async function cancelHandoff(handoffId: string) {
+    const response = await fetch(
+      `/api/workspace/handoffs/${encodeURIComponent(handoffId)}`,
+      { method: 'DELETE' }
+    );
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      window.alert(result.message ?? 'Agent handoff could not be cancelled');
+      return;
+    }
+    await requestReconciliation();
+  }
+
   async function switchWorkspace(workspaceId: string) {
     if (!workspaceId || workspaceId === data.sharedChannel.workspace.id) return;
     workspaceBusy = true;
@@ -843,6 +856,13 @@
         </span>
         <strong>{handoff.sourceAgentName} → {handoff.targetAgentName}</strong>
         <span class="text-base-content/55">{handoff.summary}</span>
+        {#if handoff.status === 'queued'}
+          <button
+            class="btn btn-ghost btn-xs ml-auto"
+            type="button"
+            onclick={() => void cancelHandoff(handoff.id)}
+          >Cancel</button>
+        {/if}
       </div>
       <p class="mt-1 text-base-content/55">{handoff.question}</p>
     </div>

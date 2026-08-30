@@ -9,6 +9,7 @@ import {
   type ProviderNotification
 } from '../lib/server/provider/agent-run.js';
 import { acceptAgentConversation } from '../lib/server/collaboration/conversation.js';
+import { enqueueAgentHandoffStatus } from '../lib/server/collaboration/handoffs.js';
 
 interface ClaimedConversationTurn {
   id: string;
@@ -271,14 +272,11 @@ async function claimNextConversationTurn(
       [row.id, now, row.workspace_id]
     );
     if (startedHandoff.rows[0]) {
-      await client.query(
-        `INSERT INTO public.notification_outbox (
-           workspace_id, agent_handoff_id, topic, payload
-         ) VALUES ($1, $2, 'agent_handoff.status', $3)`,
-        [row.workspace_id, startedHandoff.rows[0].id, {
-          agentHandoffId: startedHandoff.rows[0].id,
-          status: 'working'
-        }]
+      await enqueueAgentHandoffStatus(
+        client,
+        row.workspace_id,
+        startedHandoff.rows[0].id,
+        'working'
       );
     }
     await client.query(
@@ -318,15 +316,7 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
     [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id), now]
   );
   for (const handoff of expired.rows) {
-    await client.query(
-      `INSERT INTO public.notification_outbox (
-         workspace_id, agent_handoff_id, topic, payload
-       ) VALUES ($1, $2, 'agent_handoff.status', $3)`,
-      [handoff.workspace_id, handoff.id, {
-        agentHandoffId: handoff.id,
-        status: 'expired'
-      }]
-    );
+    await enqueueAgentHandoffStatus(client, handoff.workspace_id, handoff.id, 'expired');
   }
 }
 
@@ -421,14 +411,11 @@ async function finishConversationTurn(
       [claim.id, claim.workspace_id, status, messageId, errorCode]
     );
     if (finishedHandoff.rows[0]) {
-      await client.query(
-        `INSERT INTO public.notification_outbox (
-           workspace_id, agent_handoff_id, topic, payload
-         ) VALUES ($1, $2, 'agent_handoff.status', $3)`,
-        [claim.workspace_id, finishedHandoff.rows[0].id, {
-          agentHandoffId: finishedHandoff.rows[0].id,
-          status
-        }]
+      await enqueueAgentHandoffStatus(
+        client,
+        claim.workspace_id,
+        finishedHandoff.rows[0].id,
+        status
       );
     }
     if (status === 'completed' && body !== null && messageId) {

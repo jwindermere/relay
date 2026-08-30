@@ -17,6 +17,8 @@ import {
 import { ingestGitHubWebhook } from '../src/lib/server/github/webhooks.js';
 import { AgentRunGitHubWorkspaceBroker } from '../src/lib/server/github/workspace.js';
 import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
+import { acceptAgentConversation } from '../src/lib/server/collaboration/conversation.js';
+import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
@@ -886,6 +888,72 @@ if (skipDatabaseTests) {
       agentId: handoff.rows[0].agent_id
     }, { handoffDepth: 1, agentId: productAgentId });
 
+    const handoffSourceMessageId = `conversation-result:${
+      coordination.agentMention?.status === 'conversation'
+        ? coordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const retryClient = await pool.connect();
+    try {
+      await retryClient.query('BEGIN');
+      const retry = await acceptAgentConversation(retryClient, {
+        messageId: handoffSourceMessageId,
+        workspaceId: ids.workspaceId,
+        channelId: ids.channelId,
+        parentMessageId: null,
+        body: '@Maya Which user outcome should define success for this fix?'
+      });
+      await retryClient.query('COMMIT');
+      assert.deepEqual(
+        retry?.status === 'conversation' && retry.conversationTurnId,
+        handoff.rows[0]?.id
+      );
+    } catch (error) {
+      await retryClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      retryClient.release();
+    }
+    const durableHandoff = await pool.query<{
+      originating_pilot_member_id: string;
+      source_agent_id: string;
+      target_agent_id: string;
+      project_id: string;
+      context_snapshot: {
+        projectId: string;
+        channelId: string;
+        sourceMessageId: string;
+        originatingRequest: { messageId: string; body: string };
+      };
+      artifact_references: unknown[];
+      expected_response_shape: string;
+    }>(
+      `SELECT originating_pilot_member_id, source_agent_id, target_agent_id, project_id,
+              context_snapshot, artifact_references, expected_response_shape
+       FROM public.agent_handoff WHERE receiving_turn_id = $1`,
+      [handoff.rows[0]?.id]
+    );
+    assert.deepEqual(durableHandoff.rows[0], {
+      originating_pilot_member_id: ids.pilotMemberId,
+      source_agent_id: ids.agentId,
+      target_agent_id: productAgentId,
+      project_id: ids.projectId,
+      context_snapshot: {
+        projectId: ids.projectId,
+        channelId: ids.channelId,
+        sourceConversationTurnId: coordination.agentMention?.status === 'conversation'
+          ? coordination.agentMention.conversationTurnId
+          : '',
+        sourceMessageId: handoffSourceMessageId,
+        originatingRequest: {
+          messageId: coordination.id,
+          body: coordination.body
+        }
+      },
+      artifact_references: [],
+      expected_response_shape: 'concise_text'
+    });
+
     const handoffProvider = new FixtureProvider(async (input, observer) => {
       const workingHandoffView = await loadChannelReconciliation(
         pool,
@@ -1002,6 +1070,68 @@ if (skipDatabaseTests) {
         ({ sourceMessageId }) => sourceMessageId === expiringSourceMessageId
       )?.status,
       'expired'
+    );
+
+    const cancellableCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask Product about a cancellable decision.',
+      submissionId: 'conversation-cancellable-coordination'
+    });
+    const cancellableCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-cancellable-coordination');
+      await observer.turnStarted('turn-conversation-cancellable-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-cancellable-coordination:message:completed',
+        item: {
+          id: 'message-conversation-cancellable-coordination',
+          type: 'agentMessage',
+          text: '@Maya Which option should we cancel?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-cancellable-coordination:completed',
+        turn: { id: 'turn-conversation-cancellable-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, cancellableCoordinator, {
+      workerId: 'worker-conversation-cancellable-coordination',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const cancellableSourceMessageId = `conversation-result:${
+      cancellableCoordination.agentMention?.status === 'conversation'
+        ? cancellableCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const cancellableHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    const cancellableHandoff = cancellableHandoffView.handoffs.find(
+      ({ sourceMessageId }) => sourceMessageId === cancellableSourceMessageId
+    );
+    assert.ok(cancellableHandoff);
+    await cancelAgentHandoff(pool, ids.ownerAccess, cancellableHandoff.id);
+    assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+      assert.fail('a cancelled handoff must not execute');
+    }), {
+      workerId: 'worker-conversation-cancelled', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'idle' });
+    const cancelledHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(
+      cancelledHandoffView.handoffs.find(
+        ({ sourceMessageId }) => sourceMessageId === cancellableSourceMessageId
+      )?.status,
+      'cancelled'
     );
 
     const recoveryCoordination = await postChannelMessage(pool, ids.ownerAccess, {

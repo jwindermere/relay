@@ -164,6 +164,8 @@ export async function acceptAgentConversation(
     source_agent_id: string | null;
     originating_pilot_member_id: string | null;
     source_turn_id: string | null;
+    source_request_message_id: string | null;
+    source_request_body: string | null;
     author_is_project_member: boolean;
     agent_is_project_member: boolean;
     provider_connection_id: string | null;
@@ -182,6 +184,8 @@ export async function acceptAgentConversation(
        author.agent_id AS source_agent_id,
        source_turn.requested_by_workspace_member_id AS originating_pilot_member_id,
        source_turn.id AS source_turn_id,
+       source_request.id AS source_request_message_id,
+       source_request.body AS source_request_body,
        EXISTS (
          SELECT 1 FROM public.project_membership author_project
          WHERE author_project.project_id = channel.project_id
@@ -205,6 +209,9 @@ export async function acceptAgentConversation(
      LEFT JOIN public.workspace_member source_requester
        ON source_requester.id = source_turn.requested_by_workspace_member_id
       AND source_requester.workspace_id = source_turn.workspace_id
+     LEFT JOIN public.message source_request
+       ON source_request.id = source_turn.request_message_id
+      AND source_request.workspace_id = source_turn.workspace_id
      WHERE message.id = $1 AND message.workspace_id = $2 AND channel.id = $3`,
     [context.messageId, context.workspaceId, context.channelId, agent.id]
   );
@@ -306,8 +313,13 @@ export async function acceptAgentConversation(
         context.messageId, storedTurnId, question,
         {
           channelId: context.channelId,
+          projectId: ready.project_id,
           sourceConversationTurnId: ready.source_turn_id,
-          sourceMessageId: context.messageId
+          sourceMessageId: context.messageId,
+          originatingRequest: {
+            messageId: ready.source_request_message_id,
+            body: ready.source_request_body
+          }
         }
       ]
     );
