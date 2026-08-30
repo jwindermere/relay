@@ -8,6 +8,8 @@
     "build:runtime": "esbuild src/worker/main.ts src/bin/migrate.ts src/bin/web.ts src/bin/bootstrap-owner.ts src/bin/smoke-codex-worker.ts src/bin/verify-pilot-journey.ts --bundle --platform=node --format=esm --packages=external --outdir=build-runtime",
     "dev:web": "node --env-file-if-exists=.env node_modules/vite/bin/vite.js dev",
     "dev:worker": "node --env-file-if-exists=.env node_modules/tsx/dist/cli.mjs watch src/worker/main.ts",
+    "db:up": "node --env-file-if-exists=.env scripts/dev-postgres.mjs up",
+    "db:down": "node --env-file-if-exists=.env scripts/dev-postgres.mjs down",
     "db:migrate": "node --env-file-if-exists=.env node_modules/tsx/dist/cli.mjs src/bin/migrate.ts",
     "bootstrap:owner": "node --env-file-if-exists=.env node_modules/tsx/dist/cli.mjs src/bin/bootstrap-owner.ts",
     "start:migrate": "node build-runtime/bin/migrate.js",

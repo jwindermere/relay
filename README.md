@@ -44,8 +44,21 @@ DATABASE_URL=postgres://relay:relay@localhost:5432/relay npm run db:migrate
 ```
 
 For local development, put `DATABASE_URL`, `BETTER_AUTH_SECRET`,
-`BETTER_AUTH_URL`, and `RELAY_REALTIME_SECRET` in `.env`, then run
-`npm run dev:web` and `npm run dev:worker` separately after migrating PostgreSQL.
+`BETTER_AUTH_URL`, and `RELAY_REALTIME_SECRET` in `.env`. A local Docker-backed
+PostgreSQL instance can then be started and migrated before running the web and
+worker processes separately:
+
+```sh
+bun run db:up
+bun run db:migrate
+bun run dev:web
+# In another terminal:
+bun run dev:worker
+```
+
+`db:up` reads the local port and credentials from `DATABASE_URL`, binds PostgreSQL
+only to `127.0.0.1`, and preserves its data in a named Docker volume. Stop the
+instance without deleting its data with `bun run db:down`.
 Calls use `https://meet.jit.si` in a separate browser tab by default so hosted iframe
 limits do not interrupt meetings. A self-hosted deployment can instead be shown
 inline or in a floating panel by setting both `RELAY_JITSI_BASE_URL` and

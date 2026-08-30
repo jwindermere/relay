@@ -69,6 +69,22 @@ export async function acceptAgentConversation(
   const mentioned = agents.rows.find(({ name }) =>
     explicitAgentMentionPattern(name).test(context.body)
   );
+  const requestAuthor = await client.query<{
+    kind: 'pilot' | 'agent';
+    agent_id: string | null;
+  }>(
+    `SELECT author.kind, author.agent_id
+     FROM public.message message
+     JOIN public.workspace_member author
+       ON author.id = message.author_workspace_member_id
+      AND author.workspace_id = message.workspace_id
+     WHERE message.id = $1 AND message.workspace_id = $2`,
+    [context.messageId, context.workspaceId]
+  );
+  const agentAuthored = requestAuthor.rows[0]?.kind === 'agent';
+  // Agent output is only routable as an explicit, bounded handoff. In particular,
+  // a reply in an existing Thread must not implicitly wake the same Agent again.
+  if (agentAuthored && !mentioned) return null;
   const rootMessageId = context.parentMessageId ?? context.messageId;
   const existing = context.parentMessageId
     ? await client.query<{ id: string; agent_id: string }>(
@@ -134,6 +150,8 @@ export async function acceptAgentConversation(
 
   const readiness = await client.query<{
     author_is_active_pilot: boolean;
+    valid_agent_handoff: boolean;
+    handoff_depth: number;
     author_is_project_member: boolean;
     agent_is_project_member: boolean;
     provider_connection_id: string | null;
@@ -141,6 +159,13 @@ export async function acceptAgentConversation(
   }>(
     `SELECT
        (author.kind = 'pilot' AND membership.revoked_at IS NULL) AS author_is_active_pilot,
+       (author.kind = 'agent'
+         AND author.agent_id <> $4
+         AND source_turn.id IS NOT NULL
+         AND source_turn.handoff_depth = 0
+         AND source_requester.kind = 'pilot') AS valid_agent_handoff,
+       CASE WHEN author.kind = 'agent' THEN COALESCE(source_turn.handoff_depth + 1, 2)
+            ELSE 0 END AS handoff_depth,
        EXISTS (
          SELECT 1 FROM public.project_membership author_project
          WHERE author_project.project_id = channel.project_id
@@ -158,11 +183,18 @@ export async function acceptAgentConversation(
      JOIN public.workspace_member author ON author.id = message.author_workspace_member_id
      LEFT JOIN public.workspace_membership membership ON membership.id = author.pilot_membership_id
      LEFT JOIN public.provider_connection provider ON provider.workspace_id = message.workspace_id
+     LEFT JOIN public.agent_conversation_turn source_turn
+       ON source_turn.response_message_id = message.id
+      AND source_turn.workspace_id = message.workspace_id
+     LEFT JOIN public.workspace_member source_requester
+       ON source_requester.id = source_turn.requested_by_workspace_member_id
+      AND source_requester.workspace_id = source_turn.workspace_id
      WHERE message.id = $1 AND message.workspace_id = $2 AND channel.id = $3`,
     [context.messageId, context.workspaceId, context.channelId, agent.id]
   );
   const ready = readiness.rows[0];
-  const rejection = !ready?.author_is_active_pilot
+  if (agentAuthored && !ready?.valid_agent_handoff) return null;
+  const rejection = !ready?.author_is_active_pilot && !ready?.valid_agent_handoff
     ? 'Active Pilot member access is required.'
     : !ready.author_is_project_member
       ? 'This Channel is not eligible for Agent conversation.'
@@ -222,15 +254,15 @@ export async function acceptAgentConversation(
     `INSERT INTO public.agent_conversation_turn (
        id, workspace_id, conversation_id, request_message_id,
        requested_by_workspace_member_id, status, response_placement,
-       response_parent_message_id, ambient
+       response_parent_message_id, ambient, handoff_depth
      )
-     SELECT $1, $2, $3, message.id, message.author_workspace_member_id, 'queued', $5, $6, $7
+     SELECT $1, $2, $3, message.id, message.author_workspace_member_id, 'queued', $5, $6, $7, $8
      FROM public.message message WHERE message.id = $4 AND message.workspace_id = $2
      ON CONFLICT (request_message_id) DO NOTHING
      RETURNING id`,
     [
       turnId, context.workspaceId, storedConversationId, context.messageId,
-      responsePlacement, responseParentMessageId, ambient
+      responsePlacement, responseParentMessageId, ambient, ready.handoff_depth
     ]
   );
   const storedTurnId = turn.rows[0]?.id ?? (await client.query<{ id: string }>(

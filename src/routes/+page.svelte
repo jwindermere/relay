@@ -1459,6 +1459,9 @@
     <section class="settings-section" aria-label="Workspace Agents">
       <div class="eyebrow">04 / Agents</div>
       <h3 class="mt-2 text-base font-medium text-[#f1efe8]">Specialist teammates</h3>
+      <p class="mt-3 text-sm leading-6 text-base-content/48">
+        A specialist answering you may hand one concrete question to one other Agent. Engineering work still requires a Pilot member to delegate it.
+      </p>
       <div class="mt-4 space-y-2">
         {#each data.agentConfiguration.agents as agent (agent.id)}
           <button class="flex w-full items-center gap-3 border border-white/10 p-3 text-left hover:border-primary/60" type="button" onclick={() => editAgent(agent)}>

@@ -793,6 +793,101 @@ if (skipDatabaseTests) {
       recoveryReply.rows[0]?.body,
       'I lost the active response during a worker restart. Please send that message again.'
     );
+
+    const productAgentId = 'agent-conversation-product';
+    const productMemberId = `${productAgentId}:member`;
+    await pool.query(
+      `INSERT INTO public.agent (
+         id, workspace_id, name, agent_type, role_label, instructions,
+         participation_mode, ambient_triggers
+       ) VALUES ($1, $2, 'Maya', 'product', 'Product manager',
+                 'Clarify the product outcome.', 'reactive', ARRAY[]::text[])`,
+      [productAgentId, ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ($1, $2, 'agent', $3)`,
+      [productMemberId, ids.workspaceId, productAgentId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ids.workspaceId, ids.projectId, productMemberId]
+    );
+
+    const coordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex help decide what the reconnect fix must achieve.',
+      submissionId: 'conversation-coordination'
+    });
+    assert.equal(coordination.agentMention?.status, 'conversation');
+    const coordinatingProvider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /one bounded handoff/);
+      assert.match(input.prompt, /@Maya \(Product manager\)/);
+      await observer.threadStarted('thread-conversation-coordination');
+      await observer.turnStarted('turn-conversation-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-coordination:message:completed',
+        item: {
+          id: 'message-conversation-coordination',
+          type: 'agentMessage',
+          text: '@Maya Which user outcome should define success for this fix?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-coordination:completed',
+        turn: { id: 'turn-conversation-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, coordinatingProvider, {
+      workerId: 'worker-conversation-coordination', workspaceRoot, leaseDurationMs: 10_000
+    });
+
+    const handoff = await pool.query<{ id: string; handoff_depth: number; agent_id: string }>(
+      `SELECT turn.id, turn.handoff_depth, conversation.agent_id
+       FROM public.agent_conversation_turn turn
+       JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
+       WHERE turn.request_message_id = $1`,
+      [`conversation-result:${coordination.agentMention?.status === 'conversation'
+        ? coordination.agentMention.conversationTurnId : ''}`]
+    );
+    assert.deepEqual(handoff.rows[0] && {
+      handoffDepth: handoff.rows[0].handoff_depth,
+      agentId: handoff.rows[0].agent_id
+    }, { handoffDepth: 1, agentId: productAgentId });
+
+    const handoffProvider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /bounded Agent handoff/);
+      assert.doesNotMatch(input.prompt, /you may make one bounded handoff/);
+      await observer.threadStarted('thread-conversation-product');
+      await observer.turnStarted('turn-conversation-product');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-product:message:completed',
+        item: {
+          id: 'message-conversation-product',
+          type: 'agentMessage',
+          text: 'Success means users reconnect without losing in-flight work. @Alex please confirm.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-product:completed',
+        turn: { id: 'turn-conversation-product', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, handoffProvider, {
+      workerId: 'worker-conversation-product', workspaceRoot, leaseDurationMs: 10_000
+    });
+    const cascaded = await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count
+       FROM public.agent_conversation_turn
+       WHERE requested_by_workspace_member_id = $1`,
+      [productMemberId]
+    );
+    assert.equal(cascaded.rows[0]?.count, 0);
   });
 
   test('a Provider clarification waits visibly for durable Pilot input and continues the same turn', async () => {

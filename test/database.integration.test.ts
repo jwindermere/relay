@@ -565,7 +565,9 @@ if (connectionString) {
       initial.members.map(({ name, kind }) => ({ name, kind })),
       [
         { name: 'Alex', kind: 'agent' },
+        { name: 'Maya', kind: 'agent' },
         { name: 'Pilot member', kind: 'pilot' },
+        { name: 'Riley', kind: 'agent' },
         { name: 'Relay Owner', kind: 'pilot' }
       ]
     );

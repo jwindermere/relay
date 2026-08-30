@@ -1,0 +1,6 @@
+[ 9347967ms] [LOG] [vite] server connection lost. Polling for restart... @ http://127.0.0.1:5174/@vite/client:1002
+[ 9348973ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:5174/api/realtime-ticket:0
+[ 9348974ms] TypeError: Failed to fetch
+    at window.fetch (http://127.0.0.1:5174/node_modules/@sveltejs/kit/src/runtime/client/fetcher.js?v=ae659fde:67:10)
+    at connect (http://127.0.0.1:5174/src/routes/+page.svelte?t=1787823719560:1007:58)
+    at http://127.0.0.1:5174/src/routes/+page.svelte?t=1787823719560:1056:58

@@ -148,6 +148,10 @@ An AgentRun stopped at an uncertain execution boundary that requires human revie
 
 A Workspace may configure multiple named specialist Agents. Relay routes each Message to at most one conversational Agent and retains a single Engineering AgentRun assignee, preventing fan-out and uncontrolled social loops while preserving distinct Agent identities and specialties.
 
+## Agent handoff
+
+A bounded request from an Agent answering a Pilot member to exactly one other specialist Agent for a concrete input. The receiving Agent may answer once but may not hand off again. An Agent handoff is conversational coordination: it creates no Task or AgentRun and cannot authorize engineering work.
+
 ## MVP pilot success
 
 Invited Pilot members can collaborate with configured Agents through the Shared Agent Channel; an Engineering Agent completes at least one reviewable pull request; and its run remains understandable and recoverable through visible status, clarification, and a restart.

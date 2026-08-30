@@ -8,6 +8,7 @@ import {
   type AgentRunProvider,
   type ProviderNotification
 } from '../lib/server/provider/agent-run.js';
+import { acceptAgentConversation } from '../lib/server/collaboration/conversation.js';
 
 interface ClaimedConversationTurn {
   id: string;
@@ -22,8 +23,10 @@ interface ClaimedConversationTurn {
   agent_type: string;
   agent_role_label: string;
   agent_instructions: string;
+  collaborator_roster: string;
   response_parent_message_id: string | null;
   ambient: boolean;
+  handoff_depth: number;
   provider_thread_id: string | null;
   credential_store_reference: string;
   lease_token: string;
@@ -84,7 +87,13 @@ export async function processNextConversationTurn(
         claim.ambient
           ? 'You were not tagged. Reply only if your contribution is relevant, useful, and timely. If staying silent is better, return exactly [RELAY_SILENT].'
           : 'Reply directly and naturally to the latest message.',
-        'Do not repeat an answer already present in the recent context and do not start agent-to-agent chatter.',
+        claim.handoff_depth === 0 && claim.collaborator_roster
+          ? `If one specialist input would materially improve your answer, you may make one bounded handoff by @mentioning exactly one of these teammates with a concrete question: ${claim.collaborator_roster}.`
+          : '',
+        claim.handoff_depth === 1
+          ? 'This is a bounded Agent handoff. Answer the requested input directly and do not @mention another Agent.'
+          : 'Do not start social or open-ended agent-to-agent chatter.',
+        'Do not repeat an answer already present in the recent context.',
         'Do not inspect files, run commands, modify a repository, or use tools.',
         'If the request is ambiguous, ask a concise conversational follow-up question.',
         '',
@@ -171,7 +180,23 @@ async function claimNextConversationTurn(
               agent_member.id AS agent_member_id, agent.name AS agent_name,
               agent.agent_type, agent.role_label AS agent_role_label,
               agent.instructions AS agent_instructions,
-              turn.response_parent_message_id, turn.ambient,
+              COALESCE((
+                SELECT string_agg('@' || collaborator.name || ' (' || collaborator.role_label || ')', ', '
+                                  ORDER BY collaborator.name, collaborator.id)
+                FROM public.agent collaborator
+                JOIN public.workspace_member collaborator_member
+                  ON collaborator_member.agent_id = collaborator.id
+                 AND collaborator_member.workspace_id = collaborator.workspace_id
+                JOIN public.project_membership collaborator_project
+                  ON collaborator_project.workspace_member_id = collaborator_member.id
+                JOIN public.channel collaborator_channel
+                  ON collaborator_channel.project_id = collaborator_project.project_id
+                 AND collaborator_channel.id = conversation.channel_id
+                WHERE collaborator.workspace_id = turn.workspace_id
+                  AND collaborator.id <> conversation.agent_id
+                  AND collaborator.enabled = true AND collaborator.status <> 'disabled'
+              ), '') AS collaborator_roster,
+              turn.response_parent_message_id, turn.ambient, turn.handoff_depth,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
               connection.credential_store_reference,
               (turn.lease_expires_at IS NOT NULL AND turn.lease_expires_at <= $1) AS recovering
@@ -334,6 +359,15 @@ async function finishConversationTurn(
        WHERE id = $1 AND workspace_id = $2 AND lease_token = $3`,
       [claim.id, claim.workspace_id, claim.lease_token, status, messageId, errorCode]
     );
+    if (status === 'completed' && body !== null && messageId) {
+      await acceptAgentConversation(client, {
+        messageId,
+        workspaceId: claim.workspace_id,
+        channelId: claim.channel_id,
+        parentMessageId: claim.response_parent_message_id,
+        body
+      });
+    }
     await restoreAgentStatus(client, claim.agent_id);
     await client.query('COMMIT');
   } catch (error) {
