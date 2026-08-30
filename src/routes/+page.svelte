@@ -57,6 +57,7 @@
   let editingWorkspaceName = $state('');
   let realtimeRuns = $state<VisibleAgentRuns>({});
   let realtimeMessages = $state<typeof data.sharedChannel.messages>([]);
+  let realtimeHandoffs = $state<typeof data.reconciliation.handoffs>([]);
   let activeCall = $state<typeof data.activeCall>(null);
   let callBusy = $state(false);
   let callMessage = $state('');
@@ -70,6 +71,9 @@
   let humanTypers = $state<Record<string, { name: string; expiresAt: number }>>({});
   let githubConfiguration = $derived(data.linkedRepository.configuration);
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
+  let agentHandoffs = $derived(
+    realtimeHandoffs.length > 0 ? realtimeHandoffs : data.reconciliation.handoffs
+  );
   let channelMessages = $derived(mergeChannelMessages(
     data.sharedChannel.messages,
     realtimeMessages
@@ -103,6 +107,10 @@
 
   function repliesFor(rootId: string) {
     return channelMessages.filter((message) => message.parentMessageId === rootId);
+  }
+
+  function handoffForSource(sourceMessageId: string) {
+    return agentHandoffs.find((handoff) => handoff.sourceMessageId === sourceMessageId);
   }
 
   function initials(name: string) {
@@ -402,9 +410,11 @@
         if (!response.ok) throw new Error('Channel status could not be refreshed');
         const update = await response.json() as ChannelReconciliationUpdate & {
           messages: typeof data.sharedChannel.messages;
+          handoffs: typeof data.reconciliation.handoffs;
         };
         realtimeMessages = mergeChannelMessages(realtimeMessages, update.messages);
         realtimeRuns = applyChannelReconciliation(agentRuns, update);
+        realtimeHandoffs = update.handoffs;
         await refreshActiveCall();
       }
     })().catch(() => {
@@ -788,6 +798,7 @@
 </script>
 
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
+  {@const handoff = handoffForSource(message.id)}
   {#if message.agentMention?.status === 'accepted'}
     {@const run = latestVisibleAgentRunForSource(agentRuns, message.id)}
     <p class="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-success" role="status">
@@ -823,6 +834,18 @@
     </p>
   {:else if message.agentMention?.status === 'rejected'}
     <p class="mt-2 text-xs text-warning" role="status">{message.agentMention.reason}</p>
+  {/if}
+  {#if handoff}
+    <div class="mt-2 border-l-2 border-primary/45 pl-3 text-xs" role="status">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="badge badge-sm rounded-sm border-primary/35 bg-primary/8 text-primary">
+          Handoff · {handoff.status}
+        </span>
+        <strong>{handoff.sourceAgentName} → {handoff.targetAgentName}</strong>
+        <span class="text-base-content/55">{handoff.summary}</span>
+      </div>
+      <p class="mt-1 text-base-content/55">{handoff.question}</p>
+    </div>
   {/if}
 {/snippet}
 

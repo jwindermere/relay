@@ -845,6 +845,34 @@ if (skipDatabaseTests) {
       workerId: 'worker-conversation-coordination', workspaceRoot, leaseDurationMs: 10_000
     });
 
+    const queuedHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(queuedHandoffView.handoffs.map((handoff) => ({
+      sourceMessageId: handoff.sourceMessageId,
+      sourceAgentName: handoff.sourceAgentName,
+      targetAgentName: handoff.targetAgentName,
+      question: handoff.question,
+      expectedResponseShape: handoff.expectedResponseShape,
+      status: handoff.status,
+      summary: handoff.summary,
+      resultMessageId: handoff.resultMessageId
+    })), [{
+      sourceMessageId: `conversation-result:${coordination.agentMention?.status === 'conversation'
+        ? coordination.agentMention.conversationTurnId
+        : ''}`,
+      sourceAgentName: 'Alex',
+      targetAgentName: 'Maya',
+      question: 'Which user outcome should define success for this fix?',
+      expectedResponseShape: 'concise_text',
+      status: 'queued',
+      summary: 'Waiting for Maya',
+      resultMessageId: null
+    }]);
+
     const handoff = await pool.query<{ id: string; handoff_depth: number; agent_id: string }>(
       `SELECT turn.id, turn.handoff_depth, conversation.agent_id
        FROM public.agent_conversation_turn turn
@@ -859,6 +887,16 @@ if (skipDatabaseTests) {
     }, { handoffDepth: 1, agentId: productAgentId });
 
     const handoffProvider = new FixtureProvider(async (input, observer) => {
+      const workingHandoffView = await loadChannelReconciliation(
+        pool,
+        ids.ownerAccess,
+        ids.channelId,
+        {}
+      );
+      assert.deepEqual(workingHandoffView.handoffs.map(({ status, summary }) => ({
+        status,
+        summary
+      })), [{ status: 'working', summary: 'Maya is responding' }]);
       assert.match(input.prompt, /bounded Agent handoff/);
       assert.doesNotMatch(input.prompt, /you may make one bounded handoff/);
       await observer.threadStarted('thread-conversation-product');
@@ -869,7 +907,7 @@ if (skipDatabaseTests) {
         item: {
           id: 'message-conversation-product',
           type: 'agentMessage',
-          text: 'Success means users reconnect without losing in-flight work. @Alex please confirm.'
+          text: 'Success means users reconnect without losing in-flight work. @Alex implement it.'
         }
       });
       await observer.notification({
@@ -881,6 +919,27 @@ if (skipDatabaseTests) {
     await processNextConversationTurn(pool, handoffProvider, {
       workerId: 'worker-conversation-product', workspaceRoot, leaseDurationMs: 10_000
     });
+    const completedHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(completedHandoffView.handoffs.map(({ status, summary, resultMessageId }) => ({
+      status,
+      summary,
+      resultMessageId
+    })), [{
+      status: 'completed',
+      summary: 'Maya responded',
+      resultMessageId: `conversation-result:${handoff.rows[0]?.id}`
+    }]);
+    assert.equal(
+      completedHandoffView.runs.find(
+        ({ sourceMessageId }) => sourceMessageId === `conversation-result:${handoff.rows[0]?.id}`
+      ),
+      undefined
+    );
     const cascaded = await pool.query<{ count: number }>(
       `SELECT count(*)::integer AS count
        FROM public.agent_conversation_turn
@@ -888,6 +947,149 @@ if (skipDatabaseTests) {
       [productMemberId]
     );
     assert.equal(cascaded.rows[0]?.count, 0);
+
+    const expiringCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask for one more product decision.',
+      submissionId: 'conversation-expiring-coordination'
+    });
+    const expiringCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-expiring-coordination');
+      await observer.turnStarted('turn-conversation-expiring-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-expiring-coordination:message:completed',
+        item: {
+          id: 'message-conversation-expiring-coordination',
+          type: 'agentMessage',
+          text: '@Maya Which constraint matters most?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-expiring-coordination:completed',
+        turn: { id: 'turn-conversation-expiring-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, expiringCoordinator, {
+      workerId: 'worker-conversation-expiring-coordination',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const expiringSourceMessageId = `conversation-result:${
+      expiringCoordination.agentMention?.status === 'conversation'
+        ? expiringCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    await pool.query(
+      `UPDATE public.agent_handoff SET expires_at = now() - interval '1 minute'
+       WHERE source_message_id = $1`,
+      [expiringSourceMessageId]
+    );
+    assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+      assert.fail('an expired handoff must not execute');
+    }), {
+      workerId: 'worker-conversation-expired', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'idle' });
+    const expiredHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(
+      expiredHandoffView.handoffs.find(
+        ({ sourceMessageId }) => sourceMessageId === expiringSourceMessageId
+      )?.status,
+      'expired'
+    );
+
+    const recoveryCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask Product about recovery.',
+      submissionId: 'conversation-recovery-coordination'
+    });
+    const recoveryCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-recovery-coordination');
+      await observer.turnStarted('turn-conversation-recovery-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-recovery-coordination:message:completed',
+        item: {
+          id: 'message-conversation-recovery-coordination',
+          type: 'agentMessage',
+          text: '@Maya What must recovery preserve?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-recovery-coordination:completed',
+        turn: { id: 'turn-conversation-recovery-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, recoveryCoordinator, {
+      workerId: 'worker-conversation-recovery-coordination',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const recoverySourceMessageId = `conversation-result:${
+      recoveryCoordination.agentMention?.status === 'conversation'
+        ? recoveryCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const recoveryHandoff = await pool.query<{ receiving_turn_id: string }>(
+      `UPDATE public.agent_handoff
+       SET status = 'working', started_at = now() - interval '2 minutes'
+       WHERE source_message_id = $1
+       RETURNING receiving_turn_id`,
+      [recoverySourceMessageId]
+    );
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'working', lease_owner = 'lost-handoff-worker',
+           lease_token = 'lost-handoff-lease',
+           lease_expires_at = now() - interval '1 minute',
+           started_at = now() - interval '2 minutes'
+       WHERE id = $1`,
+      [recoveryHandoff.rows[0]?.receiving_turn_id]
+    );
+    assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+      assert.fail('an uncertain handoff must not be replayed');
+    }), {
+      workerId: 'worker-conversation-handoff-recovery',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    }), {
+      kind: 'conversation',
+      conversationTurnId: recoveryHandoff.rows[0]?.receiving_turn_id,
+      status: 'failed'
+    });
+    const failedHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(
+      failedHandoffView.handoffs.find(
+        ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+      ) && {
+        status: failedHandoffView.handoffs.find(
+          ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+        )?.status,
+        summary: failedHandoffView.handoffs.find(
+          ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+        )?.summary,
+        resultMessageId: failedHandoffView.handoffs.find(
+          ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+        )?.resultMessageId
+      },
+      {
+        status: 'failed',
+        summary: 'Maya could not respond',
+        resultMessageId: `conversation-result:${recoveryHandoff.rows[0]?.receiving_turn_id}`
+      }
+    );
   });
 
   test('a Provider clarification waits visibly for durable Pilot input and continues the same turn', async () => {

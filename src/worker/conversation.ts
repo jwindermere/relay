@@ -171,6 +171,7 @@ async function claimNextConversationTurn(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await expireQueuedAgentHandoffs(client, now);
     const candidate = await client.query<Omit<ClaimedConversationTurn, 'lease_token'> & {
       provider_connection_id: string;
     }>(
@@ -262,6 +263,24 @@ async function claimNextConversationTurn(
        WHERE id = $5`,
       [now, workerId, leaseToken, new Date(now.getTime() + leaseDurationMs), row.id]
     );
+    const startedHandoff = await client.query<{ id: string }>(
+      `UPDATE public.agent_handoff
+       SET status = 'working', started_at = COALESCE(started_at, $2), updated_at = $2
+       WHERE receiving_turn_id = $1 AND workspace_id = $3 AND status = 'queued'
+       RETURNING id`,
+      [row.id, now, row.workspace_id]
+    );
+    if (startedHandoff.rows[0]) {
+      await client.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, agent_handoff_id, topic, payload
+         ) VALUES ($1, $2, 'agent_handoff.status', $3)`,
+        [row.workspace_id, startedHandoff.rows[0].id, {
+          agentHandoffId: startedHandoff.rows[0].id,
+          status: 'working'
+        }]
+      );
+    }
     await client.query(
       `UPDATE public.agent SET status = 'working'
        WHERE id = $1 AND enabled = true`,
@@ -274,6 +293,40 @@ async function claimNextConversationTurn(
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise<void> {
+  const expired = await client.query<{
+    id: string;
+    workspace_id: string;
+    receiving_turn_id: string;
+  }>(
+    `UPDATE public.agent_handoff
+     SET status = 'expired', expired_at = $1, updated_at = $1,
+         error_code = 'handoff_expired'
+     WHERE status = 'queued' AND expires_at <= $1
+     RETURNING id, workspace_id, receiving_turn_id`,
+    [now]
+  );
+  if (expired.rows.length === 0) return;
+  await client.query(
+    `UPDATE public.agent_conversation_turn
+     SET status = 'failed', error_code = 'handoff_expired',
+         completed_at = $2, updated_at = $2
+     WHERE id = ANY($1::text[]) AND status = 'queued'`,
+    [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id), now]
+  );
+  for (const handoff of expired.rows) {
+    await client.query(
+      `INSERT INTO public.notification_outbox (
+         workspace_id, agent_handoff_id, topic, payload
+       ) VALUES ($1, $2, 'agent_handoff.status', $3)`,
+      [handoff.workspace_id, handoff.id, {
+        agentHandoffId: handoff.id,
+        status: 'expired'
+      }]
+    );
   }
 }
 
@@ -359,6 +412,25 @@ async function finishConversationTurn(
        WHERE id = $1 AND workspace_id = $2 AND lease_token = $3`,
       [claim.id, claim.workspace_id, claim.lease_token, status, messageId, errorCode]
     );
+    const finishedHandoff = await client.query<{ id: string }>(
+      `UPDATE public.agent_handoff
+       SET status = $3, result_message_id = $4, error_code = $5,
+           completed_at = now(), updated_at = now()
+       WHERE receiving_turn_id = $1 AND workspace_id = $2 AND status = 'working'
+       RETURNING id`,
+      [claim.id, claim.workspace_id, status, messageId, errorCode]
+    );
+    if (finishedHandoff.rows[0]) {
+      await client.query(
+        `INSERT INTO public.notification_outbox (
+           workspace_id, agent_handoff_id, topic, payload
+         ) VALUES ($1, $2, 'agent_handoff.status', $3)`,
+        [claim.workspace_id, finishedHandoff.rows[0].id, {
+          agentHandoffId: finishedHandoff.rows[0].id,
+          status
+        }]
+      );
+    }
     if (status === 'completed' && body !== null && messageId) {
       await acceptAgentConversation(client, {
         messageId,

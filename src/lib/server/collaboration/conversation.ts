@@ -36,6 +36,14 @@ function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean
   return normalizedBody.includes(normalized);
 }
 
+function handoffQuestion(body: string, agentName: string): string {
+  return body
+    .replace(explicitAgentMentionPattern(agentName), ' ')
+    .trim()
+    .replace(/^[\s,.:;!?-]+/u, '')
+    .trim();
+}
+
 export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
   const normalizedBody = body.toLocaleLowerCase();
   return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
@@ -152,6 +160,10 @@ export async function acceptAgentConversation(
     author_is_active_pilot: boolean;
     valid_agent_handoff: boolean;
     handoff_depth: number;
+    project_id: string | null;
+    source_agent_id: string | null;
+    originating_pilot_member_id: string | null;
+    source_turn_id: string | null;
     author_is_project_member: boolean;
     agent_is_project_member: boolean;
     provider_connection_id: string | null;
@@ -166,6 +178,10 @@ export async function acceptAgentConversation(
          AND source_requester.kind = 'pilot') AS valid_agent_handoff,
        CASE WHEN author.kind = 'agent' THEN COALESCE(source_turn.handoff_depth + 1, 2)
             ELSE 0 END AS handoff_depth,
+       channel.project_id,
+       author.agent_id AS source_agent_id,
+       source_turn.requested_by_workspace_member_id AS originating_pilot_member_id,
+       source_turn.id AS source_turn_id,
        EXISTS (
          SELECT 1 FROM public.project_membership author_project
          WHERE author_project.project_id = channel.project_id
@@ -270,6 +286,32 @@ export async function acceptAgentConversation(
     [context.messageId]
   )).rows[0]?.id;
   if (!storedTurnId) throw new Error('Agent conversation turn could not be created');
+  if (agentAuthored) {
+    if (!ready.project_id || !ready.source_agent_id
+      || !ready.originating_pilot_member_id || !ready.source_turn_id) {
+      throw new Error('Agent handoff provenance could not be established');
+    }
+    const question = handoffQuestion(context.body, agent.name);
+    if (!question) throw new Error('Agent handoff must contain a concrete question');
+    await client.query(
+      `INSERT INTO public.agent_handoff (
+         id, workspace_id, project_id, originating_pilot_member_id,
+         source_agent_id, target_agent_id, source_message_id, receiving_turn_id,
+         question, context_snapshot, artifact_references, expected_response_shape
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '[]'::jsonb, 'concise_text')
+       ON CONFLICT (source_message_id) DO NOTHING`,
+      [
+        randomUUID(), context.workspaceId, ready.project_id,
+        ready.originating_pilot_member_id, ready.source_agent_id, agent.id,
+        context.messageId, storedTurnId, question,
+        {
+          channelId: context.channelId,
+          sourceConversationTurnId: ready.source_turn_id,
+          sourceMessageId: context.messageId
+        }
+      ]
+    );
+  }
   await client.query(
     `UPDATE public.message
      SET agent_mention_status = 'conversation', mentioned_agent_id = $2

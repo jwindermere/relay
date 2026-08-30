@@ -160,6 +160,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'agent_conversation' },
       { table_schema: 'public', table_name: 'agent_conversation_turn' },
+      { table_schema: 'public', table_name: 'agent_handoff' },
       { table_schema: 'public', table_name: 'agent_run' },
       { table_schema: 'public', table_name: 'agent_run_cancellation_request' },
       { table_schema: 'public', table_name: 'agent_run_clarification' },
@@ -567,8 +568,8 @@ if (connectionString) {
         { name: 'Alex', kind: 'agent' },
         { name: 'Maya', kind: 'agent' },
         { name: 'Pilot member', kind: 'pilot' },
-        { name: 'Riley', kind: 'agent' },
-        { name: 'Relay Owner', kind: 'pilot' }
+        { name: 'Relay Owner', kind: 'pilot' },
+        { name: 'Riley', kind: 'agent' }
       ]
     );
 
