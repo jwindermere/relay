@@ -302,7 +302,10 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
   }>(
     `UPDATE public.agent_handoff
      SET status = 'expired', expired_at = $1, updated_at = $1,
-         error_code = 'handoff_expired'
+         error_code = 'handoff_expired',
+         outcome_snapshot = jsonb_build_object(
+           'kind', 'expired', 'errorCode', 'handoff_expired'
+         )
      WHERE status = 'queued' AND expires_at <= $1
      RETURNING id, workspace_id, receiving_turn_id`,
     [now]
@@ -405,10 +408,22 @@ async function finishConversationTurn(
     const finishedHandoff = await client.query<{ id: string }>(
       `UPDATE public.agent_handoff
        SET status = $3, result_message_id = $4, error_code = $5,
-           completed_at = now(), updated_at = now()
+           completed_at = now(), updated_at = now(), outcome_snapshot = $6
        WHERE receiving_turn_id = $1 AND workspace_id = $2 AND status = 'working'
        RETURNING id`,
-      [claim.id, claim.workspace_id, status, messageId, errorCode]
+      [
+        claim.id,
+        claim.workspace_id,
+        status,
+        messageId,
+        errorCode,
+        {
+          kind: status,
+          resultMessageId: messageId,
+          body,
+          errorCode
+        }
+      ]
     );
     if (finishedHandoff.rows[0]) {
       await enqueueAgentHandoffStatus(

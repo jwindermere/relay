@@ -300,12 +300,44 @@ export async function acceptAgentConversation(
     }
     const question = handoffQuestion(context.body, agent.name);
     if (!question) throw new Error('Agent handoff must contain a concrete question');
+    const suppliedArtifacts = await client.query<{
+      id: string;
+      kind: string;
+      result_message_id: string;
+      url: string;
+    }>(
+      `SELECT artifact.id, artifact.kind, artifact.result_message_id, artifact.url
+       FROM public.artifact artifact
+       WHERE artifact.workspace_id = $1 AND artifact.project_id = $2
+         AND (
+           strpos($3, artifact.url) > 0
+           OR strpos($3, artifact.result_message_id) > 0
+           OR strpos(COALESCE($4, ''), artifact.url) > 0
+           OR strpos(COALESCE($4, ''), artifact.result_message_id) > 0
+         )
+       ORDER BY artifact.created_at, artifact.id`,
+      [
+        context.workspaceId,
+        ready.project_id,
+        context.body,
+        ready.source_request_body
+      ]
+    );
+    const artifactReferences = suppliedArtifacts.rows.map((artifact) => ({
+      artifactId: artifact.id,
+      kind: artifact.kind,
+      resultMessageId: artifact.result_message_id,
+      url: artifact.url
+    }));
+    const expectedResponseShape = agent.agent_type === 'research'
+      ? 'structured_finding'
+      : 'concise_text';
     await client.query(
       `INSERT INTO public.agent_handoff (
          id, workspace_id, project_id, originating_pilot_member_id,
          source_agent_id, target_agent_id, source_message_id, receiving_turn_id,
          question, context_snapshot, artifact_references, expected_response_shape
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '[]'::jsonb, 'concise_text')
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (source_message_id) DO NOTHING`,
       [
         randomUUID(), context.workspaceId, ready.project_id,
@@ -320,7 +352,9 @@ export async function acceptAgentConversation(
             messageId: ready.source_request_message_id,
             body: ready.source_request_body
           }
-        }
+        },
+        JSON.stringify(artifactReferences),
+        expectedResponseShape
       ]
     );
   }

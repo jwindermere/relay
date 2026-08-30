@@ -42,7 +42,10 @@ export async function cancelAgentHandoff(
     const cancelled = await client.query<{ id: string; receiving_turn_id: string }>(
       `UPDATE public.agent_handoff handoff
        SET status = 'cancelled', cancelled_at = now(), updated_at = now(),
-           error_code = 'handoff_cancelled'
+           error_code = 'handoff_cancelled',
+           outcome_snapshot = jsonb_build_object(
+             'kind', 'cancelled', 'errorCode', 'handoff_cancelled'
+           )
        FROM public.workspace_member actor
        JOIN public.project_membership membership
          ON membership.workspace_member_id = actor.id

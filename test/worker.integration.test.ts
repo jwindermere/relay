@@ -816,10 +816,41 @@ if (skipDatabaseTests) {
        VALUES ($1, $2, $3)`,
       [ids.workspaceId, ids.projectId, productMemberId]
     );
+    const suppliedArtifactUrl = 'https://github.test/relay-owner/pilot/pull/39';
+    await pool.query(`UPDATE public.task SET status = 'completed' WHERE id = 'task-conversation'`);
+    await pool.query(
+      `UPDATE public.agent_run SET status = 'completed' WHERE id = 'run-conversation'`
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES (
+         'artifact-result-conversation', $1, $2, $3, 'message-conversation',
+         'Pull request #39 is ready for review.'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.artifact (
+         id, workspace_id, project_id, task_id, agent_run_id, result_message_id,
+         kind, repository_id, branch, commit_sha, pull_request_number, url
+       ) VALUES (
+         'artifact-conversation', $1, $2, 'task-conversation', 'run-conversation',
+         'artifact-result-conversation', 'github_pull_request', $3,
+         'relay/run-conversation', $4, 39, $5
+       )`,
+      [
+        ids.workspaceId,
+        ids.projectId,
+        `repo-conversation`,
+        'a'.repeat(40),
+        suppliedArtifactUrl
+      ]
+    );
 
     const coordination = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
-      body: '@Alex help decide what the reconnect fix must achieve.',
+      body: `@Alex help decide what ${suppliedArtifactUrl} must achieve.`,
       submissionId: 'conversation-coordination'
     });
     assert.equal(coordination.agentMention?.status, 'conversation');
@@ -927,9 +958,10 @@ if (skipDatabaseTests) {
       };
       artifact_references: unknown[];
       expected_response_shape: string;
+      outcome_snapshot: unknown;
     }>(
       `SELECT originating_pilot_member_id, source_agent_id, target_agent_id, project_id,
-              context_snapshot, artifact_references, expected_response_shape
+              context_snapshot, artifact_references, expected_response_shape, outcome_snapshot
        FROM public.agent_handoff WHERE receiving_turn_id = $1`,
       [handoff.rows[0]?.id]
     );
@@ -950,8 +982,14 @@ if (skipDatabaseTests) {
           body: coordination.body
         }
       },
-      artifact_references: [],
-      expected_response_shape: 'concise_text'
+      artifact_references: [{
+        artifactId: 'artifact-conversation',
+        kind: 'github_pull_request',
+        resultMessageId: 'artifact-result-conversation',
+        url: suppliedArtifactUrl
+      }],
+      expected_response_shape: 'concise_text',
+      outcome_snapshot: null
     });
 
     const handoffProvider = new FixtureProvider(async (input, observer) => {
@@ -1002,6 +1040,16 @@ if (skipDatabaseTests) {
       summary: 'Maya responded',
       resultMessageId: `conversation-result:${handoff.rows[0]?.id}`
     }]);
+    const completedOutcome = await pool.query<{ outcome_snapshot: unknown }>(
+      `SELECT outcome_snapshot FROM public.agent_handoff WHERE receiving_turn_id = $1`,
+      [handoff.rows[0]?.id]
+    );
+    assert.deepEqual(completedOutcome.rows[0]?.outcome_snapshot, {
+      kind: 'completed',
+      resultMessageId: `conversation-result:${handoff.rows[0]?.id}`,
+      body: 'Success means users reconnect without losing in-flight work. @Alex implement it.',
+      errorCode: null
+    });
     assert.equal(
       completedHandoffView.runs.find(
         ({ sourceMessageId }) => sourceMessageId === `conversation-result:${handoff.rows[0]?.id}`
