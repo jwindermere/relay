@@ -202,6 +202,26 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'workspace_member' },
       { table_schema: 'public', table_name: 'workspace_membership' }
     ]);
+    const evaluationColumns = await pool.query<{ column_name: string; is_nullable: string }>(`
+      SELECT column_name, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'collaboration_evaluation_event'
+        AND column_name IN (
+          'agent_type', 'routing_policy_version', 'prompt_version',
+          'permission_policy_version', 'agent_configuration_version',
+          'outcome_type', 'outcome_id', 'expires_at'
+        )
+      ORDER BY column_name
+    `);
+    assert.deepEqual(evaluationColumns.rows, [
+      { column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { column_name: 'agent_type', is_nullable: 'NO' },
+      { column_name: 'expires_at', is_nullable: 'NO' },
+      { column_name: 'outcome_id', is_nullable: 'NO' },
+      { column_name: 'outcome_type', is_nullable: 'NO' },
+      { column_name: 'permission_policy_version', is_nullable: 'NO' },
+      { column_name: 'prompt_version', is_nullable: 'NO' },
+      { column_name: 'routing_policy_version', is_nullable: 'NO' }
+    ]);
     await assert.doesNotReject(assertCompatibleSchema(pool));
   });
 

@@ -18,9 +18,17 @@ test('only the TLS proxy is published and it cannot reach the backend network', 
   assert.deepEqual(deployment.services.proxy?.networks, ['edge']);
   assert.deepEqual(deployment.services.postgres?.networks, ['backend']);
   assert.deepEqual(deployment.services.worker?.networks, ['backend']);
+  assert.deepEqual(deployment.services['evaluation-retention']?.networks, ['backend']);
   assert.match(JSON.stringify(deployment.services.postgres?.volumes), /postgres-data/);
   assert.match(JSON.stringify(deployment.services.worker?.volumes), /codex-state/);
   assert.match(JSON.stringify(deployment.services.worker?.volumes), /agent-run-workspaces/);
+});
+
+test('expired collaboration evaluation is purged independently of project activity', async () => {
+  const script = await readFile(resolve('ops/postgres/run-evaluation-retention.sh'), 'utf8');
+  assert.match(script, /DELETE FROM public\.collaboration_feedback WHERE expires_at <= now\(\)/);
+  assert.match(script, /DELETE FROM public\.collaboration_evaluation_event WHERE expires_at <= now\(\)/);
+  assert.match(script, /EVALUATION_RETENTION_INTERVAL_SECONDS/);
 });
 
 test('web replacement leaves the independently supervised worker running', async () => {

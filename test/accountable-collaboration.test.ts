@@ -16,7 +16,8 @@ import { decideMessageIntent } from '../src/lib/server/collaboration/message-int
 import {
   compareCollaborationEvaluationFixtures,
   detectCollaborationQualitySignals,
-  normalizeCollaborationEvaluationEvidence
+  normalizeCollaborationEvaluationEvidence,
+  normalizeCollaborationEvaluationText
 } from '../src/lib/server/collaboration/accountability.js';
 import { collaborationEvaluationFixtures } from './fixtures/collaboration-evaluation-fixtures.js';
 
@@ -226,6 +227,14 @@ test('collaboration evaluation evidence rejects credentials and private reasonin
   );
   assert.throws(
     () => normalizeCollaborationEvaluationEvidence({ rationale: 'The private chain-of-thought was retained' }),
+    /credentials or private reasoning/
+  );
+  assert.equal(
+    normalizeCollaborationEvaluationText('  Useful because the Finding cites its source.  '),
+    'Useful because the Finding cites its source.'
+  );
+  assert.throws(
+    () => normalizeCollaborationEvaluationText('authorization: Bearer retained-secret-value'),
     /credentials or private reasoning/
   );
 });

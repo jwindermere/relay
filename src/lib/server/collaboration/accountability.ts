@@ -19,15 +19,17 @@ type CollaborationSignalType =
 type CompletionOutcome = 'completed' | 'failed' | 'cancelled';
 type FeedbackRating = 'useful' | 'incorrect' | 'incomplete' | 'unnecessarily_delegated';
 
+export interface CollaborationEvaluationAttribution {
+  agentType: string;
+  routingPolicyVersion: string;
+  promptVersion: string;
+  permissionPolicyVersion: string;
+  agentConfigurationVersion: string;
+}
+
 export interface CollaborationEvaluationFixture {
   id: string;
-  attribution: {
-    agentType: string;
-    routingPolicyVersion: string;
-    promptVersion: string;
-    permissionPolicyVersion: string;
-    agentConfigurationVersion: string;
-  };
+  attribution: CollaborationEvaluationAttribution;
   handoffDepths: number[];
   findings: Array<{ id: string; summary: string; confidence: number; evidenceReferences: string[] }>;
   routingDecisions: Array<{ id: string; selectedIntent: string; correctedIntent: string | null }>;
@@ -35,8 +37,28 @@ export interface CollaborationEvaluationFixture {
   pilotFeedback: readonly FeedbackRating[];
 }
 
-const RESTRICTED_EVALUATION_MATERIAL =
-  /(?:authorization|api[ _-]?key|password|secret|token|credential|private[ _-]?key|chain[ -]of[ -]thought|private reasoning|hidden reasoning|encrypted_reasoning|provider(?: event)? trace)/iu;
+const RESTRICTED_EVALUATION_MATERIAL = [
+  /"(?:authorization|api[ _-]?key|password|secret|token|credential|private[ _-]?key|encrypted_reasoning|provider(?: event)? trace)"\s*:/iu,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
+  /\b(?:sk|ghp)_[A-Za-z0-9_-]{12,}\b/u,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/u,
+  /\bgithub_pat_[A-Za-z0-9_]{12,}\b/u,
+  /\bAKIA[A-Z0-9]{16}\b/u,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/u,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/iu,
+  /\bauthorization\s*:\s*(?:basic|bearer)\s+\S+/iu,
+  /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu,
+  /\b(?:credentialStoreReference|providerEventId|encrypted_reasoning)\b/u,
+  /\b(?:chain[ -]of[ -]thought|private reasoning|hidden reasoning)\b/iu
+];
+
+export function normalizeCollaborationEvaluationText(value: string): string {
+  const normalized = value.trim();
+  if (RESTRICTED_EVALUATION_MATERIAL.some((pattern) => pattern.test(normalized))) {
+    throw new AccountabilityError('Evaluation data must not contain credentials or private reasoning');
+  }
+  return normalized;
+}
 
 export function normalizeCollaborationEvaluationEvidence(
   evidence: Record<string, unknown>
@@ -49,7 +71,7 @@ export function normalizeCollaborationEvaluationEvidence(
     throw new AccountabilityError('Evaluation evidence must be JSON serializable');
   }
   if (encoded.length > 16_000) throw new AccountabilityError('Evaluation evidence exceeds its safe limit');
-  if (RESTRICTED_EVALUATION_MATERIAL.test(encoded)) {
+  if (RESTRICTED_EVALUATION_MATERIAL.some((pattern) => pattern.test(encoded))) {
     throw new AccountabilityError('Evaluation evidence must not contain credentials or private reasoning');
   }
   return structuredClone(evidence);
@@ -356,7 +378,7 @@ export async function loadCollaborationAccountability(
       useful: number; incorrect: number; incomplete: number; unnecessarily_delegated: number;
     }>(
       `WITH event_rollup AS (
-         SELECT COALESCE(agent.agent_type, 'unattributed') AS agent_type,
+         SELECT event.agent_type,
                 event.routing_policy_version, event.prompt_version,
                 event.permission_policy_version, event.agent_configuration_version,
                 count(*)::integer AS event_count,
@@ -370,12 +392,11 @@ export async function loadCollaborationAccountability(
                 count(*) FILTER (WHERE event.event_type = 'outcome.failed')::integer AS failed_outcomes,
                 count(*) FILTER (WHERE event.event_type = 'outcome.cancelled')::integer AS cancelled_outcomes
          FROM public.collaboration_evaluation_event event
-         LEFT JOIN public.agent agent ON agent.id = event.agent_id AND agent.workspace_id = event.workspace_id
          WHERE event.workspace_id = $1 AND event.project_id = $2 AND event.expires_at > now()
-         GROUP BY agent.agent_type, event.routing_policy_version, event.prompt_version,
+         GROUP BY event.agent_type, event.routing_policy_version, event.prompt_version,
                   event.permission_policy_version, event.agent_configuration_version
        ), feedback_rollup AS (
-         SELECT COALESCE(agent.agent_type, 'unattributed') AS agent_type,
+         SELECT feedback.agent_type,
                 feedback.routing_policy_version, feedback.prompt_version,
                 feedback.permission_policy_version, feedback.agent_configuration_version,
                 count(*) FILTER (WHERE feedback.rating = 'useful')::integer AS useful,
@@ -383,9 +404,8 @@ export async function loadCollaborationAccountability(
                 count(*) FILTER (WHERE feedback.rating = 'incomplete')::integer AS incomplete,
                 count(*) FILTER (WHERE feedback.rating = 'unnecessarily_delegated')::integer AS unnecessarily_delegated
          FROM public.collaboration_feedback feedback
-         LEFT JOIN public.agent agent ON agent.id = feedback.agent_id AND agent.workspace_id = feedback.workspace_id
          WHERE feedback.workspace_id = $1 AND feedback.project_id = $2 AND feedback.expires_at > now()
-         GROUP BY agent.agent_type, feedback.routing_policy_version, feedback.prompt_version,
+         GROUP BY feedback.agent_type, feedback.routing_policy_version, feedback.prompt_version,
                   feedback.permission_policy_version, feedback.agent_configuration_version
        ), report_keys AS (
          SELECT agent_type, routing_policy_version, prompt_version,
@@ -521,7 +541,7 @@ export async function submitCollaborationFeedback(
     || !['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'].includes(input.rating)) {
     throw new AccountabilityError('Feedback target or rating is invalid');
   }
-  const reason = input.reason?.trim() || null;
+  const reason = input.reason ? normalizeCollaborationEvaluationText(input.reason) || null : null;
   if (reason && reason.length > 1000) throw new AccountabilityError('Feedback reason is too long');
   const actor = await pool.query<{ id: string }>(
     `SELECT member.id FROM public.workspace_member member
@@ -548,10 +568,10 @@ export async function submitCollaborationFeedback(
     finding: 'target.author_agent_id', coordination_plan: 'target.coordinating_agent_id'
   }[input.outcomeType];
   const target = await pool.query<{
-    agent_id: string | null; routing_policy_version: string; prompt_version: string;
+    agent_id: string | null; agent_type: string; routing_policy_version: string; prompt_version: string;
     permission_policy_version: string; agent_configuration_version: string;
   }>(
-    `SELECT ${targetAgent} AS agent_id,
+    `SELECT ${targetAgent} AS agent_id, COALESCE(agent.agent_type, 'unattributed') AS agent_type,
             COALESCE(attribution.routing_policy_version, 'not-applicable-v1') AS routing_policy_version,
             COALESCE(attribution.prompt_version, 'not-applicable-v1') AS prompt_version,
             COALESCE(attribution.permission_policy_version, 'not-applicable-v1') AS permission_policy_version,
@@ -577,13 +597,14 @@ export async function submitCollaborationFeedback(
   await pool.query(
     `INSERT INTO public.collaboration_feedback (
        id, workspace_id, project_id, submitted_by_workspace_member_id,
-       outcome_type, outcome_id, rating, reason, agent_id,
+       outcome_type, outcome_id, rating, reason, agent_id, agent_type,
        routing_policy_version, prompt_version, permission_policy_version,
        agent_configuration_version
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (submitted_by_workspace_member_id, outcome_type, outcome_id)
      DO UPDATE SET rating = EXCLUDED.rating, reason = EXCLUDED.reason,
        agent_id = EXCLUDED.agent_id,
+       agent_type = EXCLUDED.agent_type,
        routing_policy_version = EXCLUDED.routing_policy_version,
        prompt_version = EXCLUDED.prompt_version,
        permission_policy_version = EXCLUDED.permission_policy_version,
@@ -591,6 +612,7 @@ export async function submitCollaborationFeedback(
        created_at = now(), expires_at = DEFAULT`,
     [randomUUID(), access.workspace.id, input.projectId, actor.rows[0].id,
       input.outcomeType, input.outcomeId, input.rating, reason, attribution.agent_id,
+      attribution.agent_type,
       attribution.routing_policy_version, attribution.prompt_version,
       attribution.permission_policy_version, attribution.agent_configuration_version]
   );

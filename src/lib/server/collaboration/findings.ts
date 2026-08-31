@@ -240,7 +240,7 @@ export async function createFindingFromAgentResult(
   pool: Pool,
   input: FindingInput & {
     workspaceId: string; projectId: string; authorAgentId: string;
-    resultMessageId: string; sourceHandoffId?: string;
+    resultMessageId: string; sourceHandoffId?: string; routingPolicyVersion: string;
   }
 ): Promise<string> {
   const finding = normalizeFindingInput(input);
@@ -309,11 +309,13 @@ export async function createFindingFromAgentResult(
       await client.query(
         `INSERT INTO public.collaboration_evaluation_event (
            id, workspace_id, project_id, event_type, agent_id,
-           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
+           routing_policy_version, prompt_version, permission_policy_version,
+           outcome_type, outcome_id, evidence
          ) VALUES ($1, $2, $3, 'unsupported.certainty', $4,
-           'conversation-v1', 'read-only-v1', 'finding', $5,
-           jsonb_build_object('confidence', $6::numeric, 'evidenceCount', 0))`,
-        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId, id, finding.confidence]
+           $5, 'conversation-v1', 'read-only-v1', 'finding', $6,
+           jsonb_build_object('confidence', $7::numeric, 'evidenceCount', 0))`,
+        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId,
+          input.routingPolicyVersion, id, finding.confidence]
       );
     }
     const duplicate = await client.query<{ id: string }>(
@@ -327,12 +329,13 @@ export async function createFindingFromAgentResult(
       await client.query(
         `INSERT INTO public.collaboration_evaluation_event (
            id, workspace_id, project_id, event_type, agent_id,
-           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
+           routing_policy_version, prompt_version, permission_policy_version,
+           outcome_type, outcome_id, evidence
          ) VALUES ($1, $2, $3, 'duplicate.investigation', $4,
-           'conversation-v1', 'read-only-v1', 'finding', $5,
-           jsonb_build_object('duplicatesFindingId', $6::text))`,
+           $5, 'conversation-v1', 'read-only-v1', 'finding', $6,
+           jsonb_build_object('duplicatesFindingId', $7::text))`,
         [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId,
-          id, duplicate.rows[0].id]
+          input.routingPolicyVersion, id, duplicate.rows[0].id]
       );
     }
     await client.query('COMMIT');

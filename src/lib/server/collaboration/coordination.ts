@@ -594,15 +594,32 @@ export async function completeCoordinationStep(
     status: 'completed' | 'failed'; resultMessageId: string | null;
   }
 ): Promise<void> {
-  const completed = await client.query<{ plan_id: string }>(
+  const completed = await client.query<{ id: string; plan_id: string; target_agent_id: string }>(
     `UPDATE public.coordination_plan_step
      SET status = $3, result_message_id = $4, completed_at = now()
      WHERE conversation_turn_id = $1 AND workspace_id = $2 AND status = 'active'
-     RETURNING plan_id`,
+     RETURNING id, plan_id, target_agent_id`,
     [input.conversationTurnId, input.workspaceId, input.status, input.resultMessageId]
   );
   const planId = completed.rows[0]?.plan_id;
   if (!planId) return;
+  await client.query(
+    `INSERT INTO public.collaboration_evaluation_event (
+       id, workspace_id, project_id, event_type, agent_id,
+       routing_policy_version, prompt_version, permission_policy_version,
+       outcome_type, outcome_id, evidence
+     )
+     SELECT $1, plan.workspace_id, plan.project_id, $2, $3,
+            COALESCE(decision.policy_version, 'not-applicable-v1'),
+            'coordination-step-v1', 'coordination-budget-v1',
+            'coordination_step', $4, jsonb_build_object('status', $5::text)
+     FROM public.coordination_plan plan
+     LEFT JOIN public.message_intent_decision decision
+       ON decision.message_id = plan.source_message_id AND decision.workspace_id = plan.workspace_id
+     WHERE plan.id = $6 AND plan.workspace_id = $7`,
+    [randomUUID(), `outcome.${input.status}`, completed.rows[0]!.target_agent_id,
+      completed.rows[0]!.id, input.status, planId, input.workspaceId]
+  );
   if (input.status === 'failed') {
     await client.query(
       `UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`,

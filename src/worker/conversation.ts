@@ -46,6 +46,7 @@ interface ClaimedConversationTurn {
   lease_token: string;
   recovering: boolean;
   routing_intent: string | null;
+  routing_policy_version: string | null;
   eligible: boolean;
 }
 
@@ -233,6 +234,7 @@ async function claimNextConversationTurn(
               ), '') AS collaborator_roster,
               turn.response_parent_message_id, turn.ambient, turn.handoff_depth,
               COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
+              decision.policy_version AS routing_policy_version,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
               connection.credential_store_reference,
               agent.enabled AND agent.status <> 'disabled' AND EXISTS (
@@ -422,11 +424,13 @@ async function finishConversationTurn(
       await client.query(
         `INSERT INTO public.collaboration_evaluation_event (
            id, workspace_id, project_id, event_type, agent_id,
-           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
+           routing_policy_version, prompt_version, permission_policy_version,
+           outcome_type, outcome_id, evidence
          ) VALUES ($1, $2, $3, 'recursive.handoff_attempt', $4,
-           'conversation-v1', 'handoff-depth-v1', 'message', $5,
-           jsonb_build_object('handoffDepth', $6::integer))`,
+           $5, 'conversation-v1', 'handoff-depth-v1', 'message', $6,
+           jsonb_build_object('handoffDepth', $7::integer))`,
         [randomUUID(), claim.workspace_id, claim.project_id, claim.agent_id,
+          claim.routing_policy_version ?? 'not-applicable-v1',
           `conversation-result:${claim.id}`, claim.handoff_depth]
       );
     }
@@ -497,6 +501,23 @@ async function finishConversationTurn(
         status
       );
     }
+    await client.query(
+      `INSERT INTO public.collaboration_evaluation_event (
+         id, workspace_id, project_id, event_type, agent_id,
+         routing_policy_version, prompt_version, permission_policy_version,
+         outcome_type, outcome_id, evidence
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'conversation-v1', $7, $8, $9,
+         jsonb_build_object('status', $10::text, 'errorCode', $11::text))`,
+      [
+        randomUUID(), claim.workspace_id, claim.project_id, `outcome.${status}`, claim.agent_id,
+        claim.routing_policy_version ?? 'not-applicable-v1',
+        finishedHandoff.rows[0] ? 'handoff-depth-v1' : 'read-only-v1',
+        finishedHandoff.rows[0] ? 'handoff' : messageId ? 'message' : 'conversation_turn',
+        finishedHandoff.rows[0]?.id ?? messageId ?? claim.id,
+        status,
+        errorCode
+      ]
+    );
     await completeCoordinationStep(client, {
       workspaceId: claim.workspace_id,
       conversationTurnId: claim.id,
@@ -529,6 +550,7 @@ async function finishConversationTurn(
         workspaceId: claim.workspace_id,
         projectId: claim.project_id,
         authorAgentId: claim.agent_id,
+        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
         resultMessageId: messageId,
         ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
       }).catch(() => undefined);

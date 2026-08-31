@@ -79,6 +79,7 @@
   let githubConfiguration = $derived(data.linkedRepository.configuration);
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
   let accountability = $derived(realtimeAccountability ?? data.accountability);
+  const feedbackRatings = ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as const;
   let filteredInbox = $derived(accountability.inbox.filter((item) =>
     (inboxAgentFilter === 'all' || item.agentId === inboxAgentFilter)
     && (inboxStateFilter === 'all' || item.state === inboxStateFilter)
@@ -965,6 +966,14 @@
 
 </script>
 
+{#snippet feedbackControls(label: string, outcomeType: string, outcomeId: string)}
+  <div class="mt-2 flex flex-wrap gap-1" aria-label={label}>
+    {#each feedbackRatings as rating}
+      <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback(outcomeType, outcomeId, rating)}>{rating.replaceAll('_', ' ')}</button>
+    {/each}
+  </div>
+{/snippet}
+
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
   {@const handoff = handoffForSource(message.id)}
   {@const plan = planForSource(message.id)}
@@ -1000,11 +1009,7 @@
       >Review pull request #{run.artifact.pullRequestNumber} in GitHub</a>
     {/if}
     {#if run && ['completed', 'failed', 'cancelled'].includes(run.status)}
-      <div class="mt-2 flex flex-wrap gap-1" aria-label="Rate engineering result">
-        {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
-          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('agent_run', run.id, rating)}>{rating.replaceAll('_', ' ')}</button>
-        {/each}
-      </div>
+      {@render feedbackControls('Rate engineering result', 'agent_run', run.id)}
     {/if}
     {#if run && run.milestones.length > 1}
       <ul class="mt-1 space-y-1 text-xs text-base-content/55" aria-label="Engineering request milestones">
@@ -1041,11 +1046,7 @@
       </div>
       <p class="mt-1 text-base-content/55">{handoff.question}</p>
       {#if ['completed', 'failed', 'cancelled', 'expired'].includes(handoff.status)}
-        <div class="mt-1 flex flex-wrap gap-1" aria-label="Rate handoff result">
-          {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
-            <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('handoff', handoff.id, rating)}>{rating.replaceAll('_', ' ')}</button>
-          {/each}
-        </div>
+        {@render feedbackControls('Rate handoff result', 'handoff', handoff.id)}
       {/if}
     </div>
   {/if}
@@ -1102,11 +1103,7 @@
         </div>
       {/if}
       {#if ['completed', 'rejected', 'cancelled', 'failed'].includes(plan.status)}
-        <div class="mt-2 flex flex-wrap gap-1">
-          {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
-            <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('coordination_plan', plan.id, rating)}>{rating.replaceAll('_', ' ')}</button>
-          {/each}
-        </div>
+        {@render feedbackControls('Rate coordination result', 'coordination_plan', plan.id)}
       {/if}
     </div>
   {/if}
@@ -1258,11 +1255,7 @@
                 </li>
               {/each}
             </ul>
-            <div class="mt-1 flex flex-wrap gap-1">
-              {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
-                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('finding', finding.id, rating)}>{rating.replaceAll('_', ' ')}</button>
-              {/each}
-            </div>
+            {@render feedbackControls('Rate Finding', 'finding', finding.id)}
           </li>
         {/each}
       </ul>

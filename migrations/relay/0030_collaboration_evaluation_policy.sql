@@ -22,6 +22,7 @@ AFTER INSERT ON public.workspace
 FOR EACH ROW EXECUTE FUNCTION public.create_workspace_collaboration_evaluation_policy();
 
 ALTER TABLE public.collaboration_evaluation_event
+  ADD COLUMN agent_type text NOT NULL DEFAULT 'unattributed',
   ALTER COLUMN routing_policy_version SET DEFAULT 'not-applicable-v1',
   ALTER COLUMN prompt_version SET DEFAULT 'not-applicable-v1',
   ALTER COLUMN permission_policy_version SET DEFAULT 'not-applicable-v1',
@@ -29,7 +30,11 @@ ALTER TABLE public.collaboration_evaluation_event
   ADD COLUMN expires_at timestamptz;
 
 UPDATE public.collaboration_evaluation_event event
-SET routing_policy_version = COALESCE(event.routing_policy_version, 'not-applicable-v1'),
+SET agent_type = COALESCE((
+      SELECT agent.agent_type FROM public.agent agent
+      WHERE agent.id = event.agent_id AND agent.workspace_id = event.workspace_id
+    ), 'unattributed'),
+    routing_policy_version = COALESCE(event.routing_policy_version, 'not-applicable-v1'),
     prompt_version = COALESCE(event.prompt_version, 'not-applicable-v1'),
     permission_policy_version = COALESCE(event.permission_policy_version, 'not-applicable-v1'),
     agent_configuration_version = COALESCE(
@@ -58,6 +63,7 @@ ALTER TABLE public.collaboration_evaluation_event
 
 ALTER TABLE public.collaboration_feedback
   ADD COLUMN agent_id text,
+  ADD COLUMN agent_type text NOT NULL DEFAULT 'unattributed',
   ADD COLUMN routing_policy_version text NOT NULL DEFAULT 'not-applicable-v1',
   ADD COLUMN prompt_version text NOT NULL DEFAULT 'not-applicable-v1',
   ADD COLUMN permission_policy_version text NOT NULL DEFAULT 'not-applicable-v1',
@@ -67,9 +73,9 @@ ALTER TABLE public.collaboration_feedback
     FOREIGN KEY (agent_id, workspace_id) REFERENCES public.agent(id, workspace_id) ON DELETE RESTRICT;
 
 UPDATE public.collaboration_feedback feedback
-SET (agent_id, routing_policy_version, prompt_version,
+SET (agent_id, agent_type, routing_policy_version, prompt_version,
      permission_policy_version, agent_configuration_version) = (
-      SELECT event.agent_id,
+      SELECT event.agent_id, event.agent_type,
              COALESCE(event.routing_policy_version, 'not-applicable-v1'),
              COALESCE(event.prompt_version, 'not-applicable-v1'),
              COALESCE(event.permission_policy_version, 'not-applicable-v1'),
@@ -104,13 +110,15 @@ CREATE FUNCTION public.prepare_collaboration_evaluation_event() RETURNS trigger 
 DECLARE
   retention integer;
   configuration integer;
+  snapshot_agent_type text;
 BEGIN
   SELECT retention_days INTO retention
   FROM public.workspace_collaboration_evaluation_policy WHERE workspace_id = NEW.workspace_id;
   IF NEW.agent_id IS NOT NULL THEN
-    SELECT configuration_version INTO configuration
+    SELECT configuration_version, agent_type INTO configuration, snapshot_agent_type
     FROM public.agent WHERE id = NEW.agent_id AND workspace_id = NEW.workspace_id;
   END IF;
+  NEW.agent_type := COALESCE(snapshot_agent_type, NEW.agent_type, 'unattributed');
   NEW.routing_policy_version := COALESCE(NEW.routing_policy_version, 'not-applicable-v1');
   NEW.prompt_version := COALESCE(NEW.prompt_version, 'not-applicable-v1');
   NEW.permission_policy_version := COALESCE(NEW.permission_policy_version, 'not-applicable-v1');
@@ -130,10 +138,21 @@ BEFORE INSERT ON public.collaboration_evaluation_event
 FOR EACH ROW EXECUTE FUNCTION public.prepare_collaboration_evaluation_event();
 
 ALTER TABLE public.collaboration_evaluation_event
+  ALTER COLUMN agent_type DROP DEFAULT,
   ALTER COLUMN agent_configuration_version DROP DEFAULT,
   ADD CONSTRAINT collaboration_evaluation_evidence_private CHECK (
     evidence::text !~* '"(authorization|api[_ -]?key|password|secret|token|credential|private[_ -]?key|encrypted_reasoning|provider[_ -]?(event[_ -]?)?trace)"[[:space:]]*:'
     AND evidence::text !~* '(chain[ -]of[ -]thought|private reasoning|hidden reasoning)'
+    AND evidence::text !~ '(-----BEGIN [A-Z ]*PRIVATE KEY-----|\m(sk|ghp)_[A-Za-z0-9_-]{12,}\M|\msk-(proj-)?[A-Za-z0-9_-]{12,}\M|\mgithub_pat_[A-Za-z0-9_]{12,}\M|\mAKIA[A-Z0-9]{16}\M|\meyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\M)'
+    AND evidence::text !~* '(authorization[[:space:]]*:[[:space:]]*(basic|bearer)[[:space:]]+[^[:space:]]+|[a-z][a-z0-9+.-]*://[^[:space:]/@:]+:[^[:space:]/@]+@)'
+  );
+
+ALTER TABLE public.collaboration_feedback
+  ADD CONSTRAINT collaboration_feedback_reason_private CHECK (
+    reason IS NULL OR (
+      reason !~* '(chain[ -]of[ -]thought|private reasoning|hidden reasoning|authorization[[:space:]]*:[[:space:]]*(basic|bearer)[[:space:]]+[^[:space:]]+)'
+      AND reason !~ '(-----BEGIN [A-Z ]*PRIVATE KEY-----|\m(sk|ghp)_[A-Za-z0-9_-]{12,}\M|\msk-(proj-)?[A-Za-z0-9_-]{12,}\M|\mgithub_pat_[A-Za-z0-9_]{12,}\M|\mAKIA[A-Z0-9]{16}\M|\meyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\M)'
+    )
   );
 
 CREATE FUNCTION public.prepare_collaboration_feedback() RETURNS trigger AS $$
@@ -149,6 +168,23 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER collaboration_feedback_prepare
 BEFORE INSERT OR UPDATE ON public.collaboration_feedback
 FOR EACH ROW EXECUTE FUNCTION public.prepare_collaboration_feedback();
+
+CREATE FUNCTION public.refresh_collaboration_evaluation_expiry() RETURNS trigger AS $$
+BEGIN
+  UPDATE public.collaboration_evaluation_event
+  SET expires_at = created_at + NEW.retention_days * interval '1 day'
+  WHERE workspace_id = NEW.workspace_id;
+  UPDATE public.collaboration_feedback
+  SET expires_at = created_at + NEW.retention_days * interval '1 day'
+  WHERE workspace_id = NEW.workspace_id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER workspace_collaboration_evaluation_policy_after_update
+AFTER UPDATE OF retention_days ON public.workspace_collaboration_evaluation_policy
+FOR EACH ROW WHEN (OLD.retention_days IS DISTINCT FROM NEW.retention_days)
+EXECUTE FUNCTION public.refresh_collaboration_evaluation_expiry();
 
 CREATE INDEX collaboration_evaluation_expiry_idx
   ON public.collaboration_evaluation_event(workspace_id, expires_at);

@@ -46,6 +46,11 @@ at `RELAY_BACKUP_INTERVAL_SECONDS`. A completed backup consists of a `.dump` and
 storage or an off-host mounted filesystem—using a local directory does not satisfy
 the recovery requirement.
 
+The evaluation-retention service removes expired Collaboration evaluation events and
+Pilot feedback independently of Project activity. It runs hourly by default; set
+`RELAY_EVALUATION_RETENTION_INTERVAL_SECONDS` to a shorter interval when a Workspace's
+retention policy requires a tighter deletion window.
+
 ## Compatible replacement
 
 Use the deployment commands instead of replacing both application services together:
