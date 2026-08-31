@@ -72,9 +72,14 @@ test('source-backed findings reject unsafe and duplicate evidence', () => {
 
   for (const summary of [
     'Use AKIAIOSFODNN7EXAMPLE for access.',
+    'Use sk-proj-abcdefghijklmnopqrstuv for access.',
     'Token: eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl',
+    'Authorization: Basic cmVsYXk6cHJpdmF0ZQ==',
     'Connect with postgres://relay:private-password@database/relay.',
-    'Provider payload included providerEventId and encrypted_reasoning.'
+    'The password is correct-horse-battery-staple.',
+    'Provider payload included providerEventId and encrypted_reasoning.',
+    'Raw trace: {"method":"item/tool/requestUserInput","params":{"question":"why"}}',
+    'User: explain the choice\nAssistant: my internal reasoning follows.'
   ]) {
     assert.throws(() => normalizeFindingInput({
       summary, confidence: 0.4, observedEvidence: [], inferences: [], assumptions: [],

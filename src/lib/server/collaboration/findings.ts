@@ -43,14 +43,19 @@ export class FindingError extends Error {
 const RESTRICTED_MEMORY_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
   /\b(?:sk|ghp)_[A-Za-z0-9_-]{12,}\b/u,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/u,
   /\bgithub_pat_[A-Za-z0-9_]{12,}\b/u,
   /\bAKIA[A-Z0-9]{16}\b/u,
   /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/u,
   /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/iu,
-  /\bauthorization\s*:\s*bearer\s+\S+/iu,
+  /\bauthorization\s*:\s*(?:basic|bearer)\s+\S+/iu,
   /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu,
+  /\b(?:api[ _-]?key|password|secret|token|credential)\s+(?:is|was)\s+\S+/iu,
   /\b(?:credentialStoreReference|providerEventId|encrypted_reasoning)\b/u,
-  /"method"\s*:\s*"(?:item|turn)\/(?:started|completed)"/u
+  /"(?:method|params|result)"\s*:/u,
+  /\b(?:chain[ -]of[ -]thought|hidden reasoning|internal reasoning)\b/iu,
+  /(?:^|\n)\s*(?:user|assistant|system)\s*:.*\n\s*(?:user|assistant|system)\s*:/iu,
+  /```(?:json)?[\s\S]*"(?:method|params|result)"\s*:/iu
 ];
 
 function assertContainsNoRecognizedRestrictedMaterial(statement: string): void {
