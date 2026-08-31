@@ -245,6 +245,7 @@ export async function updateWorkspaceAgent(
        SET name = $3, agent_type = $4, role_label = $5, instructions = $6,
            participation_mode = $7, ambient_triggers = $8, reply_mode = $9,
            enabled = $10,
+           configuration_version = configuration_version + 1,
            status = CASE WHEN $10 THEN CASE WHEN status = 'disabled' THEN 'idle' ELSE status END
                          ELSE 'disabled' END
        WHERE id = $1 AND workspace_id = $2`,

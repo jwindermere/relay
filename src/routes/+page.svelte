@@ -918,11 +918,22 @@
   }
 
   async function submitFeedback(outcomeType: string, outcomeId: string, rating: string) {
+    const reason = window.prompt('Optional reason for this rating (Cancel to leave feedback unchanged)', '');
+    if (reason === null) return;
     const response = await fetch('/api/workspace/accountability', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ projectId: data.sharedChannel.project.id, outcomeType, outcomeId, rating })
+      body: JSON.stringify({
+        projectId: data.sharedChannel.project.id, outcomeType, outcomeId, rating,
+        ...(reason.trim() ? { reason: reason.trim() } : {})
+      })
     });
     if (!response.ok) agentMessage = (await response.json()).message ?? 'Feedback could not be saved.';
+    else {
+      const accountabilityResponse = await fetch(
+        `/api/workspace/accountability?projectId=${encodeURIComponent(data.sharedChannel.project.id)}`
+      );
+      if (accountabilityResponse.ok) realtimeAccountability = await accountabilityResponse.json();
+    }
   }
 
   async function editPlan(plan: (typeof accountability.plans)[number]) {
@@ -988,6 +999,13 @@
         rel="noopener noreferrer"
       >Review pull request #{run.artifact.pullRequestNumber} in GitHub</a>
     {/if}
+    {#if run && ['completed', 'failed', 'cancelled'].includes(run.status)}
+      <div class="mt-2 flex flex-wrap gap-1" aria-label="Rate engineering result">
+        {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('agent_run', run.id, rating)}>{rating.replaceAll('_', ' ')}</button>
+        {/each}
+      </div>
+    {/if}
     {#if run && run.milestones.length > 1}
       <ul class="mt-1 space-y-1 text-xs text-base-content/55" aria-label="Engineering request milestones">
         {#each run.milestones.slice(0, -1) as entry (`${run.id}:${entry.sequence}`)}
@@ -1022,6 +1040,13 @@
         {/if}
       </div>
       <p class="mt-1 text-base-content/55">{handoff.question}</p>
+      {#if ['completed', 'failed', 'cancelled', 'expired'].includes(handoff.status)}
+        <div class="mt-1 flex flex-wrap gap-1" aria-label="Rate handoff result">
+          {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
+            <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('handoff', handoff.id, rating)}>{rating.replaceAll('_', ' ')}</button>
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
   {#if steering}
@@ -1186,6 +1211,32 @@
         <li class="py-2 text-base-content/35">No matching work.</li>
       {/each}
     </ul>
+
+    {#if accountability.evaluation.length > 0}
+      <div class="eyebrow mt-6">Collaboration quality</div>
+      <ul class="mt-2 max-h-52 space-y-2 overflow-y-auto text-xs">
+        {#each accountability.evaluation as report (`${report.agentType}:${report.routingPolicyVersion}:${report.promptVersion}:${report.permissionPolicyVersion}:${report.agentConfigurationVersion}`)}
+          <li class="border border-white/8 p-2">
+            <strong>{report.agentType}</strong>
+            <span class="block text-base-content/45">
+              {report.routingPolicyVersion} · {report.agentConfigurationVersion}
+            </span>
+            <span class="block text-base-content/35">
+              Prompt {report.promptVersion} · policy {report.permissionPolicyVersion}
+            </span>
+            <span class="mt-1 block text-base-content/55">
+              Outcomes {report.completionOutcomes.completed} completed / {report.completionOutcomes.failed} failed / {report.completionOutcomes.cancelled} cancelled
+            </span>
+            <span class="block text-base-content/55">
+              Feedback {report.pilotFeedback.useful} useful / {report.pilotFeedback.incorrect} incorrect / {report.pilotFeedback.incomplete} incomplete / {report.pilotFeedback.unnecessarilyDelegated} unnecessary
+            </span>
+            <span class="block text-base-content/45">
+              Checks: {report.automatedChecks.recursiveHandoffAttempts} recursive · {report.automatedChecks.duplicateInvestigations} duplicate · {report.automatedChecks.unsupportedCertainty} unsupported · {report.automatedChecks.routingDisagreements} routing disagreement
+            </span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
 
     {#if accountability.findings.length > 0}
       <div class="eyebrow mt-6">Findings</div>

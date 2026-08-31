@@ -13,7 +13,12 @@ import {
   reserveCoordinationBudget
 } from '../src/lib/server/collaboration/coordination.js';
 import { decideMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
-import { detectCollaborationQualitySignals } from '../src/lib/server/collaboration/accountability.js';
+import {
+  compareCollaborationEvaluationFixtures,
+  detectCollaborationQualitySignals,
+  normalizeCollaborationEvaluationEvidence
+} from '../src/lib/server/collaboration/accountability.js';
+import { collaborationEvaluationFixtures } from './fixtures/collaboration-evaluation-fixtures.js';
 
 test('inaccessible Finding evidence renders retained provenance without an active link', () => {
   assert.deepEqual(presentFindingEvidence({
@@ -191,4 +196,36 @@ test('quality evaluation identifies observable collaboration failures without pr
   }).map(({ type }) => type), [
     'recursive_handoff_attempt', 'duplicate_investigation', 'unsupported_certainty', 'routing_disagreement'
   ]);
+});
+
+test('collaboration fixtures reproducibly compare policy and configuration behavior', () => {
+  const { baseline, candidate } = collaborationEvaluationFixtures;
+
+  assert.deepEqual(compareCollaborationEvaluationFixtures(baseline, candidate), {
+    baselineFixtureId: 'baseline-routing-v1',
+    candidateFixtureId: 'candidate-routing-v2',
+    baselineAttribution: baseline.attribution,
+    candidateAttribution: candidate.attribution,
+    deltas: {
+      automatedSignals: { recursive_handoff_attempt: -1, unsupported_certainty: -1, routing_disagreement: -1 },
+      completionOutcomes: { completed: 1, failed: -1 },
+      pilotFeedback: { useful: 1, incorrect: -1, incomplete: -1 }
+    }
+  });
+  assert.deepEqual(compareCollaborationEvaluationFixtures(baseline, candidate),
+    compareCollaborationEvaluationFixtures(baseline, candidate));
+});
+
+test('collaboration evaluation evidence rejects credentials and private reasoning', () => {
+  assert.deepEqual(normalizeCollaborationEvaluationEvidence({
+    confidence: 0.75, evidenceCount: 2, selectedIntent: 'research_request'
+  }), { confidence: 0.75, evidenceCount: 2, selectedIntent: 'research_request' });
+  assert.throws(
+    () => normalizeCollaborationEvaluationEvidence({ authorization: 'Bearer secret-value' }),
+    /credentials or private reasoning/
+  );
+  assert.throws(
+    () => normalizeCollaborationEvaluationEvidence({ rationale: 'The private chain-of-thought was retained' }),
+    /credentials or private reasoning/
+  );
 });

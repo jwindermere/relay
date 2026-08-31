@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import {
@@ -97,6 +98,42 @@ export async function appendAgentRunEvent(
        SET state = 'expired'
        WHERE agent_run_id = $1 AND state IN ('pending', 'approved')`,
       [target.id]
+    );
+    await client.query(
+      `INSERT INTO public.collaboration_evaluation_event (
+         id, workspace_id, project_id, event_type, agent_id,
+         routing_policy_version, prompt_version, permission_policy_version,
+         outcome_type, outcome_id, evidence
+       )
+       SELECT $1, run.workspace_id, task.project_id, $2, run.agent_id,
+              COALESCE(decision.policy_version, 'not-applicable-v1'),
+              'engineering-run-v1', 'mvp-engineering-autonomy-v1',
+              'agent_run', run.id, jsonb_build_object('status', $3::text)
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id AND task.workspace_id = run.workspace_id
+       LEFT JOIN public.message_intent_decision decision
+         ON decision.message_id = task.source_message_id AND decision.workspace_id = run.workspace_id
+       WHERE run.id = $4 AND run.workspace_id = $5`,
+      [randomUUID(), `outcome.${event.status}`, event.status, target.id, target.workspaceId]
+    );
+  }
+  if (event.eventType === 'run.action_rejected') {
+    await client.query(
+      `INSERT INTO public.collaboration_evaluation_event (
+         id, workspace_id, project_id, event_type, agent_id,
+         routing_policy_version, prompt_version, permission_policy_version,
+         outcome_type, outcome_id, evidence
+       )
+       SELECT $1, run.workspace_id, task.project_id, 'policy.rejected', run.agent_id,
+              COALESCE(decision.policy_version, 'not-applicable-v1'),
+              'engineering-run-v1', 'mvp-engineering-autonomy-v1',
+              'agent_run', run.id, jsonb_build_object('agentRunEventType', $2::text)
+       FROM public.agent_run run
+       JOIN public.task task ON task.id = run.task_id AND task.workspace_id = run.workspace_id
+       LEFT JOIN public.message_intent_decision decision
+         ON decision.message_id = task.source_message_id AND decision.workspace_id = run.workspace_id
+       WHERE run.id = $3 AND run.workspace_id = $4`,
+      [randomUUID(), event.eventType, target.id, target.workspaceId]
     );
   }
   await client.query(

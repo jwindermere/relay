@@ -10,12 +10,104 @@ export class AccountabilityError extends Error {
   }
 }
 
+type CollaborationSignalType =
+  | 'recursive_handoff_attempt'
+  | 'duplicate_investigation'
+  | 'unsupported_certainty'
+  | 'routing_disagreement';
+
+type CompletionOutcome = 'completed' | 'failed' | 'cancelled';
+type FeedbackRating = 'useful' | 'incorrect' | 'incomplete' | 'unnecessarily_delegated';
+
+export interface CollaborationEvaluationFixture {
+  id: string;
+  attribution: {
+    agentType: string;
+    routingPolicyVersion: string;
+    promptVersion: string;
+    permissionPolicyVersion: string;
+    agentConfigurationVersion: string;
+  };
+  handoffDepths: number[];
+  findings: Array<{ id: string; summary: string; confidence: number; evidenceReferences: string[] }>;
+  routingDecisions: Array<{ id: string; selectedIntent: string; correctedIntent: string | null }>;
+  outcomes: readonly CompletionOutcome[];
+  pilotFeedback: readonly FeedbackRating[];
+}
+
+const RESTRICTED_EVALUATION_MATERIAL =
+  /(?:authorization|api[ _-]?key|password|secret|token|credential|private[ _-]?key|chain[ -]of[ -]thought|private reasoning|hidden reasoning|encrypted_reasoning|provider(?: event)? trace)/iu;
+
+export function normalizeCollaborationEvaluationEvidence(
+  evidence: Record<string, unknown>
+): Record<string, unknown> {
+  if (!evidence || Array.isArray(evidence) || Object.getPrototypeOf(evidence) !== Object.prototype) {
+    throw new AccountabilityError('Evaluation evidence must be an object');
+  }
+  let encoded: string;
+  try { encoded = JSON.stringify(evidence); } catch {
+    throw new AccountabilityError('Evaluation evidence must be JSON serializable');
+  }
+  if (encoded.length > 16_000) throw new AccountabilityError('Evaluation evidence exceeds its safe limit');
+  if (RESTRICTED_EVALUATION_MATERIAL.test(encoded)) {
+    throw new AccountabilityError('Evaluation evidence must not contain credentials or private reasoning');
+  }
+  return structuredClone(evidence);
+}
+
+function countValues<T extends string>(values: readonly T[]): Partial<Record<T, number>> {
+  const counts: Partial<Record<T, number>> = {};
+  for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
+  return counts;
+}
+
+function deltas<T extends string>(
+  baseline: Partial<Record<T, number>>,
+  candidate: Partial<Record<T, number>>,
+  order: readonly T[]
+): Partial<Record<T, number>> {
+  const result: Partial<Record<T, number>> = {};
+  for (const key of order) {
+    const delta = (candidate[key] ?? 0) - (baseline[key] ?? 0);
+    if (delta !== 0) result[key] = delta;
+  }
+  return result;
+}
+
+export function compareCollaborationEvaluationFixtures(
+  baseline: CollaborationEvaluationFixture,
+  candidate: CollaborationEvaluationFixture
+) {
+  const baselineSignals = countValues(detectCollaborationQualitySignals(baseline).map(({ type }) => type));
+  const candidateSignals = countValues(detectCollaborationQualitySignals(candidate).map(({ type }) => type));
+  return {
+    baselineFixtureId: baseline.id,
+    candidateFixtureId: candidate.id,
+    baselineAttribution: baseline.attribution,
+    candidateAttribution: candidate.attribution,
+    deltas: {
+      automatedSignals: deltas<CollaborationSignalType>(baselineSignals, candidateSignals, [
+        'recursive_handoff_attempt', 'duplicate_investigation',
+        'unsupported_certainty', 'routing_disagreement'
+      ]),
+      completionOutcomes: deltas<CompletionOutcome>(
+        countValues(baseline.outcomes), countValues(candidate.outcomes),
+        ['completed', 'failed', 'cancelled']
+      ),
+      pilotFeedback: deltas<FeedbackRating>(
+        countValues(baseline.pilotFeedback), countValues(candidate.pilotFeedback),
+        ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated']
+      )
+    }
+  };
+}
+
 export function detectCollaborationQualitySignals(input: {
   handoffDepths: number[];
   findings: Array<{ id: string; summary: string; confidence: number; evidenceReferences: string[] }>;
   routingDecisions: Array<{ id: string; selectedIntent: string; correctedIntent: string | null }>;
-}): Array<{ type: 'recursive_handoff_attempt' | 'duplicate_investigation' | 'unsupported_certainty' | 'routing_disagreement'; outcomeId: string }> {
-  const signals: Array<{ type: 'recursive_handoff_attempt' | 'duplicate_investigation' | 'unsupported_certainty' | 'routing_disagreement'; outcomeId: string }> = [];
+}): Array<{ type: CollaborationSignalType; outcomeId: string }> {
+  const signals: Array<{ type: CollaborationSignalType; outcomeId: string }> = [];
   if (input.handoffDepths.some((depth) => depth > 1)) {
     signals.push({ type: 'recursive_handoff_attempt', outcomeId: 'handoff-policy' });
   }
@@ -78,6 +170,7 @@ export async function loadCollaborationAccountability(
     [access.workspace.id, access.membership.id, projectId]
   );
   if (!membership.rows[0]?.allowed) throw new AccountabilityError('active Project membership is required');
+  await purgeExpiredCollaborationEvaluation(pool, access.workspace.id, projectId);
 
   const [steering, memory, plans, findings, inbox, capacity, evaluation] = await Promise.all([
     pool.query<{
@@ -254,18 +347,79 @@ export async function loadCollaborationAccountability(
       [access.workspace.id, projectId]
     ),
     pool.query<{
-      agent_type: string; routing_policy_version: string | null;
+      agent_type: string; routing_policy_version: string; prompt_version: string;
+      permission_policy_version: string; agent_configuration_version: string;
       event_count: number; policy_rejections: number; overrides: number;
+      recursive_handoff_attempts: number; duplicate_investigations: number;
+      unsupported_certainty: number; routing_disagreements: number;
+      completed_outcomes: number; failed_outcomes: number; cancelled_outcomes: number;
+      useful: number; incorrect: number; incomplete: number; unnecessarily_delegated: number;
     }>(
-      `SELECT COALESCE(agent.agent_type, 'unattributed') AS agent_type,
-              event.routing_policy_version, count(*)::integer AS event_count,
-              count(*) FILTER (WHERE event.event_type = 'policy.rejected')::integer AS policy_rejections,
-              count(*) FILTER (WHERE event.event_type = 'pilot.override')::integer AS overrides
-       FROM public.collaboration_evaluation_event event
-       LEFT JOIN public.agent agent ON agent.id = event.agent_id
-       WHERE event.workspace_id = $1 AND event.project_id = $2
-       GROUP BY agent.agent_type, event.routing_policy_version
-       ORDER BY agent.agent_type, event.routing_policy_version`,
+      `WITH event_rollup AS (
+         SELECT COALESCE(agent.agent_type, 'unattributed') AS agent_type,
+                event.routing_policy_version, event.prompt_version,
+                event.permission_policy_version, event.agent_configuration_version,
+                count(*)::integer AS event_count,
+                count(*) FILTER (WHERE event.event_type = 'policy.rejected')::integer AS policy_rejections,
+                count(*) FILTER (WHERE event.event_type = 'pilot.override')::integer AS overrides,
+                count(*) FILTER (WHERE event.event_type = 'recursive.handoff_attempt')::integer AS recursive_handoff_attempts,
+                count(*) FILTER (WHERE event.event_type = 'duplicate.investigation')::integer AS duplicate_investigations,
+                count(*) FILTER (WHERE event.event_type = 'unsupported.certainty')::integer AS unsupported_certainty,
+                count(*) FILTER (WHERE event.event_type = 'routing.disagreement')::integer AS routing_disagreements,
+                count(*) FILTER (WHERE event.event_type = 'outcome.completed')::integer AS completed_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.failed')::integer AS failed_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.cancelled')::integer AS cancelled_outcomes
+         FROM public.collaboration_evaluation_event event
+         LEFT JOIN public.agent agent ON agent.id = event.agent_id AND agent.workspace_id = event.workspace_id
+         WHERE event.workspace_id = $1 AND event.project_id = $2 AND event.expires_at > now()
+         GROUP BY agent.agent_type, event.routing_policy_version, event.prompt_version,
+                  event.permission_policy_version, event.agent_configuration_version
+       ), feedback_rollup AS (
+         SELECT COALESCE(agent.agent_type, 'unattributed') AS agent_type,
+                feedback.routing_policy_version, feedback.prompt_version,
+                feedback.permission_policy_version, feedback.agent_configuration_version,
+                count(*) FILTER (WHERE feedback.rating = 'useful')::integer AS useful,
+                count(*) FILTER (WHERE feedback.rating = 'incorrect')::integer AS incorrect,
+                count(*) FILTER (WHERE feedback.rating = 'incomplete')::integer AS incomplete,
+                count(*) FILTER (WHERE feedback.rating = 'unnecessarily_delegated')::integer AS unnecessarily_delegated
+         FROM public.collaboration_feedback feedback
+         LEFT JOIN public.agent agent ON agent.id = feedback.agent_id AND agent.workspace_id = feedback.workspace_id
+         WHERE feedback.workspace_id = $1 AND feedback.project_id = $2 AND feedback.expires_at > now()
+         GROUP BY agent.agent_type, feedback.routing_policy_version, feedback.prompt_version,
+                  feedback.permission_policy_version, feedback.agent_configuration_version
+       ), report_keys AS (
+         SELECT agent_type, routing_policy_version, prompt_version,
+                permission_policy_version, agent_configuration_version FROM event_rollup
+         UNION
+         SELECT agent_type, routing_policy_version, prompt_version,
+                permission_policy_version, agent_configuration_version FROM feedback_rollup
+       )
+       SELECT report_keys.*,
+              COALESCE(event.event_count, 0)::integer AS event_count,
+              COALESCE(event.policy_rejections, 0)::integer AS policy_rejections,
+              COALESCE(event.overrides, 0)::integer AS overrides,
+              COALESCE(event.recursive_handoff_attempts, 0)::integer AS recursive_handoff_attempts,
+              COALESCE(event.duplicate_investigations, 0)::integer AS duplicate_investigations,
+              COALESCE(event.unsupported_certainty, 0)::integer AS unsupported_certainty,
+              COALESCE(event.routing_disagreements, 0)::integer AS routing_disagreements,
+              COALESCE(event.completed_outcomes, 0)::integer AS completed_outcomes,
+              COALESCE(event.failed_outcomes, 0)::integer AS failed_outcomes,
+              COALESCE(event.cancelled_outcomes, 0)::integer AS cancelled_outcomes,
+              COALESCE(feedback.useful, 0)::integer AS useful,
+              COALESCE(feedback.incorrect, 0)::integer AS incorrect,
+              COALESCE(feedback.incomplete, 0)::integer AS incomplete,
+              COALESCE(feedback.unnecessarily_delegated, 0)::integer AS unnecessarily_delegated
+       FROM report_keys
+       LEFT JOIN event_rollup event USING (
+         agent_type, routing_policy_version, prompt_version,
+         permission_policy_version, agent_configuration_version
+       )
+       LEFT JOIN feedback_rollup feedback USING (
+         agent_type, routing_policy_version, prompt_version,
+         permission_policy_version, agent_configuration_version
+       )
+       ORDER BY agent_type, routing_policy_version, prompt_version,
+                permission_policy_version, agent_configuration_version`,
       [access.workspace.id, projectId]
     )
   ]);
@@ -318,9 +472,40 @@ export async function loadCollaborationAccountability(
     })),
     evaluation: evaluation.rows.map((row) => ({
       agentType: row.agent_type, routingPolicyVersion: row.routing_policy_version,
-      eventCount: row.event_count, policyRejections: row.policy_rejections, overrides: row.overrides
+      promptVersion: row.prompt_version, permissionPolicyVersion: row.permission_policy_version,
+      agentConfigurationVersion: row.agent_configuration_version,
+      eventCount: row.event_count, policyRejections: row.policy_rejections, overrides: row.overrides,
+      automatedChecks: {
+        recursiveHandoffAttempts: row.recursive_handoff_attempts,
+        duplicateInvestigations: row.duplicate_investigations,
+        unsupportedCertainty: row.unsupported_certainty,
+        routingDisagreements: row.routing_disagreements
+      },
+      completionOutcomes: {
+        completed: row.completed_outcomes, failed: row.failed_outcomes, cancelled: row.cancelled_outcomes
+      },
+      pilotFeedback: {
+        useful: row.useful, incorrect: row.incorrect, incomplete: row.incomplete,
+        unnecessarilyDelegated: row.unnecessarily_delegated
+      }
     }))
   };
+}
+
+export async function purgeExpiredCollaborationEvaluation(
+  pool: Pool,
+  workspaceId: string,
+  projectId: string
+): Promise<void> {
+  await pool.query(
+    `WITH expired_feedback AS (
+       DELETE FROM public.collaboration_feedback
+       WHERE workspace_id = $1 AND project_id = $2 AND expires_at <= now()
+     )
+     DELETE FROM public.collaboration_evaluation_event
+     WHERE workspace_id = $1 AND project_id = $2 AND expires_at <= now()`,
+    [workspaceId, projectId]
+  );
 }
 
 export async function submitCollaborationFeedback(
@@ -355,20 +540,58 @@ export async function submitCollaborationFeedback(
   const projectPredicate = input.outcomeType === 'message'
     ? 'target_channel.project_id = $3'
     : input.outcomeType === 'agent_run' ? 'target_task.project_id = $3' : 'target.project_id = $3';
-  const target = await pool.query<{ allowed: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM ${targetTable}
-     WHERE target.id = $1 AND target.workspace_id = $2 AND ${projectPredicate}) AS allowed`,
-    [input.outcomeId, access.workspace.id, input.projectId]
+  const targetAgent = {
+    message: `(SELECT author.agent_id FROM public.workspace_member author
+               WHERE author.id = target.author_workspace_member_id
+                 AND author.workspace_id = target.workspace_id)`,
+    handoff: 'target.target_agent_id', agent_run: 'target.agent_id',
+    finding: 'target.author_agent_id', coordination_plan: 'target.coordinating_agent_id'
+  }[input.outcomeType];
+  const target = await pool.query<{
+    agent_id: string | null; routing_policy_version: string; prompt_version: string;
+    permission_policy_version: string; agent_configuration_version: string;
+  }>(
+    `SELECT ${targetAgent} AS agent_id,
+            COALESCE(attribution.routing_policy_version, 'not-applicable-v1') AS routing_policy_version,
+            COALESCE(attribution.prompt_version, 'not-applicable-v1') AS prompt_version,
+            COALESCE(attribution.permission_policy_version, 'not-applicable-v1') AS permission_policy_version,
+            COALESCE(attribution.agent_configuration_version,
+              CASE WHEN ${targetAgent} IS NULL THEN 'unattributed-v1'
+                   ELSE 'agent-config-' || COALESCE(agent.configuration_version, 1)::text END
+            ) AS agent_configuration_version
+     FROM ${targetTable}
+     LEFT JOIN public.agent agent ON agent.id = ${targetAgent} AND agent.workspace_id = target.workspace_id
+     LEFT JOIN LATERAL (
+       SELECT event.routing_policy_version, event.prompt_version,
+              event.permission_policy_version, event.agent_configuration_version
+       FROM public.collaboration_evaluation_event event
+       WHERE event.workspace_id = target.workspace_id AND event.project_id = $3
+         AND event.outcome_type = $4 AND event.outcome_id = target.id
+       ORDER BY event.created_at DESC, event.id DESC LIMIT 1
+     ) attribution ON true
+     WHERE target.id = $1 AND target.workspace_id = $2 AND ${projectPredicate}`,
+    [input.outcomeId, access.workspace.id, input.projectId, input.outcomeType]
   );
-  if (!target.rows[0]?.allowed) throw new AccountabilityError('Feedback outcome is outside the Project');
+  const attribution = target.rows[0];
+  if (!attribution) throw new AccountabilityError('Feedback outcome is outside the Project');
   await pool.query(
     `INSERT INTO public.collaboration_feedback (
        id, workspace_id, project_id, submitted_by_workspace_member_id,
-       outcome_type, outcome_id, rating, reason
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       outcome_type, outcome_id, rating, reason, agent_id,
+       routing_policy_version, prompt_version, permission_policy_version,
+       agent_configuration_version
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (submitted_by_workspace_member_id, outcome_type, outcome_id)
-     DO UPDATE SET rating = EXCLUDED.rating, reason = EXCLUDED.reason, created_at = now()`,
+     DO UPDATE SET rating = EXCLUDED.rating, reason = EXCLUDED.reason,
+       agent_id = EXCLUDED.agent_id,
+       routing_policy_version = EXCLUDED.routing_policy_version,
+       prompt_version = EXCLUDED.prompt_version,
+       permission_policy_version = EXCLUDED.permission_policy_version,
+       agent_configuration_version = EXCLUDED.agent_configuration_version,
+       created_at = now(), expires_at = DEFAULT`,
     [randomUUID(), access.workspace.id, input.projectId, actor.rows[0].id,
-      input.outcomeType, input.outcomeId, input.rating, reason]
+      input.outcomeType, input.outcomeId, input.rating, reason, attribution.agent_id,
+      attribution.routing_policy_version, attribution.prompt_version,
+      attribution.permission_policy_version, attribution.agent_configuration_version]
   );
 }

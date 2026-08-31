@@ -196,6 +196,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'task' },
       { table_schema: 'public', table_name: 'workspace' },
+      { table_schema: 'public', table_name: 'workspace_collaboration_evaluation_policy' },
       { table_schema: 'public', table_name: 'workspace_coordination_policy' },
       { table_schema: 'public', table_name: 'workspace_invitation' },
       { table_schema: 'public', table_name: 'workspace_member' },
