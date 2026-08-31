@@ -1180,7 +1180,7 @@ if (connectionString) {
       }, mentionDependencies),
       postChannelMessage(pool, memberAccess, {
         channelId: channel.channel.id,
-        body: '@Alex this retry must not retarget the accepted work.',
+        body: request,
         submissionId
       }, mentionDependencies)
     ]);
@@ -1189,6 +1189,13 @@ if (connectionString) {
     assert.equal(first.routingDecision?.intent, 'engineering_delegation');
     assert.equal(first.agentMention, null);
     assert.deepEqual(first.agentMention, retry.agentMention);
+    const conflictingRetry = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex this retry must not retarget the accepted work.',
+      submissionId
+    }, mentionDependencies);
+    assert.equal(conflictingRetry.id, first.id);
+    assert.equal(conflictingRetry.body, request);
     await correctMessageIntent(pool, memberAccess, first.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const confirmed = (await loadSharedAgentChannel(pool, memberAccess))
