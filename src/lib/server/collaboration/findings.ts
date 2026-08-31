@@ -242,6 +242,8 @@ export async function createFindingFromAgentResult(
   input: FindingInput & {
     workspaceId: string; projectId: string; authorAgentId: string;
     resultMessageId: string; sourceHandoffId?: string; routingPolicyVersion: string;
+    agentConfigurationVersion: string;
+    agentType: string;
   }
 ): Promise<string> {
   const finding = normalizeFindingInput(input);
@@ -310,6 +312,8 @@ export async function createFindingFromAgentResult(
       workspaceId: input.workspaceId, projectId: input.projectId,
       eventType: 'outcome.completed', agentId: input.authorAgentId,
       routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+      agentConfigurationVersion: input.agentConfigurationVersion,
+      agentType: input.agentType,
       permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
       evidence: { status: 'completed', evidenceCount: finding.evidence.length }
     });
@@ -318,6 +322,8 @@ export async function createFindingFromAgentResult(
         workspaceId: input.workspaceId, projectId: input.projectId,
         eventType: 'unsupported.certainty', agentId: input.authorAgentId,
         routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+        agentConfigurationVersion: input.agentConfigurationVersion,
+        agentType: input.agentType,
         permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
         evidence: { confidence: finding.confidence, evidenceCount: 0 }
       });
@@ -334,6 +340,8 @@ export async function createFindingFromAgentResult(
         workspaceId: input.workspaceId, projectId: input.projectId,
         eventType: 'duplicate.investigation', agentId: input.authorAgentId,
         routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+        agentConfigurationVersion: input.agentConfigurationVersion,
+        agentType: input.agentType,
         permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
         evidence: { duplicatesFindingId: duplicate.rows[0].id }
       });

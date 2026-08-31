@@ -28,6 +28,11 @@ test('expired collaboration evaluation is purged independently of project activi
   const script = await readFile(resolve('ops/postgres/run-evaluation-retention.sh'), 'utf8');
   assert.match(script, /SELECT public\.purge_expired_collaboration_evaluation\(\)/);
   assert.match(script, /EVALUATION_RETENTION_INTERVAL_SECONDS/);
+  const operations = await readFile(resolve('ops/README.md'), 'utf8');
+  assert.match(
+    operations,
+    /restart `web`, `worker`, `migrate`, `backup`, and `evaluation-retention`/
+  );
 });
 
 test('web replacement leaves the independently supervised worker running', async () => {

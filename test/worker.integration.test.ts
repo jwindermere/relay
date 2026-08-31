@@ -1195,6 +1195,28 @@ if (skipDatabaseTests) {
       )?.status,
       'cancelled'
     );
+    const interruptedHandoffEvaluation = await pool.query<{
+      event_type: string; routing_policy_version: string; agent_configuration_version: string;
+    }>(
+      `SELECT event.event_type, event.routing_policy_version,
+              event.agent_configuration_version
+       FROM public.collaboration_evaluation_event event
+       JOIN public.agent_handoff handoff ON handoff.id = event.outcome_id
+       WHERE event.outcome_type = 'handoff'
+         AND handoff.source_message_id = ANY($1::text[])
+       ORDER BY event.event_type`,
+      [[cancellableSourceMessageId, expiringSourceMessageId]]
+    );
+    assert.deepEqual(interruptedHandoffEvaluation.rows, [
+      {
+        event_type: 'outcome.cancelled', routing_policy_version: 'message-intent-v1',
+        agent_configuration_version: 'agent-config-1'
+      },
+      {
+        event_type: 'outcome.expired', routing_policy_version: 'message-intent-v1',
+        agent_configuration_version: 'agent-config-1'
+      }
+    ]);
 
     const recoveryCoordination = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -2468,6 +2490,8 @@ if (skipDatabaseTests) {
       workspaceId: ids.workspaceId, projectId: ids.projectId,
       coordinatingAgentId: ids.agentId, sourceMessageId: resultMessageId,
       routingPolicyVersion: 'message-intent-v1',
+      agentConfigurationVersion: 1,
+      agentType: 'engineering',
       goal: 'Assess evidence', allowParallel: false,
       budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 },
       steps: [{ key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] }]
@@ -2593,6 +2617,12 @@ if (skipDatabaseTests) {
     const researchTurnId = request.agentMention?.status === 'conversation'
       ? request.agentMention.conversationTurnId : '';
     await pool.query(
+      `UPDATE public.agent
+       SET configuration_version = configuration_version + 1, agent_type = 'product'
+       WHERE id = $1`,
+      [researchAgentId]
+    );
+    await pool.query(
       `UPDATE public.agent_conversation_turn
        SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
        WHERE status = 'queued' AND id <> $1`,
@@ -2626,7 +2656,7 @@ if (skipDatabaseTests) {
     });
     const stored = await pool.query<{
       findings: number; evidence: number; memory: number; evaluation_events: number;
-      routing_policy_version: string;
+      routing_policy_version: string; agent_configuration_version: string; agent_type: string;
     }>(
       `SELECT
          (SELECT count(*)::integer FROM public.agent_finding WHERE project_id = $1) AS findings,
@@ -2638,12 +2668,20 @@ if (skipDatabaseTests) {
             AND event_type = 'outcome.completed') AS evaluation_events,
          (SELECT routing_policy_version FROM public.collaboration_evaluation_event
           WHERE project_id = $1 AND outcome_type = 'finding'
-            AND event_type = 'outcome.completed' LIMIT 1) AS routing_policy_version`,
+            AND event_type = 'outcome.completed' LIMIT 1) AS routing_policy_version,
+         (SELECT agent_configuration_version FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed' LIMIT 1) AS agent_configuration_version,
+         (SELECT agent_type FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed' LIMIT 1) AS agent_type`,
       [ids.projectId]
     );
     assert.deepEqual(stored.rows[0], {
       findings: 1, evidence: 2, memory: 1, evaluation_events: 1,
-      routing_policy_version: 'message-intent-v1'
+      routing_policy_version: 'message-intent-v1',
+      agent_configuration_version: 'agent-config-1',
+      agent_type: 'research'
     });
     const accountability = await loadCollaborationAccountability(
       pool, ids.ownerAccess, ids.projectId

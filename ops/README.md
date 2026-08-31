@@ -119,7 +119,7 @@ immediate revocation.
 
 | Boundary | Credential | Rotation or revocation | Expected impact |
 | --- | --- | --- | --- |
-| Application/database | PostgreSQL password and database URL files | Change the database role password, replace both files, restart `web`, `worker`, `migrate`, and `backup`. | Brief application/worker database reconnect; durable state remains. |
+| Application/database | PostgreSQL password and database URL files | Change the database role password, replace both files, restart `web`, `worker`, `migrate`, `backup`, and `evaluation-retention`. | Brief application/worker database reconnect; evaluation retention resumes with the new credential; durable state remains. |
 | Application/email | Email delivery token file | Replace it and restart `web`. | Invitation email delivery only. |
 | Authentication | Better Auth secret file | Replace it and restart `web`; revoke individual sessions or membership in Relay when narrower response is possible. | Rotation invalidates authentication cookies; AgentRun execution continues. |
 | Codex | Worker-only managed-login state | Disconnect the Provider connection to stop new claims, drain the worker, and perform managed logout/login as the worker OS identity. | Existing history remains; new work waits until reconnection. |

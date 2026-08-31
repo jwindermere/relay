@@ -134,11 +134,13 @@ export async function correctMessageIntent(
     if (!messageContext.rows[0]) throw new MessageIntentError('Message routing decision was not found');
     const existingWork = await client.query<{
       task_id: string; run_id: string; run_status: string; assigned_agent_id: string;
-      project_id: string; routing_policy_version: string | null;
+      project_id: string; routing_policy_version: string | null; agent_configuration_version: number;
+      agent_type_snapshot: string;
     }>(
       `SELECT task.id AS task_id, run.id AS run_id, run.status AS run_status,
               task.assigned_agent_id, task.project_id,
-              decision.policy_version AS routing_policy_version
+              decision.policy_version AS routing_policy_version,
+              run.agent_configuration_version, run.agent_type_snapshot
        FROM public.task task JOIN public.agent_run run ON run.task_id = task.id
        LEFT JOIN public.message_intent_decision decision ON decision.message_id = task.source_message_id
        WHERE task.source_message_id = $1 AND task.workspace_id = $2
@@ -191,6 +193,8 @@ export async function correctMessageIntent(
         workspaceId: access.workspace.id, projectId: routed.project_id,
         eventType: 'outcome.cancelled', agentId: routed.assigned_agent_id,
         routingPolicyVersion: routed.routing_policy_version,
+        agentConfigurationVersion: `agent-config-${routed.agent_configuration_version}`,
+        agentType: routed.agent_type_snapshot,
         promptVersion: 'engineering-run-v1',
         permissionPolicyVersion: 'mvp-engineering-autonomy-v1',
         outcomeType: 'agent_run', outcomeId: routed.run_id,

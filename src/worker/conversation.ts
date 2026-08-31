@@ -48,6 +48,8 @@ interface ClaimedConversationTurn {
   recovering: boolean;
   routing_intent: string | null;
   routing_policy_version: string | null;
+  agent_configuration_version: number;
+  agent_type_snapshot: string;
   eligible: boolean;
 }
 
@@ -234,6 +236,7 @@ async function claimNextConversationTurn(
                   AND collaborator.enabled = true AND collaborator.status <> 'disabled'
               ), '') AS collaborator_roster,
               turn.response_parent_message_id, turn.ambient, turn.handoff_depth,
+              turn.agent_configuration_version, turn.agent_type_snapshot,
               COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
               decision.policy_version AS routing_policy_version,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
@@ -357,6 +360,19 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
     [now]
   );
   if (expired.rows.length === 0) return;
+  const attributions = await client.query<{
+    id: string; routing_policy_version: string | null; agent_configuration_version: number;
+    agent_type_snapshot: string;
+  }>(
+    `SELECT turn.id, decision.policy_version AS routing_policy_version,
+            turn.agent_configuration_version, turn.agent_type_snapshot
+     FROM public.agent_conversation_turn turn
+     JOIN public.message request ON request.id = turn.request_message_id
+     LEFT JOIN public.message_intent_decision decision ON decision.message_id = request.id
+     WHERE turn.id = ANY($1::text[])`,
+    [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id)]
+  );
+  const attributionByTurn = new Map(attributions.rows.map((row) => [row.id, row]));
   await client.query(
     `UPDATE public.agent_conversation_turn
      SET status = 'failed', error_code = 'handoff_expired',
@@ -365,10 +381,15 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
     [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id), now]
   );
   for (const handoff of expired.rows) {
+    const attribution = attributionByTurn.get(handoff.receiving_turn_id);
+    if (!attribution) throw new Error('Expired Agent handoff attribution was not found');
     await enqueueAgentHandoffStatus(client, handoff.workspace_id, handoff.id, 'expired');
     await recordCollaborationEvaluationEvent(client, {
       workspaceId: handoff.workspace_id, projectId: handoff.project_id,
       eventType: 'outcome.expired', agentId: handoff.target_agent_id,
+      routingPolicyVersion: attribution.routing_policy_version,
+      agentConfigurationVersion: `agent-config-${attribution.agent_configuration_version}`,
+      agentType: attribution.agent_type_snapshot,
       promptVersion: 'conversation-v1', permissionPolicyVersion: 'handoff-depth-v1',
       outcomeType: 'handoff', outcomeId: handoff.id,
       evidence: { status: 'expired', errorCode: 'handoff_expired' }
@@ -435,6 +456,8 @@ async function finishConversationTurn(
         workspaceId: claim.workspace_id, projectId: claim.project_id,
         eventType: 'recursive.handoff_attempt', agentId: claim.agent_id,
         routingPolicyVersion: claim.routing_policy_version, promptVersion: 'conversation-v1',
+        agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+        agentType: claim.agent_type_snapshot,
         permissionPolicyVersion: 'handoff-depth-v1', outcomeType: 'message',
         outcomeId: `conversation-result:${claim.id}`,
         evidence: { handoffDepth: claim.handoff_depth }
@@ -511,6 +534,8 @@ async function finishConversationTurn(
       workspaceId: claim.workspace_id, projectId: claim.project_id,
       eventType: `outcome.${status}`, agentId: claim.agent_id,
       routingPolicyVersion: claim.routing_policy_version, promptVersion: 'conversation-v1',
+      agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+      agentType: claim.agent_type_snapshot,
       permissionPolicyVersion: finishedHandoff.rows[0] ? 'handoff-depth-v1' : 'read-only-v1',
       outcomeType: finishedHandoff.rows[0] ? 'handoff' : messageId ? 'message' : 'conversation_turn',
       outcomeId: finishedHandoff.rows[0]?.id ?? messageId ?? claim.id,
@@ -540,7 +565,9 @@ async function finishConversationTurn(
         projectId: claim.project_id,
         coordinatingAgentId: claim.agent_id,
         sourceMessageId: messageId,
-        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1'
+        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
+        agentConfigurationVersion: claim.agent_configuration_version,
+        agentType: claim.agent_type_snapshot
       }).catch(() => undefined);
     }
     if (findingResult && messageId) {
@@ -550,6 +577,8 @@ async function finishConversationTurn(
         projectId: claim.project_id,
         authorAgentId: claim.agent_id,
         routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
+        agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+        agentType: claim.agent_type_snapshot,
         resultMessageId: messageId,
         ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
       }).catch(() => undefined);

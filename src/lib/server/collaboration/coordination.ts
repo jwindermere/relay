@@ -134,7 +134,7 @@ export async function proposeCoordinationPlan(
   pool: Pool,
   input: CoordinationPlanInput & {
     workspaceId: string; projectId: string; coordinatingAgentId: string; sourceMessageId: string;
-    routingPolicyVersion: string;
+    routingPolicyVersion: string; agentConfigurationVersion: number; agentType: string;
   }
 ): Promise<string> {
   const plan = normalizeCoordinationPlan(input);
@@ -189,12 +189,13 @@ export async function proposeCoordinationPlan(
     await client.query(
       `INSERT INTO public.coordination_plan (
          id, workspace_id, project_id, coordinating_agent_id, source_message_id,
-         routing_policy_version,
+         routing_policy_version, agent_configuration_version, agent_type_snapshot,
          goal, constraints, allow_parallel, max_participants, max_handoffs,
          max_depth, max_agent_runs, max_elapsed_seconds, provider_usage_limit
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
       [id, input.workspaceId, input.projectId, input.coordinatingAgentId, input.sourceMessageId,
-        input.routingPolicyVersion, plan.goal, JSON.stringify(plan.constraints), plan.allowParallel,
+        input.routingPolicyVersion, input.agentConfigurationVersion, input.agentType,
+        plan.goal, JSON.stringify(plan.constraints), plan.allowParallel,
         plan.budget.maxParticipants, plan.budget.maxHandoffs, plan.budget.maxDepth,
         plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
         plan.budget.providerUsageLimit ?? null]
@@ -245,6 +246,8 @@ export async function decideCoordinationPlan(
     const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed'] : ['approved', 'active', 'paused'];
     const updated = await client.query<{
       project_id: string; coordinating_agent_id: string; routing_policy_version: string;
+      agent_configuration_version: number;
+      agent_type_snapshot: string;
     }>(
       `UPDATE public.coordination_plan
        SET status = $4,
@@ -252,7 +255,8 @@ export async function decideCoordinationPlan(
            approved_at = CASE WHEN $4 = 'approved' THEN now() ELSE approved_at END,
            updated_at = now()
        WHERE id = $1 AND workspace_id = $2 AND status = ANY($5::text[])
-       RETURNING project_id, coordinating_agent_id, routing_policy_version`,
+       RETURNING project_id, coordinating_agent_id, routing_policy_version,
+         agent_configuration_version, agent_type_snapshot`,
       [planId, access.workspace.id, actor.rows[0].id, nextStatus, allowedCurrent]
     );
     if (updated.rowCount !== 1) throw new CoordinationError('Coordination plan cannot accept that decision');
@@ -272,6 +276,8 @@ export async function decideCoordinationPlan(
         workspaceId: access.workspace.id, projectId: updated.rows[0]!.project_id,
         eventType: `outcome.${nextStatus}`, agentId: updated.rows[0]!.coordinating_agent_id,
         routingPolicyVersion: updated.rows[0]!.routing_policy_version,
+        agentConfigurationVersion: `agent-config-${updated.rows[0]!.agent_configuration_version}`,
+        agentType: updated.rows[0]!.agent_type_snapshot,
         promptVersion: 'coordination-plan-v1', permissionPolicyVersion: 'coordination-budget-v1',
         outcomeType: 'coordination_plan', outcomeId: planId,
         evidence: { status: nextStatus }
@@ -619,11 +625,15 @@ export async function completeCoordinationStep(
   if (!planId) return;
   const evaluation = await client.query<{
     workspace_id: string; project_id: string; routing_policy_version: string;
+    agent_configuration_version: number;
+    agent_type_snapshot: string;
   }>(
-    `SELECT plan.workspace_id, plan.project_id, plan.routing_policy_version
+    `SELECT plan.workspace_id, plan.project_id, plan.routing_policy_version,
+            turn.agent_configuration_version, turn.agent_type_snapshot
      FROM public.coordination_plan plan
+     JOIN public.agent_conversation_turn turn ON turn.id = $3
      WHERE plan.id = $1 AND plan.workspace_id = $2`,
-    [planId, input.workspaceId]
+    [planId, input.workspaceId, input.conversationTurnId]
   );
   const evaluationContext = evaluation.rows[0];
   if (evaluationContext) {
@@ -631,6 +641,8 @@ export async function completeCoordinationStep(
       workspaceId: evaluationContext.workspace_id, projectId: evaluationContext.project_id,
       eventType: `outcome.${input.status}`, agentId: completed.rows[0]!.target_agent_id,
       routingPolicyVersion: evaluationContext.routing_policy_version,
+      agentConfigurationVersion: `agent-config-${evaluationContext.agent_configuration_version}`,
+      agentType: evaluationContext.agent_type_snapshot,
       promptVersion: 'coordination-step-v1', permissionPolicyVersion: 'coordination-budget-v1',
       outcomeType: 'coordination_step', outcomeId: completed.rows[0]!.id,
       evidence: { status: input.status }
@@ -669,10 +681,13 @@ async function finishCoordinationPlanIfComplete(client: PoolClient, planId: stri
     const synthesis = await client.query<{
       workspace_id: string; project_id: string; channel_id: string; root_message_id: string;
       coordinating_agent_id: string; routing_policy_version: string;
+      agent_configuration_version: number;
+      agent_type_snapshot: string;
       coordinator_member_id: string; result_ids: string[]; artifact_ids: string[];
     }>(
       `SELECT plan.workspace_id, plan.project_id, plan.coordinating_agent_id,
-              plan.routing_policy_version, source.channel_id,
+              plan.routing_policy_version, plan.agent_configuration_version,
+              plan.agent_type_snapshot, source.channel_id,
               COALESCE(source.parent_message_id, source.id) AS root_message_id,
               member.id AS coordinator_member_id,
               array_agg(step.result_message_id ORDER BY step.position)
@@ -711,6 +726,8 @@ async function finishCoordinationPlanIfComplete(client: PoolClient, planId: stri
         workspaceId: row.workspace_id, projectId: row.project_id,
         eventType: 'outcome.completed', agentId: row.coordinating_agent_id,
         routingPolicyVersion: row.routing_policy_version,
+        agentConfigurationVersion: `agent-config-${row.agent_configuration_version}`,
+        agentType: row.agent_type_snapshot,
         promptVersion: 'coordination-plan-v1', permissionPolicyVersion: 'coordination-budget-v1',
         outcomeType: 'coordination_plan', outcomeId: planId,
         evidence: { status: 'completed', synthesisMessageId }

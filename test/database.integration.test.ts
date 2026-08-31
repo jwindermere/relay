@@ -222,6 +222,25 @@ if (connectionString) {
       { column_name: 'prompt_version', is_nullable: 'NO' },
       { column_name: 'routing_policy_version', is_nullable: 'NO' }
     ]);
+    const evaluationSourceColumns = await pool.query<{
+      table_name: string; column_name: string; is_nullable: string;
+    }>(`
+      SELECT table_name, column_name, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN (
+          'agent_run', 'agent_conversation_turn', 'coordination_plan'
+        )
+        AND column_name IN ('agent_configuration_version', 'agent_type_snapshot')
+      ORDER BY table_name, column_name
+    `);
+    assert.deepEqual(evaluationSourceColumns.rows, [
+      { table_name: 'agent_conversation_turn', column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { table_name: 'agent_conversation_turn', column_name: 'agent_type_snapshot', is_nullable: 'NO' },
+      { table_name: 'agent_run', column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { table_name: 'agent_run', column_name: 'agent_type_snapshot', is_nullable: 'NO' },
+      { table_name: 'coordination_plan', column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { table_name: 'coordination_plan', column_name: 'agent_type_snapshot', is_nullable: 'NO' }
+    ]);
     await assert.doesNotReject(assertCompatibleSchema(pool));
   });
 

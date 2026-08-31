@@ -65,6 +65,20 @@ export async function cancelAgentHandoff(
     if (!row) {
       throw new AgentHandoffError('Queued Agent handoff was not found');
     }
+    const evaluation = await client.query<{
+      routing_policy_version: string | null; agent_configuration_version: number;
+      agent_type_snapshot: string;
+    }>(
+      `SELECT decision.policy_version AS routing_policy_version,
+              turn.agent_configuration_version, turn.agent_type_snapshot
+       FROM public.agent_conversation_turn turn
+       JOIN public.message request ON request.id = turn.request_message_id
+       LEFT JOIN public.message_intent_decision decision ON decision.message_id = request.id
+       WHERE turn.id = $1 AND turn.workspace_id = $2`,
+      [row.receiving_turn_id, access.workspace.id]
+    );
+    const attribution = evaluation.rows[0];
+    if (!attribution) throw new AgentHandoffError('Agent handoff attribution was not found');
     await client.query(
       `UPDATE public.agent_conversation_turn
        SET status = 'failed', error_code = 'handoff_cancelled',
@@ -76,6 +90,9 @@ export async function cancelAgentHandoff(
     await recordCollaborationEvaluationEvent(client, {
       workspaceId: access.workspace.id, projectId: row.project_id,
       eventType: 'outcome.cancelled', agentId: row.target_agent_id,
+      routingPolicyVersion: attribution.routing_policy_version,
+      agentConfigurationVersion: `agent-config-${attribution.agent_configuration_version}`,
+      agentType: attribution.agent_type_snapshot,
       promptVersion: 'conversation-v1', permissionPolicyVersion: 'handoff-depth-v1',
       outcomeType: 'handoff', outcomeId: row.id,
       evidence: { status: 'cancelled', errorCode: 'handoff_cancelled' }

@@ -34,9 +34,12 @@ async function recordAgentRunEvaluationEvent(
 ): Promise<void> {
   const context = await client.query<{
     workspace_id: string; project_id: string; agent_id: string; routing_policy_version: string | null;
+    agent_configuration_version: number;
+    agent_type_snapshot: string;
   }>(
     `SELECT run.workspace_id, task.project_id, run.agent_id,
-            decision.policy_version AS routing_policy_version
+            decision.policy_version AS routing_policy_version,
+            run.agent_configuration_version, run.agent_type_snapshot
      FROM public.agent_run run
      JOIN public.task task ON task.id = run.task_id AND task.workspace_id = run.workspace_id
      LEFT JOIN public.message_intent_decision decision
@@ -49,6 +52,8 @@ async function recordAgentRunEvaluationEvent(
   await recordCollaborationEvaluationEvent(client, {
     workspaceId: row.workspace_id, projectId: row.project_id, eventType,
     agentId: row.agent_id, routingPolicyVersion: row.routing_policy_version,
+    agentType: row.agent_type_snapshot,
+    agentConfigurationVersion: `agent-config-${row.agent_configuration_version}`,
     promptVersion: 'engineering-run-v1',
     permissionPolicyVersion: 'mvp-engineering-autonomy-v1',
     outcomeType: 'agent_run', outcomeId: target.id, evidence
