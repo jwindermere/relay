@@ -40,17 +40,22 @@ export class FindingError extends Error {
   }
 }
 
-const CREDENTIAL_PATTERNS = [
+const RESTRICTED_MEMORY_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
   /\b(?:sk|ghp)_[A-Za-z0-9_-]{12,}\b/u,
   /\bgithub_pat_[A-Za-z0-9_]{12,}\b/u,
+  /\bAKIA[A-Z0-9]{16}\b/u,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/u,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/iu,
   /\bauthorization\s*:\s*bearer\s+\S+/iu,
-  /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu
+  /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu,
+  /\b(?:credentialStoreReference|providerEventId|encrypted_reasoning)\b/u,
+  /"method"\s*:\s*"(?:item|turn)\/(?:started|completed)"/u
 ];
 
-function assertSafeProjectMemoryStatement(statement: string): void {
-  if (CREDENTIAL_PATTERNS.some((pattern) => pattern.test(statement))) {
-    throw new FindingError('Memory must not contain credentials');
+function assertContainsNoRecognizedRestrictedMaterial(statement: string): void {
+  if (RESTRICTED_MEMORY_PATTERNS.some((pattern) => pattern.test(statement))) {
+    throw new FindingError('Memory must not contain credentials or Provider traces');
   }
 }
 
@@ -68,7 +73,7 @@ function cleanList(value: unknown, label: string): string[] {
 export function normalizeFindingInput(input: FindingInput): FindingInput {
   const summary = input?.summary?.trim();
   if (!summary || summary.length > 4000) throw new FindingError('Finding summary is required');
-  assertSafeProjectMemoryStatement(summary);
+  assertContainsNoRecognizedRestrictedMaterial(summary);
   if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
     throw new FindingError('Finding confidence must be between 0 and 1');
   }
@@ -344,7 +349,7 @@ export async function createProjectMemory(
   if (!projectId) throw new FindingError('Project is required');
   const statement = typeof input?.statement === 'string' ? input.statement.trim() : '';
   if (!statement || statement.length > 4000) throw new FindingError('Memory statement is required');
-  assertSafeProjectMemoryStatement(statement);
+  assertContainsNoRecognizedRestrictedMaterial(statement);
   const allowedTypes: MemoryType[] = ['decision', 'terminology', 'constraint', 'finding', 'convention', 'rejected_approach'];
   if (!allowedTypes.includes(input.type)) throw new FindingError('Memory type is invalid');
   if (!Array.isArray(input.sourceReferences)
@@ -430,9 +435,9 @@ export async function setProjectMemoryLifecycle(
   pool: Pool,
   access: WorkspaceAccess,
   memoryId: string,
-  lifecycle: 'active' | 'archived' | 'deleted'
+  lifecycle: 'archived' | 'deleted'
 ): Promise<void> {
-  if (!['active', 'archived', 'deleted'].includes(lifecycle)) {
+  if (!['archived', 'deleted'].includes(lifecycle)) {
     throw new FindingError('Memory lifecycle is invalid');
   }
   const updated = await pool.query(

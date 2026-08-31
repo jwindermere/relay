@@ -2650,7 +2650,7 @@ if (skipDatabaseTests) {
     );
   });
 
-  test('Project memory is provenance-scoped, correctable, revocable, and deterministically bounded', async () => {
+  test('Project memory is provenance-scoped, superseded, archived, deleted, and deterministically bounded', async () => {
     const ids = await seedQueuedAgentRun(pool, 'project-memory');
     const otherWorkspace = await seedQueuedAgentRun(pool, 'project-memory-other-workspace');
     await pool.query(`UPDATE public.agent_run SET available_at = 'infinity' WHERE id = $1`, [
@@ -2706,7 +2706,7 @@ if (skipDatabaseTests) {
         statement: 'Authorization: Bearer credential-that-must-not-be-stored',
         sourceReferences: [`message:${sourceMessageId}`]
       }),
-      /must not contain credentials/
+      /must not contain credentials or Provider traces/
     );
 
     const originalDecisionId = memoryIds.get('decision');
@@ -2782,6 +2782,93 @@ if (skipDatabaseTests) {
     assert.deepEqual(await processNextAgentRun(pool, provider, {
       workerId: 'worker-project-memory', workspaceRoot
     }), { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+
+    await pool.query(
+      `INSERT INTO public.agent (id, workspace_id, name, role_label)
+       VALUES ('agent-project-memory-source', $1, 'Riley', 'Research agent')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ('agent-member-project-memory-source', $1, 'agent', 'agent-project-memory-source')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, 'agent-member-project-memory-source')`,
+      [ids.workspaceId, ids.projectId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation (
+         id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+       ) VALUES (
+         'conversation-project-memory-provenance', $1, $2, $3, $4, $5
+       )`,
+      [ids.workspaceId, ids.channelId, sourceMessageId, ids.agentId, ids.providerConnectionId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, status
+       ) VALUES (
+         'turn-project-memory-provenance', $1, 'conversation-project-memory-provenance',
+         $2, $3, 'queued'
+       )`,
+      [ids.workspaceId, sourceMessageId, ids.pilotMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_handoff (
+         id, workspace_id, project_id, originating_pilot_member_id,
+         source_agent_id, target_agent_id, source_message_id, source_task_id,
+         receiving_turn_id, question
+       ) VALUES (
+         'handoff-project-memory-provenance', $1, $2, $3,
+         'agent-project-memory-source', $4, $5, 'task-project-memory',
+         'turn-project-memory-provenance', 'Confirm the durable outcome.'
+       )`,
+      [ids.workspaceId, ids.projectId, ids.pilotMemberId, ids.agentId, sourceMessageId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES (
+         'artifact-result-project-memory', $1, $2, $3, $4,
+         'Pull request #33 is ready for review.'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId, sourceMessageId]
+    );
+    await pool.query(
+      `INSERT INTO public.artifact (
+         id, workspace_id, project_id, task_id, agent_run_id, result_message_id,
+         kind, repository_id, branch, commit_sha, pull_request_number, url
+       ) VALUES (
+         'artifact-project-memory', $1, $2, 'task-project-memory', $3,
+         'artifact-result-project-memory', 'github_pull_request', $4,
+         'relay/project-memory', $5, 33, 'https://github.test/relay/pull/33'
+       )`,
+      [ids.workspaceId, ids.projectId, ids.runId, ids.linkedRepositoryId, 'a'.repeat(40)]
+    );
+    const multiSourceMemoryId = await createProjectMemory(pool, ids.ownerAccess, {
+      projectId: ids.projectId,
+      type: 'finding',
+      statement: 'All supported durable provenance resolves inside the Project.',
+      sourceReferences: [
+        'handoff:handoff-project-memory-provenance',
+        'task:task-project-memory',
+        `agent_run:${ids.runId}`,
+        'artifact:artifact-project-memory'
+      ]
+    });
+    assert.deepEqual(
+      (await loadCollaborationAccountability(pool, ids.ownerAccess, ids.projectId))
+        .memory.find(({ id }) => id === multiSourceMemoryId)?.sourceReferences,
+      [
+        'handoff:handoff-project-memory-provenance',
+        'task:task-project-memory',
+        `agent_run:${ids.runId}`,
+        'artifact:artifact-project-memory'
+      ]
+    );
 
     await pool.query(
       `DELETE FROM public.project_membership

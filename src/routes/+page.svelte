@@ -1233,8 +1233,10 @@
               <div class="mt-1 flex gap-1">
                 <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctMemory(memory)}>Correct / supersede</button>
                 <button class="btn btn-ghost btn-xs" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'archived')}>Archive</button>
-                <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'deleted')}>Delete</button>
               </div>
+            {/if}
+            {#if memory.lifecycle !== 'deleted'}
+              <button class="btn btn-ghost btn-xs mt-1 text-error" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'deleted')}>Delete</button>
             {/if}
           </li>
         {/each}
