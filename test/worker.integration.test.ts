@@ -1295,7 +1295,8 @@ if (skipDatabaseTests) {
         }]
       });
       assert.deepEqual(answers, {
-        coverage: ['Yes, cover a complete web-process restart.']
+        coverage: ['Yes, cover a complete web-process restart.'],
+        relay_pilot_steering: ['Do not change deployment files.']
       });
       await observer.clarificationDelivered('request-clarification');
       await observer.notification({
@@ -1329,6 +1330,13 @@ if (skipDatabaseTests) {
       'SELECT status FROM public.agent_run WHERE id = $1', [ids.runId]
     );
     assert.equal(waiting.rows[0]?.status, 'waiting_for_input');
+
+    const steering = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-clarification',
+      body: 'steer: Do not change deployment files.',
+      submissionId: 'steering-while-waiting'
+    });
 
     const answerMessageId = 'answer-clarification';
     await pool.query(
@@ -1377,6 +1385,20 @@ if (skipDatabaseTests) {
     assert.equal(stored.rows[0]?.provider_thread_id, 'thread-clarification');
     assert.ok(stored.rows[0]?.delivery_attempted_at);
     assert.ok(stored.rows[0]?.delivered_at);
+    const deliveredSteering = await pool.query<{
+      source_message_id: string; status: string;
+      provider_thread_id: string; provider_turn_id: string;
+    }>(
+      `SELECT source_message_id, status, provider_thread_id, provider_turn_id
+       FROM public.agent_run_steering WHERE agent_run_id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(deliveredSteering.rows, [{
+      source_message_id: steering.id,
+      status: 'delivered',
+      provider_thread_id: 'thread-clarification',
+      provider_turn_id: 'turn-clarification'
+    }]);
   });
 
   test('one attributable Approval is consumed once before its action continues', async () => {
@@ -2176,6 +2198,84 @@ if (skipDatabaseTests) {
       source_message_id: steering.id, ordinal: 1, status: 'delivered',
       provider_thread_id: 'thread-steering-guidance', provider_turn_id: 'turn-steering-guidance'
     }]);
+  });
+
+  test('simultaneous Pilot steering is durably ordered and submission-idempotent', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'steering-ordering');
+    const firstInput = {
+      channelId: ids.channelId,
+      parentMessageId: 'message-steering-ordering',
+      body: 'steer: add regression coverage',
+      submissionId: 'steering-ordering-first'
+    };
+    const [first, second] = await Promise.all([
+      postChannelMessage(pool, ids.ownerAccess, firstInput),
+      postChannelMessage(pool, ids.memberAccess, {
+        channelId: ids.channelId,
+        parentMessageId: 'message-steering-ordering',
+        body: 'constraint: do not change deployment files',
+        submissionId: 'steering-ordering-second'
+      })
+    ]);
+    const retry = await postChannelMessage(pool, ids.ownerAccess, firstInput);
+
+    assert.equal(retry.id, first.id);
+    const stored = await pool.query<{
+      source_message_id: string; ordinal: number; status: string;
+    }>(
+      `SELECT source_message_id, ordinal, status
+       FROM public.agent_run_steering WHERE agent_run_id = $1 ORDER BY ordinal`,
+      [ids.runId]
+    );
+    assert.deepEqual(stored.rows.map(({ ordinal, status }) => ({ ordinal, status })), [
+      { ordinal: 1, status: 'pending' },
+      { ordinal: 2, status: 'pending' }
+    ]);
+    assert.deepEqual(
+      new Set(stored.rows.map(({ source_message_id }) => source_message_id)),
+      new Set([first.id, second.id])
+    );
+  });
+
+  test('steering remains visible when active, recovering, or paused and is rejected when terminal', async () => {
+    const acceptedStates = ['working', 'recovering', 'paused'] as const;
+    for (const status of acceptedStates) {
+      const ids = await seedQueuedAgentRun(pool, `steering-${status}`);
+      await pool.query('UPDATE public.agent_run SET status = $2 WHERE id = $1', [ids.runId, status]);
+      const steering = await postChannelMessage(pool, ids.memberAccess, {
+        channelId: ids.channelId,
+        parentMessageId: `message-steering-${status}`,
+        body: `guidance: preserve the ${status} evidence`,
+        submissionId: `steering-${status}-input`
+      });
+      const stored = await pool.query<{ source_message_id: string; status: string }>(
+        `SELECT source_message_id, status FROM public.agent_run_steering
+         WHERE agent_run_id = $1`,
+        [ids.runId]
+      );
+      assert.deepEqual(stored.rows, [{ source_message_id: steering.id, status: 'pending' }]);
+    }
+
+    const terminalStates = ['completed', 'failed', 'cancelled'] as const;
+    for (const status of terminalStates) {
+      const ids = await seedQueuedAgentRun(pool, `steering-${status}`);
+      await pool.query(
+        'UPDATE public.agent_run SET status = $2, completed_at = now() WHERE id = $1',
+        [ids.runId, status]
+      );
+      await postChannelMessage(pool, ids.memberAccess, {
+        channelId: ids.channelId,
+        parentMessageId: `message-steering-${status}`,
+        body: `steer: this must not attach to ${status} work`,
+        submissionId: `steering-${status}-input`
+      });
+      const stored = await pool.query<{ count: number }>(
+        `SELECT count(*)::integer AS count FROM public.agent_run_steering
+         WHERE agent_run_id = $1`,
+        [ids.runId]
+      );
+      assert.equal(stored.rows[0]?.count, 0);
+    }
   });
 
   test('a Pilot intent correction stops queued repository work before execution', async () => {
