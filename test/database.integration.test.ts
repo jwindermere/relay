@@ -244,6 +244,31 @@ if (connectionString) {
     await assert.doesNotReject(assertCompatibleSchema(pool));
   });
 
+  test('Agent handoff schema enforces lifecycle, retry, provenance, and loop boundaries', async () => {
+    const constraints = await pool.query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(constraint_row.oid) AS definition
+       FROM pg_constraint constraint_row
+       JOIN pg_class table_row ON table_row.oid = constraint_row.conrelid
+       JOIN pg_namespace schema_row ON schema_row.oid = table_row.relnamespace
+       WHERE schema_row.nspname = 'public' AND table_row.relname = 'agent_handoff'
+       ORDER BY constraint_row.conname`
+    );
+    const contract = constraints.rows.map(({ definition }) => definition).join('\n');
+    assert.match(
+      contract,
+      /status.*queued.*working.*completed.*failed.*cancelled.*expired/is
+    );
+    assert.match(contract, /UNIQUE \(source_message_id\)/i);
+    assert.match(contract, /UNIQUE \(receiving_turn_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(project_id, workspace_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(originating_pilot_member_id, workspace_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(source_agent_id, workspace_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(target_agent_id, workspace_id\)/i);
+    assert.match(contract, /source_agent_id <> target_agent_id/i);
+    assert.match(contract, /status = 'completed'.*result_message_id IS NOT NULL/is);
+    assert.match(contract, /status = 'working'.*started_at IS NOT NULL/is);
+  });
+
   test('a runtime accepts additive mixed-version schemas and rejects unsafe contracts', async () => {
     const compatibleVersion = REQUIRED_MIGRATION_STREAM_VERSIONS.relay + 1;
     const incompatibleVersion = compatibleVersion + 1;
@@ -933,6 +958,112 @@ if (connectionString) {
       JSON.stringify(audit.rows),
       /provider-login-secret-reference|codex:|OWNER-CODE|api.?key/i
     );
+  });
+
+  test('Agent handoff persistence rejects retries, invalid lifecycle changes, and broken provenance', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const fixture = await client.query<{
+        workspace_id: string; project_id: string; channel_id: string;
+        pilot_member_id: string; source_agent_id: string; source_member_id: string;
+        target_agent_id: string; provider_connection_id: string;
+      }>(
+        `SELECT workspace.id AS workspace_id, project.id AS project_id,
+                channel.id AS channel_id, pilot_member.id AS pilot_member_id,
+                source_agent.id AS source_agent_id, source_member.id AS source_member_id,
+                target_agent.id AS target_agent_id, provider.id AS provider_connection_id
+         FROM public.workspace workspace
+         JOIN public.project project ON project.workspace_id = workspace.id
+         JOIN public.channel channel ON channel.project_id = project.id
+         JOIN public.workspace_member pilot_member
+           ON pilot_member.workspace_id = workspace.id AND pilot_member.kind = 'pilot'
+         JOIN public.agent source_agent
+           ON source_agent.workspace_id = workspace.id AND source_agent.name = 'Alex'
+         JOIN public.workspace_member source_member ON source_member.agent_id = source_agent.id
+         JOIN public.agent target_agent
+           ON target_agent.workspace_id = workspace.id AND target_agent.name = 'Maya'
+         JOIN public.provider_connection provider ON provider.workspace_id = workspace.id
+         ORDER BY project.created_at, pilot_member.created_at
+         LIMIT 1`
+      );
+      const context = fixture.rows[0]!;
+      await client.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, body
+         ) VALUES ('database-handoff-source', $1, $2, $3, '@Maya Which outcome matters?')`,
+        [context.workspace_id, context.channel_id, context.source_member_id]
+      );
+      await client.query(
+        `INSERT INTO public.agent_conversation (
+           id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+         ) VALUES ('database-handoff-conversation', $1, $2, 'database-handoff-source', $3, $4)`,
+        [context.workspace_id, context.channel_id, context.target_agent_id,
+          context.provider_connection_id]
+      );
+      await client.query(
+        `INSERT INTO public.agent_conversation_turn (
+           id, workspace_id, conversation_id, request_message_id,
+           requested_by_workspace_member_id, status, handoff_depth
+         ) VALUES (
+           'database-handoff-turn', $1, 'database-handoff-conversation',
+           'database-handoff-source', $2, 'queued', 1
+         )`,
+        [context.workspace_id, context.source_member_id]
+      );
+      const handoffValues = [context.workspace_id, context.project_id,
+        context.pilot_member_id, context.source_agent_id, context.target_agent_id];
+      const insertHandoff = (id: string) => client.query(
+        `INSERT INTO public.agent_handoff (
+           id, workspace_id, project_id, originating_pilot_member_id,
+           source_agent_id, target_agent_id, source_message_id, receiving_turn_id, question
+         ) VALUES ($6, $1, $2, $3, $4, $5,
+           'database-handoff-source', 'database-handoff-turn', 'Which outcome matters?')`,
+        [...handoffValues, id]
+      );
+      await insertHandoff('database-handoff');
+
+      const rejected = async (name: string, operation: () => Promise<unknown>) => {
+        await client.query(`SAVEPOINT ${name}`);
+        await assert.rejects(operation());
+        await client.query(`ROLLBACK TO SAVEPOINT ${name}`);
+      };
+      await rejected('duplicate_retry', () => insertHandoff('database-handoff-retry'));
+      await rejected('self_handoff', () => client.query(
+        `UPDATE public.agent_handoff SET target_agent_id = source_agent_id
+         WHERE id = 'database-handoff'`
+      ));
+      await rejected('cross_project', () => client.query(
+        `UPDATE public.agent_handoff SET project_id = 'missing-project'
+         WHERE id = 'database-handoff'`
+      ));
+      await rejected('invalid_lifecycle', () => client.query(
+        `UPDATE public.agent_handoff SET status = 'completed'
+         WHERE id = 'database-handoff'`
+      ));
+
+      await client.query(
+        `UPDATE public.agent_handoff SET status = 'working', started_at = now()
+         WHERE id = 'database-handoff'`
+      );
+      await client.query(
+        `UPDATE public.agent_handoff
+         SET status = 'failed', completed_at = now(), error_code = 'provider_failed'
+         WHERE id = 'database-handoff'`
+      );
+      const completed = await client.query<{ status: string; error_code: string }>(
+        `SELECT status, error_code FROM public.agent_handoff WHERE id = 'database-handoff'`
+      );
+      assert.deepEqual(completed.rows[0], {
+        status: 'failed', error_code: 'provider_failed'
+      });
+      await client.query('ROLLBACK');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   test('only the active owner links and verifies one stable GitHub repository identity', async () => {

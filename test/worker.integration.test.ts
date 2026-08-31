@@ -970,16 +970,20 @@ if (skipDatabaseTests) {
         sourceMessageId: string;
         originatingRequest: { messageId: string; body: string };
       };
+      supplied_context: Array<{ author_name: string; body: string }>;
       artifact_references: unknown[];
       expected_response_shape: string;
       outcome_snapshot: unknown;
     }>(
       `SELECT originating_pilot_member_id, source_agent_id, target_agent_id, project_id,
-              context_snapshot, artifact_references, expected_response_shape, outcome_snapshot
+              context_snapshot - 'suppliedChannelContext' AS context_snapshot,
+              context_snapshot->'suppliedChannelContext' AS supplied_context,
+              artifact_references, expected_response_shape, outcome_snapshot
        FROM public.agent_handoff WHERE receiving_turn_id = $1`,
       [handoff.rows[0]?.id]
     );
-    assert.deepEqual(durableHandoff.rows[0], {
+    const { supplied_context: suppliedContext, ...durableContract } = durableHandoff.rows[0]!;
+    assert.deepEqual(durableContract, {
       originating_pilot_member_id: ids.pilotMemberId,
       source_agent_id: ids.agentId,
       target_agent_id: productAgentId,
@@ -1005,6 +1009,16 @@ if (skipDatabaseTests) {
       expected_response_shape: 'concise_text',
       outcome_snapshot: null
     });
+    assert.ok(suppliedContext.some(
+      ({ body }) => body === coordination.body
+    ));
+
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES ('late-handoff-context', $1, $2, $3, 'This arrived after the handoff contract.')`,
+      [ids.workspaceId, ids.channelId, ids.pilotMemberId]
+    );
 
     const handoffProvider = new FixtureProvider(async (input, observer) => {
       const workingHandoffView = await loadChannelReconciliation(
@@ -1019,6 +1033,8 @@ if (skipDatabaseTests) {
       })), [{ status: 'working', summary: 'Maya is responding' }]);
       assert.match(input.prompt, /bounded Agent handoff/);
       assert.doesNotMatch(input.prompt, /you may make one bounded handoff/);
+      assert.match(input.prompt, /help decide what Artifact artifact-conversation must achieve/);
+      assert.doesNotMatch(input.prompt, /This arrived after the handoff contract/);
       await observer.threadStarted('thread-conversation-product');
       await observer.turnStarted('turn-conversation-product');
       await observer.notification({
@@ -1077,6 +1093,44 @@ if (skipDatabaseTests) {
       [productMemberId]
     );
     assert.equal(cascaded.rows[0]?.count, 0);
+
+    const forbiddenRepositoryCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask Product to carry out this repository change.',
+      submissionId: 'conversation-forbidden-repository-coordination'
+    });
+    const forbiddenRepositoryCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-forbidden-repository');
+      await observer.turnStarted('turn-conversation-forbidden-repository');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-forbidden-repository:message:completed',
+        item: {
+          id: 'message-conversation-forbidden-repository',
+          type: 'agentMessage',
+          text: '@Maya please recommend an approach, then implement it in the codebase.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-forbidden-repository:completed',
+        turn: { id: 'turn-conversation-forbidden-repository', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, forbiddenRepositoryCoordinator, {
+      workerId: 'worker-conversation-forbidden-repository', workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const forbiddenRepositorySourceId = `conversation-result:${
+      forbiddenRepositoryCoordination.agentMention?.status === 'conversation'
+        ? forbiddenRepositoryCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const forbiddenRepositoryHandoff = await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count FROM public.agent_handoff WHERE source_message_id = $1`,
+      [forbiddenRepositorySourceId]
+    );
+    assert.equal(forbiddenRepositoryHandoff.rows[0]?.count, 0);
 
     const expiringCoordination = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,

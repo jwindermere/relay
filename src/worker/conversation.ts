@@ -9,6 +9,7 @@ import {
   type ProviderNotification
 } from '../lib/server/provider/agent-run.js';
 import { acceptAgentConversation } from '../lib/server/collaboration/conversation.js';
+import { loadChannelContextBeforeMessage } from '../lib/server/collaboration/channel-context.js';
 import { enqueueAgentHandoffStatus } from '../lib/server/collaboration/handoffs.js';
 import { recordCollaborationEvaluationEvent } from '../lib/server/collaboration/evaluation.js';
 import {
@@ -30,6 +31,7 @@ interface ClaimedConversationTurn {
   project_id: string;
   conversation_id: string;
   request_body: string;
+  request_message_id: string;
   root_message_id: string;
   channel_id: string;
   agent_id: string;
@@ -42,6 +44,9 @@ interface ClaimedConversationTurn {
   response_parent_message_id: string | null;
   ambient: boolean;
   handoff_depth: number;
+  handoff_context_snapshot: {
+    suppliedChannelContext?: Array<{ author_name: string; body: string }>;
+  } | null;
   provider_thread_id: string | null;
   credential_store_reference: string;
   lease_token: string;
@@ -214,7 +219,7 @@ async function claimNextConversationTurn(
       provider_connection_id: string;
     }>(
       `SELECT turn.id, turn.workspace_id, channel.project_id, turn.conversation_id,
-              request.body AS request_body, conversation.root_message_id,
+              turn.request_message_id, request.body AS request_body, conversation.root_message_id,
               conversation.channel_id, conversation.agent_id,
               agent_member.id AS agent_member_id, agent.name AS agent_name,
               agent.agent_type, agent.role_label AS agent_role_label,
@@ -236,6 +241,7 @@ async function claimNextConversationTurn(
                   AND collaborator.enabled = true AND collaborator.status <> 'disabled'
               ), '') AS collaborator_roster,
               turn.response_parent_message_id, turn.ambient, turn.handoff_depth,
+              handoff.context_snapshot AS handoff_context_snapshot,
               turn.agent_configuration_version, turn.agent_type_snapshot,
               COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
               decision.policy_version AS routing_policy_version,
@@ -258,6 +264,9 @@ async function claimNextConversationTurn(
          ON agent_member.agent_id = conversation.agent_id
         AND agent_member.workspace_id = conversation.workspace_id
        JOIN public.agent agent ON agent.id = conversation.agent_id
+       LEFT JOIN public.agent_handoff handoff
+         ON handoff.receiving_turn_id = turn.id
+        AND handoff.workspace_id = turn.workspace_id
        WHERE (
            (turn.status = 'queued' AND turn.available_at <= $1 AND turn.lease_expires_at IS NULL)
            OR (turn.status = 'working' AND turn.lease_expires_at <= $1)
@@ -596,30 +605,16 @@ async function loadConversationMemory(
   claim: Pick<
     ClaimedConversationTurn,
     'workspace_id' | 'project_id' | 'channel_id' | 'agent_id' | 'id'
+      | 'request_message_id' | 'handoff_context_snapshot'
   >
 ): Promise<string> {
+  const suppliedChannelContext = claim.handoff_context_snapshot?.suppliedChannelContext;
+  const messageContext = suppliedChannelContext
+    ? Promise.resolve({ rows: suppliedChannelContext })
+    : loadChannelContextBeforeMessage(pool, claim.request_message_id, claim.workspace_id)
+      .then((rows) => ({ rows }));
   const [messages, projectMemory, findings] = await Promise.all([
-    pool.query<{ author_name: string; body: string }>(
-    `SELECT memory.author_name, memory.body
-     FROM (
-       SELECT COALESCE(pilot_user.name, agent.name) AS author_name, message.body,
-              message.created_at, message.id
-       FROM public.agent_conversation_turn turn
-       JOIN public.message request ON request.id = turn.request_message_id
-       JOIN public.message message ON message.channel_id = request.channel_id
-         AND message.workspace_id = request.workspace_id
-         AND (message.created_at, message.id) < (request.created_at, request.id)
-       JOIN public.workspace_member author ON author.id = message.author_workspace_member_id
-       LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
-       LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
-       LEFT JOIN public.agent agent ON agent.id = author.agent_id
-       WHERE turn.id = $1 AND request.workspace_id = $2 AND request.channel_id = $3
-       ORDER BY message.created_at DESC, message.id DESC
-       LIMIT 30
-     ) memory
-     ORDER BY memory.created_at, memory.id`,
-      [claim.id, claim.workspace_id, claim.channel_id]
-    ),
+    messageContext,
     loadAgentProjectMemoryContext(pool, {
       workspaceId: claim.workspace_id,
       projectId: claim.project_id,
