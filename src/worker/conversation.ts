@@ -539,7 +539,8 @@ async function finishConversationTurn(
         workspaceId: claim.workspace_id,
         projectId: claim.project_id,
         coordinatingAgentId: claim.agent_id,
-        sourceMessageId: messageId
+        sourceMessageId: messageId,
+        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1'
       }).catch(() => undefined);
     }
     if (findingResult && messageId) {

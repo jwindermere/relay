@@ -1,6 +1,9 @@
 ALTER TABLE public.agent
   ADD COLUMN configuration_version integer NOT NULL DEFAULT 1 CHECK (configuration_version > 0);
 
+ALTER TABLE public.coordination_plan
+  ADD COLUMN routing_policy_version text NOT NULL DEFAULT 'not-applicable-v1';
+
 CREATE TABLE public.workspace_collaboration_evaluation_policy (
   workspace_id text PRIMARY KEY REFERENCES public.workspace(id) ON DELETE CASCADE,
   retention_days integer NOT NULL DEFAULT 365 CHECK (retention_days BETWEEN 1 AND 3650),
@@ -144,7 +147,7 @@ ALTER TABLE public.collaboration_evaluation_event
     evidence::text !~* '"(authorization|api[_ -]?key|password|secret|token|credential|private[_ -]?key|encrypted_reasoning|provider[_ -]?(event[_ -]?)?trace)"[[:space:]]*:'
     AND evidence::text !~* '(chain[ -]of[ -]thought|private reasoning|hidden reasoning)'
     AND evidence::text !~ '(-----BEGIN [A-Z ]*PRIVATE KEY-----|\m(sk|ghp)_[A-Za-z0-9_-]{12,}\M|\msk-(proj-)?[A-Za-z0-9_-]{12,}\M|\mgithub_pat_[A-Za-z0-9_]{12,}\M|\mAKIA[A-Z0-9]{16}\M|\meyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\M)'
-    AND evidence::text !~* '(authorization[[:space:]]*:[[:space:]]*(basic|bearer)[[:space:]]+[^[:space:]]+|[a-z][a-z0-9+.-]*://[^[:space:]/@:]+:[^[:space:]/@]+@)'
+    AND evidence::text !~* '(authorization[[:space:]]*:[[:space:]]*(basic|bearer)[[:space:]]+[^[:space:]]+|[a-z][a-z0-9+.-]*://[^[:space:]/@:]+:[^[:space:]/@]+@|(api[ _-]?key|password|secret|token)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,})'
   );
 
 ALTER TABLE public.collaboration_feedback
@@ -152,6 +155,7 @@ ALTER TABLE public.collaboration_feedback
     reason IS NULL OR (
       reason !~* '(chain[ -]of[ -]thought|private reasoning|hidden reasoning|authorization[[:space:]]*:[[:space:]]*(basic|bearer)[[:space:]]+[^[:space:]]+)'
       AND reason !~ '(-----BEGIN [A-Z ]*PRIVATE KEY-----|\m(sk|ghp)_[A-Za-z0-9_-]{12,}\M|\msk-(proj-)?[A-Za-z0-9_-]{12,}\M|\mgithub_pat_[A-Za-z0-9_]{12,}\M|\mAKIA[A-Z0-9]{16}\M|\meyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\M)'
+      AND reason !~* '([a-z][a-z0-9+.-]*://[^[:space:]/@:]+:[^[:space:]/@]+@|(api[ _-]?key|password|secret|token)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,})'
     )
   );
 

@@ -306,6 +306,13 @@ export async function createFindingFromAgentResult(
       [randomUUID(), input.workspaceId, input.projectId, source.rows[0].author_member_id,
         finding.summary, JSON.stringify([`finding:${id}`, `message:${input.resultMessageId}`])]
     );
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: input.workspaceId, projectId: input.projectId,
+      eventType: 'outcome.completed', agentId: input.authorAgentId,
+      routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+      permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
+      evidence: { status: 'completed', evidenceCount: finding.evidence.length }
+    });
     if (finding.evidence.length === 0 && finding.confidence >= 0.8) {
       await recordCollaborationEvaluationEvent(client, {
         workspaceId: input.workspaceId, projectId: input.projectId,

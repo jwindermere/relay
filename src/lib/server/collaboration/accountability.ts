@@ -16,7 +16,7 @@ type CollaborationSignalType =
   | 'unsupported_certainty'
   | 'routing_disagreement';
 
-type CompletionOutcome = 'completed' | 'failed' | 'cancelled' | 'expired' | 'rejected';
+type EvaluationOutcome = 'completed' | 'failed' | 'cancelled' | 'expired' | 'rejected';
 type FeedbackRating = 'useful' | 'incorrect' | 'incomplete' | 'unnecessarily_delegated';
 
 export interface CollaborationEvaluationAttribution {
@@ -53,7 +53,7 @@ export interface CollaborationEvaluationFixture {
   handoffDepths: number[];
   findings: Array<{ id: string; summary: string; confidence: number; evidenceReferences: string[] }>;
   routingDecisions: Array<{ id: string; selectedIntent: string; correctedIntent: string | null }>;
-  outcomes: readonly CompletionOutcome[];
+  outcomes: readonly EvaluationOutcome[];
   pilotFeedback: readonly FeedbackRating[];
 }
 
@@ -132,7 +132,7 @@ export function compareCollaborationEvaluationFixtures(
         'recursive_handoff_attempt', 'duplicate_investigation',
         'unsupported_certainty', 'routing_disagreement'
       ]),
-      completionOutcomes: deltas<CompletionOutcome>(
+      completionOutcomes: deltas<EvaluationOutcome>(
         countValues(baseline.outcomes), countValues(candidate.outcomes),
         ['completed', 'failed', 'cancelled', 'expired', 'rejected']
       ),

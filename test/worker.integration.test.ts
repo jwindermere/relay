@@ -2467,6 +2467,7 @@ if (skipDatabaseTests) {
     const planId = await proposeCoordinationPlan(pool, {
       workspaceId: ids.workspaceId, projectId: ids.projectId,
       coordinatingAgentId: ids.agentId, sourceMessageId: resultMessageId,
+      routingPolicyVersion: 'message-intent-v1',
       goal: 'Assess evidence', allowParallel: false,
       budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 },
       steps: [{ key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] }]
@@ -2623,15 +2624,27 @@ if (skipDatabaseTests) {
       conversationTurnId: researchTurnId,
       status: 'completed'
     });
-    const stored = await pool.query<{ findings: number; evidence: number; memory: number }>(
+    const stored = await pool.query<{
+      findings: number; evidence: number; memory: number; evaluation_events: number;
+      routing_policy_version: string;
+    }>(
       `SELECT
          (SELECT count(*)::integer FROM public.agent_finding WHERE project_id = $1) AS findings,
          (SELECT count(*)::integer FROM public.finding_evidence WHERE project_id = $1) AS evidence,
          (SELECT count(*)::integer FROM public.project_memory
-          WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory`,
+          WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory,
+         (SELECT count(*)::integer FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed') AS evaluation_events,
+         (SELECT routing_policy_version FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed' LIMIT 1) AS routing_policy_version`,
       [ids.projectId]
     );
-    assert.deepEqual(stored.rows[0], { findings: 1, evidence: 2, memory: 1 });
+    assert.deepEqual(stored.rows[0], {
+      findings: 1, evidence: 2, memory: 1, evaluation_events: 1,
+      routing_policy_version: 'message-intent-v1'
+    });
     const accountability = await loadCollaborationAccountability(
       pool, ids.ownerAccess, ids.projectId
     );

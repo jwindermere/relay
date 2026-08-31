@@ -134,6 +134,7 @@ export async function proposeCoordinationPlan(
   pool: Pool,
   input: CoordinationPlanInput & {
     workspaceId: string; projectId: string; coordinatingAgentId: string; sourceMessageId: string;
+    routingPolicyVersion: string;
   }
 ): Promise<string> {
   const plan = normalizeCoordinationPlan(input);
@@ -188,11 +189,12 @@ export async function proposeCoordinationPlan(
     await client.query(
       `INSERT INTO public.coordination_plan (
          id, workspace_id, project_id, coordinating_agent_id, source_message_id,
+         routing_policy_version,
          goal, constraints, allow_parallel, max_participants, max_handoffs,
          max_depth, max_agent_runs, max_elapsed_seconds, provider_usage_limit
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [id, input.workspaceId, input.projectId, input.coordinatingAgentId, input.sourceMessageId,
-        plan.goal, JSON.stringify(plan.constraints), plan.allowParallel,
+        input.routingPolicyVersion, plan.goal, JSON.stringify(plan.constraints), plan.allowParallel,
         plan.budget.maxParticipants, plan.budget.maxHandoffs, plan.budget.maxDepth,
         plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
         plan.budget.providerUsageLimit ?? null]
@@ -242,7 +244,7 @@ export async function decideCoordinationPlan(
     const nextStatus = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : action === 'pause' ? 'paused' : 'cancelled';
     const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed'] : ['approved', 'active', 'paused'];
     const updated = await client.query<{
-      project_id: string; coordinating_agent_id: string; source_message_id: string;
+      project_id: string; coordinating_agent_id: string; routing_policy_version: string;
     }>(
       `UPDATE public.coordination_plan
        SET status = $4,
@@ -250,7 +252,7 @@ export async function decideCoordinationPlan(
            approved_at = CASE WHEN $4 = 'approved' THEN now() ELSE approved_at END,
            updated_at = now()
        WHERE id = $1 AND workspace_id = $2 AND status = ANY($5::text[])
-       RETURNING project_id, coordinating_agent_id, source_message_id`,
+       RETURNING project_id, coordinating_agent_id, routing_policy_version`,
       [planId, access.workspace.id, actor.rows[0].id, nextStatus, allowedCurrent]
     );
     if (updated.rowCount !== 1) throw new CoordinationError('Coordination plan cannot accept that decision');
@@ -266,15 +268,10 @@ export async function decideCoordinationPlan(
          WHERE plan_id = $1 AND workspace_id = $2 AND status IN ('pending', 'ready', 'blocked')`,
         [planId, access.workspace.id]
       );
-      const routing = await client.query<{ policy_version: string }>(
-        `SELECT policy_version FROM public.message_intent_decision
-         WHERE message_id = $1 AND workspace_id = $2`,
-        [updated.rows[0]!.source_message_id, access.workspace.id]
-      );
       await recordCollaborationEvaluationEvent(client, {
         workspaceId: access.workspace.id, projectId: updated.rows[0]!.project_id,
         eventType: `outcome.${nextStatus}`, agentId: updated.rows[0]!.coordinating_agent_id,
-        routingPolicyVersion: routing.rows[0]?.policy_version,
+        routingPolicyVersion: updated.rows[0]!.routing_policy_version,
         promptVersion: 'coordination-plan-v1', permissionPolicyVersion: 'coordination-budget-v1',
         outcomeType: 'coordination_plan', outcomeId: planId,
         evidence: { status: nextStatus }
@@ -621,12 +618,10 @@ export async function completeCoordinationStep(
   const planId = completed.rows[0]?.plan_id;
   if (!planId) return;
   const evaluation = await client.query<{
-    workspace_id: string; project_id: string; routing_policy_version: string | null;
+    workspace_id: string; project_id: string; routing_policy_version: string;
   }>(
-    `SELECT plan.workspace_id, plan.project_id, decision.policy_version AS routing_policy_version
+    `SELECT plan.workspace_id, plan.project_id, plan.routing_policy_version
      FROM public.coordination_plan plan
-     LEFT JOIN public.message_intent_decision decision
-       ON decision.message_id = plan.source_message_id AND decision.workspace_id = plan.workspace_id
      WHERE plan.id = $1 AND plan.workspace_id = $2`,
     [planId, input.workspaceId]
   );
@@ -672,10 +667,12 @@ async function finishCoordinationPlanIfComplete(client: PoolClient, planId: stri
   );
   if (remaining.rows[0]?.count === 0) {
     const synthesis = await client.query<{
-      workspace_id: string; channel_id: string; root_message_id: string;
+      workspace_id: string; project_id: string; channel_id: string; root_message_id: string;
+      coordinating_agent_id: string; routing_policy_version: string;
       coordinator_member_id: string; result_ids: string[]; artifact_ids: string[];
     }>(
-      `SELECT plan.workspace_id, source.channel_id,
+      `SELECT plan.workspace_id, plan.project_id, plan.coordinating_agent_id,
+              plan.routing_policy_version, source.channel_id,
               COALESCE(source.parent_message_id, source.id) AS root_message_id,
               member.id AS coordinator_member_id,
               array_agg(step.result_message_id ORDER BY step.position)
@@ -710,6 +707,14 @@ async function finishCoordinationPlanIfComplete(client: PoolClient, planId: stri
          VALUES ($1, $2, 'channel.message', $3)`,
         [row.workspace_id, synthesisMessageId, { messageId: synthesisMessageId }]
       );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: row.workspace_id, projectId: row.project_id,
+        eventType: 'outcome.completed', agentId: row.coordinating_agent_id,
+        routingPolicyVersion: row.routing_policy_version,
+        promptVersion: 'coordination-plan-v1', permissionPolicyVersion: 'coordination-budget-v1',
+        outcomeType: 'coordination_plan', outcomeId: planId,
+        evidence: { status: 'completed', synthesisMessageId }
+      });
     }
     await client.query(
       `UPDATE public.coordination_plan
