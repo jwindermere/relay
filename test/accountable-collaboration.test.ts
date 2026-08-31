@@ -19,7 +19,10 @@ import {
   normalizeCollaborationEvaluationEvidence,
   normalizeCollaborationEvaluationText
 } from '../src/lib/server/collaboration/accountability.js';
-import { collaborationEvaluationFixtures } from './fixtures/collaboration-evaluation-fixtures.js';
+import {
+  baselineCollaborationEvaluationFixture,
+  createCandidateCollaborationEvaluationFixture
+} from './fixtures/collaboration-evaluation-fixtures.js';
 
 test('inaccessible Finding evidence renders retained provenance without an active link', () => {
   assert.deepEqual(presentFindingEvidence({
@@ -200,11 +203,13 @@ test('quality evaluation identifies observable collaboration failures without pr
 });
 
 test('collaboration fixtures reproducibly compare policy and configuration behavior', () => {
-  const { baseline, candidate } = collaborationEvaluationFixtures;
+  const baseline = baselineCollaborationEvaluationFixture;
+  const candidate = createCandidateCollaborationEvaluationFixture();
+  assert.equal(candidate.routingDecisions[0]?.selectedIntent, 'research_request');
 
   assert.deepEqual(compareCollaborationEvaluationFixtures(baseline, candidate), {
     baselineFixtureId: 'baseline-routing-v1',
-    candidateFixtureId: 'candidate-routing-v2',
+    candidateFixtureId: candidate.id,
     baselineAttribution: baseline.attribution,
     candidateAttribution: candidate.attribution,
     deltas: {

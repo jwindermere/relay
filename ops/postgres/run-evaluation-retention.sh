@@ -9,9 +9,6 @@ esac
 
 while true; do
   psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --command \
-    "WITH expired_feedback AS (
-       DELETE FROM public.collaboration_feedback WHERE expires_at <= now()
-     )
-     DELETE FROM public.collaboration_evaluation_event WHERE expires_at <= now()"
+    'SELECT public.purge_expired_collaboration_evaluation()'
   sleep "$EVALUATION_RETENTION_INTERVAL_SECONDS"
 done

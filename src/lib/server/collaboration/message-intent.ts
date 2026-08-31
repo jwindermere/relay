@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import type { GitHubRepositoryGateway } from '../github/connection.js';
 import { acceptAgentConversation } from './conversation.js';
+import { recordCollaborationEvaluationEvent } from './evaluation.js';
 import {
   acceptEligibleAgentMention,
   explicitAgentMentionPattern,
@@ -133,10 +134,13 @@ export async function correctMessageIntent(
     if (!messageContext.rows[0]) throw new MessageIntentError('Message routing decision was not found');
     const existingWork = await client.query<{
       task_id: string; run_id: string; run_status: string; assigned_agent_id: string;
+      project_id: string; routing_policy_version: string | null;
     }>(
       `SELECT task.id AS task_id, run.id AS run_id, run.status AS run_status,
-              task.assigned_agent_id
+              task.assigned_agent_id, task.project_id,
+              decision.policy_version AS routing_policy_version
        FROM public.task task JOIN public.agent_run run ON run.task_id = task.id
+       LEFT JOIN public.message_intent_decision decision ON decision.message_id = task.source_message_id
        WHERE task.source_message_id = $1 AND task.workspace_id = $2
        ORDER BY run.attempt_number DESC LIMIT 1 FOR UPDATE OF task, run`,
       [messageId, access.workspace.id]
@@ -183,6 +187,15 @@ export async function correctMessageIntent(
            mentioned_agent_id = NULL, agent_mention_reason = NULL
          WHERE id = $1`, [messageId]
       );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: access.workspace.id, projectId: routed.project_id,
+        eventType: 'outcome.cancelled', agentId: routed.assigned_agent_id,
+        routingPolicyVersion: routed.routing_policy_version,
+        promptVersion: 'engineering-run-v1',
+        permissionPolicyVersion: 'mvp-engineering-autonomy-v1',
+        outcomeType: 'agent_run', outcomeId: routed.run_id,
+        evidence: { status: 'cancelled', reason: 'routing_corrected' }
+      });
     }
     const updated = await client.query(
       `UPDATE public.message_intent_decision decision

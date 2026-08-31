@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import { recordCollaborationEvaluationEvent } from './evaluation.js';
 
 export type AgentHandoffStatus =
   | 'queued'
@@ -39,7 +40,9 @@ export async function cancelAgentHandoff(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const cancelled = await client.query<{ id: string; receiving_turn_id: string }>(
+    const cancelled = await client.query<{
+      id: string; receiving_turn_id: string; project_id: string; target_agent_id: string;
+    }>(
       `UPDATE public.agent_handoff handoff
        SET status = 'cancelled', cancelled_at = now(), updated_at = now(),
            error_code = 'handoff_cancelled',
@@ -55,7 +58,7 @@ export async function cancelAgentHandoff(
          AND actor.kind = 'pilot' AND actor.pilot_membership_id = $3
          AND membership.project_id = handoff.project_id
          AND handoff.status = 'queued'
-       RETURNING handoff.id, handoff.receiving_turn_id`,
+       RETURNING handoff.id, handoff.receiving_turn_id, handoff.project_id, handoff.target_agent_id`,
       [handoffId, access.workspace.id, access.membership.id]
     );
     const row = cancelled.rows[0];
@@ -70,6 +73,13 @@ export async function cancelAgentHandoff(
       [row.receiving_turn_id, access.workspace.id]
     );
     await enqueueAgentHandoffStatus(client, access.workspace.id, row.id, 'cancelled');
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: access.workspace.id, projectId: row.project_id,
+      eventType: 'outcome.cancelled', agentId: row.target_agent_id,
+      promptVersion: 'conversation-v1', permissionPolicyVersion: 'handoff-depth-v1',
+      outcomeType: 'handoff', outcomeId: row.id,
+      evidence: { status: 'cancelled', errorCode: 'handoff_cancelled' }
+    });
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

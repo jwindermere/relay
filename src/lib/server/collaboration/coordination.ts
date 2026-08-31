@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import { recordCollaborationEvaluationEvent } from './evaluation.js';
 
 export interface CoordinationBudget {
   maxParticipants: number;
@@ -240,13 +241,16 @@ export async function decideCoordinationPlan(
     if (!actor.rows[0]) throw new CoordinationError('active Pilot membership is required');
     const nextStatus = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : action === 'pause' ? 'paused' : 'cancelled';
     const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed'] : ['approved', 'active', 'paused'];
-    const updated = await client.query(
+    const updated = await client.query<{
+      project_id: string; coordinating_agent_id: string; source_message_id: string;
+    }>(
       `UPDATE public.coordination_plan
        SET status = $4,
            approved_by_workspace_member_id = CASE WHEN $4 = 'approved' THEN $3 ELSE approved_by_workspace_member_id END,
            approved_at = CASE WHEN $4 = 'approved' THEN now() ELSE approved_at END,
            updated_at = now()
-       WHERE id = $1 AND workspace_id = $2 AND status = ANY($5::text[])`,
+       WHERE id = $1 AND workspace_id = $2 AND status = ANY($5::text[])
+       RETURNING project_id, coordinating_agent_id, source_message_id`,
       [planId, access.workspace.id, actor.rows[0].id, nextStatus, allowedCurrent]
     );
     if (updated.rowCount !== 1) throw new CoordinationError('Coordination plan cannot accept that decision');
@@ -262,6 +266,19 @@ export async function decideCoordinationPlan(
          WHERE plan_id = $1 AND workspace_id = $2 AND status IN ('pending', 'ready', 'blocked')`,
         [planId, access.workspace.id]
       );
+      const routing = await client.query<{ policy_version: string }>(
+        `SELECT policy_version FROM public.message_intent_decision
+         WHERE message_id = $1 AND workspace_id = $2`,
+        [updated.rows[0]!.source_message_id, access.workspace.id]
+      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: access.workspace.id, projectId: updated.rows[0]!.project_id,
+        eventType: `outcome.${nextStatus}`, agentId: updated.rows[0]!.coordinating_agent_id,
+        routingPolicyVersion: routing.rows[0]?.policy_version,
+        promptVersion: 'coordination-plan-v1', permissionPolicyVersion: 'coordination-budget-v1',
+        outcomeType: 'coordination_plan', outcomeId: planId,
+        evidence: { status: nextStatus }
+      });
     }
     await client.query('COMMIT');
   } catch (error) {
@@ -603,23 +620,27 @@ export async function completeCoordinationStep(
   );
   const planId = completed.rows[0]?.plan_id;
   if (!planId) return;
-  await client.query(
-    `INSERT INTO public.collaboration_evaluation_event (
-       id, workspace_id, project_id, event_type, agent_id,
-       routing_policy_version, prompt_version, permission_policy_version,
-       outcome_type, outcome_id, evidence
-     )
-     SELECT $1, plan.workspace_id, plan.project_id, $2, $3,
-            COALESCE(decision.policy_version, 'not-applicable-v1'),
-            'coordination-step-v1', 'coordination-budget-v1',
-            'coordination_step', $4, jsonb_build_object('status', $5::text)
+  const evaluation = await client.query<{
+    workspace_id: string; project_id: string; routing_policy_version: string | null;
+  }>(
+    `SELECT plan.workspace_id, plan.project_id, decision.policy_version AS routing_policy_version
      FROM public.coordination_plan plan
      LEFT JOIN public.message_intent_decision decision
        ON decision.message_id = plan.source_message_id AND decision.workspace_id = plan.workspace_id
-     WHERE plan.id = $6 AND plan.workspace_id = $7`,
-    [randomUUID(), `outcome.${input.status}`, completed.rows[0]!.target_agent_id,
-      completed.rows[0]!.id, input.status, planId, input.workspaceId]
+     WHERE plan.id = $1 AND plan.workspace_id = $2`,
+    [planId, input.workspaceId]
   );
+  const evaluationContext = evaluation.rows[0];
+  if (evaluationContext) {
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: evaluationContext.workspace_id, projectId: evaluationContext.project_id,
+      eventType: `outcome.${input.status}`, agentId: completed.rows[0]!.target_agent_id,
+      routingPolicyVersion: evaluationContext.routing_policy_version,
+      promptVersion: 'coordination-step-v1', permissionPolicyVersion: 'coordination-budget-v1',
+      outcomeType: 'coordination_step', outcomeId: completed.rows[0]!.id,
+      evidence: { status: input.status }
+    });
+  }
   if (input.status === 'failed') {
     await client.query(
       `UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`,

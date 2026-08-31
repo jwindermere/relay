@@ -16,7 +16,7 @@ type CollaborationSignalType =
   | 'unsupported_certainty'
   | 'routing_disagreement';
 
-type CompletionOutcome = 'completed' | 'failed' | 'cancelled';
+type CompletionOutcome = 'completed' | 'failed' | 'cancelled' | 'expired' | 'rejected';
 type FeedbackRating = 'useful' | 'incorrect' | 'incomplete' | 'unnecessarily_delegated';
 
 export interface CollaborationEvaluationAttribution {
@@ -25,6 +25,26 @@ export interface CollaborationEvaluationAttribution {
   promptVersion: string;
   permissionPolicyVersion: string;
   agentConfigurationVersion: string;
+}
+
+interface CollaborationEvaluationAttributionRow {
+  agent_type: string;
+  routing_policy_version: string;
+  prompt_version: string;
+  permission_policy_version: string;
+  agent_configuration_version: string;
+}
+
+function mapCollaborationEvaluationAttribution(
+  row: CollaborationEvaluationAttributionRow
+): CollaborationEvaluationAttribution {
+  return {
+    agentType: row.agent_type,
+    routingPolicyVersion: row.routing_policy_version,
+    promptVersion: row.prompt_version,
+    permissionPolicyVersion: row.permission_policy_version,
+    agentConfigurationVersion: row.agent_configuration_version
+  };
 }
 
 export interface CollaborationEvaluationFixture {
@@ -114,7 +134,7 @@ export function compareCollaborationEvaluationFixtures(
       ]),
       completionOutcomes: deltas<CompletionOutcome>(
         countValues(baseline.outcomes), countValues(candidate.outcomes),
-        ['completed', 'failed', 'cancelled']
+        ['completed', 'failed', 'cancelled', 'expired', 'rejected']
       ),
       pilotFeedback: deltas<FeedbackRating>(
         countValues(baseline.pilotFeedback), countValues(candidate.pilotFeedback),
@@ -368,13 +388,12 @@ export async function loadCollaborationAccountability(
        ORDER BY agent.id`,
       [access.workspace.id, projectId]
     ),
-    pool.query<{
-      agent_type: string; routing_policy_version: string; prompt_version: string;
-      permission_policy_version: string; agent_configuration_version: string;
+    pool.query<CollaborationEvaluationAttributionRow & {
       event_count: number; policy_rejections: number; overrides: number;
       recursive_handoff_attempts: number; duplicate_investigations: number;
       unsupported_certainty: number; routing_disagreements: number;
       completed_outcomes: number; failed_outcomes: number; cancelled_outcomes: number;
+      expired_outcomes: number; rejected_outcomes: number;
       useful: number; incorrect: number; incomplete: number; unnecessarily_delegated: number;
     }>(
       `WITH event_rollup AS (
@@ -390,7 +409,9 @@ export async function loadCollaborationAccountability(
                 count(*) FILTER (WHERE event.event_type = 'routing.disagreement')::integer AS routing_disagreements,
                 count(*) FILTER (WHERE event.event_type = 'outcome.completed')::integer AS completed_outcomes,
                 count(*) FILTER (WHERE event.event_type = 'outcome.failed')::integer AS failed_outcomes,
-                count(*) FILTER (WHERE event.event_type = 'outcome.cancelled')::integer AS cancelled_outcomes
+                count(*) FILTER (WHERE event.event_type = 'outcome.cancelled')::integer AS cancelled_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.expired')::integer AS expired_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.rejected')::integer AS rejected_outcomes
          FROM public.collaboration_evaluation_event event
          WHERE event.workspace_id = $1 AND event.project_id = $2 AND event.expires_at > now()
          GROUP BY event.agent_type, event.routing_policy_version, event.prompt_version,
@@ -425,6 +446,8 @@ export async function loadCollaborationAccountability(
               COALESCE(event.completed_outcomes, 0)::integer AS completed_outcomes,
               COALESCE(event.failed_outcomes, 0)::integer AS failed_outcomes,
               COALESCE(event.cancelled_outcomes, 0)::integer AS cancelled_outcomes,
+              COALESCE(event.expired_outcomes, 0)::integer AS expired_outcomes,
+              COALESCE(event.rejected_outcomes, 0)::integer AS rejected_outcomes,
               COALESCE(feedback.useful, 0)::integer AS useful,
               COALESCE(feedback.incorrect, 0)::integer AS incorrect,
               COALESCE(feedback.incomplete, 0)::integer AS incomplete,
@@ -491,9 +514,7 @@ export async function loadCollaborationAccountability(
         : row.active_work > 0 ? 'occupied' : 'available'
     })),
     evaluation: evaluation.rows.map((row) => ({
-      agentType: row.agent_type, routingPolicyVersion: row.routing_policy_version,
-      promptVersion: row.prompt_version, permissionPolicyVersion: row.permission_policy_version,
-      agentConfigurationVersion: row.agent_configuration_version,
+      ...mapCollaborationEvaluationAttribution(row),
       eventCount: row.event_count, policyRejections: row.policy_rejections, overrides: row.overrides,
       automatedChecks: {
         recursiveHandoffAttempts: row.recursive_handoff_attempts,
@@ -502,7 +523,8 @@ export async function loadCollaborationAccountability(
         routingDisagreements: row.routing_disagreements
       },
       completionOutcomes: {
-        completed: row.completed_outcomes, failed: row.failed_outcomes, cancelled: row.cancelled_outcomes
+        completed: row.completed_outcomes, failed: row.failed_outcomes,
+        cancelled: row.cancelled_outcomes, expired: row.expired_outcomes, rejected: row.rejected_outcomes
       },
       pilotFeedback: {
         useful: row.useful, incorrect: row.incorrect, incomplete: row.incomplete,
@@ -518,12 +540,7 @@ export async function purgeExpiredCollaborationEvaluation(
   projectId: string
 ): Promise<void> {
   await pool.query(
-    `WITH expired_feedback AS (
-       DELETE FROM public.collaboration_feedback
-       WHERE workspace_id = $1 AND project_id = $2 AND expires_at <= now()
-     )
-     DELETE FROM public.collaboration_evaluation_event
-     WHERE workspace_id = $1 AND project_id = $2 AND expires_at <= now()`,
+    'SELECT public.purge_expired_collaboration_evaluation($1, $2)',
     [workspaceId, projectId]
   );
 }
@@ -567,11 +584,9 @@ export async function submitCollaborationFeedback(
     handoff: 'target.target_agent_id', agent_run: 'target.agent_id',
     finding: 'target.author_agent_id', coordination_plan: 'target.coordinating_agent_id'
   }[input.outcomeType];
-  const target = await pool.query<{
-    agent_id: string | null; agent_type: string; routing_policy_version: string; prompt_version: string;
-    permission_policy_version: string; agent_configuration_version: string;
-  }>(
-    `SELECT ${targetAgent} AS agent_id, COALESCE(agent.agent_type, 'unattributed') AS agent_type,
+  const target = await pool.query<CollaborationEvaluationAttributionRow & { agent_id: string | null }>(
+    `SELECT ${targetAgent} AS agent_id,
+            COALESCE(attribution.agent_type, agent.agent_type, 'unattributed') AS agent_type,
             COALESCE(attribution.routing_policy_version, 'not-applicable-v1') AS routing_policy_version,
             COALESCE(attribution.prompt_version, 'not-applicable-v1') AS prompt_version,
             COALESCE(attribution.permission_policy_version, 'not-applicable-v1') AS permission_policy_version,
@@ -582,7 +597,7 @@ export async function submitCollaborationFeedback(
      FROM ${targetTable}
      LEFT JOIN public.agent agent ON agent.id = ${targetAgent} AND agent.workspace_id = target.workspace_id
      LEFT JOIN LATERAL (
-       SELECT event.routing_policy_version, event.prompt_version,
+       SELECT event.agent_type, event.routing_policy_version, event.prompt_version,
               event.permission_policy_version, event.agent_configuration_version
        FROM public.collaboration_evaluation_event event
        WHERE event.workspace_id = target.workspace_id AND event.project_id = $3

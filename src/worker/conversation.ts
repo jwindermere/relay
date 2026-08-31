@@ -10,6 +10,7 @@ import {
 } from '../lib/server/provider/agent-run.js';
 import { acceptAgentConversation } from '../lib/server/collaboration/conversation.js';
 import { enqueueAgentHandoffStatus } from '../lib/server/collaboration/handoffs.js';
+import { recordCollaborationEvaluationEvent } from '../lib/server/collaboration/evaluation.js';
 import {
   activateNextCoordinationStep,
   completeCoordinationStep,
@@ -341,6 +342,8 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
   const expired = await client.query<{
     id: string;
     workspace_id: string;
+    project_id: string;
+    target_agent_id: string;
     receiving_turn_id: string;
   }>(
     `UPDATE public.agent_handoff
@@ -350,7 +353,7 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
            'kind', 'expired', 'errorCode', 'handoff_expired'
          )
      WHERE status = 'queued' AND expires_at <= $1
-     RETURNING id, workspace_id, receiving_turn_id`,
+     RETURNING id, workspace_id, project_id, target_agent_id, receiving_turn_id`,
     [now]
   );
   if (expired.rows.length === 0) return;
@@ -363,6 +366,13 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
   );
   for (const handoff of expired.rows) {
     await enqueueAgentHandoffStatus(client, handoff.workspace_id, handoff.id, 'expired');
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: handoff.workspace_id, projectId: handoff.project_id,
+      eventType: 'outcome.expired', agentId: handoff.target_agent_id,
+      promptVersion: 'conversation-v1', permissionPolicyVersion: 'handoff-depth-v1',
+      outcomeType: 'handoff', outcomeId: handoff.id,
+      evidence: { status: 'expired', errorCode: 'handoff_expired' }
+    });
   }
 }
 
@@ -421,18 +431,14 @@ async function finishConversationTurn(
     await client.query('BEGIN');
     if (body !== null && status === 'completed' && claim.handoff_depth >= 1
       && /```relay-handoff\b/iu.test(body)) {
-      await client.query(
-        `INSERT INTO public.collaboration_evaluation_event (
-           id, workspace_id, project_id, event_type, agent_id,
-           routing_policy_version, prompt_version, permission_policy_version,
-           outcome_type, outcome_id, evidence
-         ) VALUES ($1, $2, $3, 'recursive.handoff_attempt', $4,
-           $5, 'conversation-v1', 'handoff-depth-v1', 'message', $6,
-           jsonb_build_object('handoffDepth', $7::integer))`,
-        [randomUUID(), claim.workspace_id, claim.project_id, claim.agent_id,
-          claim.routing_policy_version ?? 'not-applicable-v1',
-          `conversation-result:${claim.id}`, claim.handoff_depth]
-      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: claim.workspace_id, projectId: claim.project_id,
+        eventType: 'recursive.handoff_attempt', agentId: claim.agent_id,
+        routingPolicyVersion: claim.routing_policy_version, promptVersion: 'conversation-v1',
+        permissionPolicyVersion: 'handoff-depth-v1', outcomeType: 'message',
+        outcomeId: `conversation-result:${claim.id}`,
+        evidence: { handoffDepth: claim.handoff_depth }
+      });
     }
     const messageId = visibleBody === null ? null : `conversation-result:${claim.id}`;
     if (visibleBody !== null && messageId) {
@@ -501,23 +507,15 @@ async function finishConversationTurn(
         status
       );
     }
-    await client.query(
-      `INSERT INTO public.collaboration_evaluation_event (
-         id, workspace_id, project_id, event_type, agent_id,
-         routing_policy_version, prompt_version, permission_policy_version,
-         outcome_type, outcome_id, evidence
-       ) VALUES ($1, $2, $3, $4, $5, $6, 'conversation-v1', $7, $8, $9,
-         jsonb_build_object('status', $10::text, 'errorCode', $11::text))`,
-      [
-        randomUUID(), claim.workspace_id, claim.project_id, `outcome.${status}`, claim.agent_id,
-        claim.routing_policy_version ?? 'not-applicable-v1',
-        finishedHandoff.rows[0] ? 'handoff-depth-v1' : 'read-only-v1',
-        finishedHandoff.rows[0] ? 'handoff' : messageId ? 'message' : 'conversation_turn',
-        finishedHandoff.rows[0]?.id ?? messageId ?? claim.id,
-        status,
-        errorCode
-      ]
-    );
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: claim.workspace_id, projectId: claim.project_id,
+      eventType: `outcome.${status}`, agentId: claim.agent_id,
+      routingPolicyVersion: claim.routing_policy_version, promptVersion: 'conversation-v1',
+      permissionPolicyVersion: finishedHandoff.rows[0] ? 'handoff-depth-v1' : 'read-only-v1',
+      outcomeType: finishedHandoff.rows[0] ? 'handoff' : messageId ? 'message' : 'conversation_turn',
+      outcomeId: finishedHandoff.rows[0]?.id ?? messageId ?? claim.id,
+      evidence: { status, errorCode }
+    });
     await completeCoordinationStep(client, {
       workspaceId: claim.workspace_id,
       conversationTurnId: claim.id,

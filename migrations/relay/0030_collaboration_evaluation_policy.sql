@@ -186,6 +186,22 @@ AFTER UPDATE OF retention_days ON public.workspace_collaboration_evaluation_poli
 FOR EACH ROW WHEN (OLD.retention_days IS DISTINCT FROM NEW.retention_days)
 EXECUTE FUNCTION public.refresh_collaboration_evaluation_expiry();
 
+CREATE FUNCTION public.purge_expired_collaboration_evaluation(
+  target_workspace_id text DEFAULT NULL,
+  target_project_id text DEFAULT NULL
+) RETURNS void AS $$
+BEGIN
+  DELETE FROM public.collaboration_feedback
+  WHERE expires_at <= now()
+    AND (target_workspace_id IS NULL OR workspace_id = target_workspace_id)
+    AND (target_project_id IS NULL OR project_id = target_project_id);
+  DELETE FROM public.collaboration_evaluation_event
+  WHERE expires_at <= now()
+    AND (target_workspace_id IS NULL OR workspace_id = target_workspace_id)
+    AND (target_project_id IS NULL OR project_id = target_project_id);
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE INDEX collaboration_evaluation_expiry_idx
   ON public.collaboration_evaluation_event(workspace_id, expires_at);
 CREATE INDEX collaboration_feedback_expiry_idx

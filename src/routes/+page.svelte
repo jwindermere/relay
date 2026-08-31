@@ -1222,7 +1222,7 @@
               Prompt {report.promptVersion} · policy {report.permissionPolicyVersion}
             </span>
             <span class="mt-1 block text-base-content/55">
-              Outcomes {report.completionOutcomes.completed} completed / {report.completionOutcomes.failed} failed / {report.completionOutcomes.cancelled} cancelled
+              Outcomes {report.completionOutcomes.completed} completed / {report.completionOutcomes.failed} failed / {report.completionOutcomes.cancelled} cancelled / {report.completionOutcomes.expired} expired / {report.completionOutcomes.rejected} rejected
             </span>
             <span class="block text-base-content/55">
               Feedback {report.pilotFeedback.useful} useful / {report.pilotFeedback.incorrect} incorrect / {report.pilotFeedback.incomplete} incomplete / {report.pilotFeedback.unnecessarilyDelegated} unnecessary

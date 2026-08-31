@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import {
@@ -6,7 +5,7 @@ import {
   type AgentRunEventType,
   type AgentRunStatus
 } from './agent-run.js';
-import { normalizeCollaborationEvaluationEvidence } from '../collaboration/accountability.js';
+import { recordCollaborationEvaluationEvent } from '../collaboration/evaluation.js';
 
 export interface AgentRunEventInput {
   eventType: AgentRunEventType;
@@ -33,26 +32,27 @@ async function recordAgentRunEvaluationEvent(
   eventType: string,
   evidence: Record<string, unknown>
 ): Promise<void> {
-  await client.query(
-    `INSERT INTO public.collaboration_evaluation_event (
-       id, workspace_id, project_id, event_type, agent_id,
-       routing_policy_version, prompt_version, permission_policy_version,
-       outcome_type, outcome_id, evidence
-     )
-     SELECT $1, run.workspace_id, task.project_id, $2, run.agent_id,
-            COALESCE(decision.policy_version, 'not-applicable-v1'),
-            'engineering-run-v1', 'mvp-engineering-autonomy-v1',
-            'agent_run', run.id, $3::jsonb
+  const context = await client.query<{
+    workspace_id: string; project_id: string; agent_id: string; routing_policy_version: string | null;
+  }>(
+    `SELECT run.workspace_id, task.project_id, run.agent_id,
+            decision.policy_version AS routing_policy_version
      FROM public.agent_run run
      JOIN public.task task ON task.id = run.task_id AND task.workspace_id = run.workspace_id
      LEFT JOIN public.message_intent_decision decision
        ON decision.message_id = task.source_message_id AND decision.workspace_id = run.workspace_id
-     WHERE run.id = $4 AND run.workspace_id = $5`,
-    [
-      randomUUID(), eventType, normalizeCollaborationEvaluationEvidence(evidence),
-      target.id, target.workspaceId
-    ]
+     WHERE run.id = $1 AND run.workspace_id = $2`,
+    [target.id, target.workspaceId]
   );
+  const row = context.rows[0];
+  if (!row) return;
+  await recordCollaborationEvaluationEvent(client, {
+    workspaceId: row.workspace_id, projectId: row.project_id, eventType,
+    agentId: row.agent_id, routingPolicyVersion: row.routing_policy_version,
+    promptVersion: 'engineering-run-v1',
+    permissionPolicyVersion: 'mvp-engineering-autonomy-v1',
+    outcomeType: 'agent_run', outcomeId: target.id, evidence
+  });
 }
 
 export async function appendAgentRunEvent(

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import { recordCollaborationEvaluationEvent } from './evaluation.js';
 
 export type EvidenceType = 'external' | 'repository' | 'message' | 'artifact';
 export type MemoryType =
@@ -306,17 +307,13 @@ export async function createFindingFromAgentResult(
         finding.summary, JSON.stringify([`finding:${id}`, `message:${input.resultMessageId}`])]
     );
     if (finding.evidence.length === 0 && finding.confidence >= 0.8) {
-      await client.query(
-        `INSERT INTO public.collaboration_evaluation_event (
-           id, workspace_id, project_id, event_type, agent_id,
-           routing_policy_version, prompt_version, permission_policy_version,
-           outcome_type, outcome_id, evidence
-         ) VALUES ($1, $2, $3, 'unsupported.certainty', $4,
-           $5, 'conversation-v1', 'read-only-v1', 'finding', $6,
-           jsonb_build_object('confidence', $7::numeric, 'evidenceCount', 0))`,
-        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId,
-          input.routingPolicyVersion, id, finding.confidence]
-      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: input.workspaceId, projectId: input.projectId,
+        eventType: 'unsupported.certainty', agentId: input.authorAgentId,
+        routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+        permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
+        evidence: { confidence: finding.confidence, evidenceCount: 0 }
+      });
     }
     const duplicate = await client.query<{ id: string }>(
       `SELECT id FROM public.agent_finding
@@ -326,17 +323,13 @@ export async function createFindingFromAgentResult(
       [input.workspaceId, input.projectId, id, finding.summary]
     );
     if (duplicate.rows[0]) {
-      await client.query(
-        `INSERT INTO public.collaboration_evaluation_event (
-           id, workspace_id, project_id, event_type, agent_id,
-           routing_policy_version, prompt_version, permission_policy_version,
-           outcome_type, outcome_id, evidence
-         ) VALUES ($1, $2, $3, 'duplicate.investigation', $4,
-           $5, 'conversation-v1', 'read-only-v1', 'finding', $6,
-           jsonb_build_object('duplicatesFindingId', $7::text))`,
-        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId,
-          input.routingPolicyVersion, id, duplicate.rows[0].id]
-      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: input.workspaceId, projectId: input.projectId,
+        eventType: 'duplicate.investigation', agentId: input.authorAgentId,
+        routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+        permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
+        evidence: { duplicatesFindingId: duplicate.rows[0].id }
+      });
     }
     await client.query('COMMIT');
     return id;
