@@ -40,6 +40,20 @@ export class FindingError extends Error {
   }
 }
 
+const CREDENTIAL_PATTERNS = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
+  /\b(?:sk|ghp)_[A-Za-z0-9_-]{12,}\b/u,
+  /\bgithub_pat_[A-Za-z0-9_]{12,}\b/u,
+  /\bauthorization\s*:\s*bearer\s+\S+/iu,
+  /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu
+];
+
+function assertSafeProjectMemoryStatement(statement: string): void {
+  if (CREDENTIAL_PATTERNS.some((pattern) => pattern.test(statement))) {
+    throw new FindingError('Memory must not contain credentials');
+  }
+}
+
 function cleanList(value: unknown, label: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
     throw new FindingError(`${label} must be a list of concise statements`);
@@ -54,6 +68,7 @@ function cleanList(value: unknown, label: string): string[] {
 export function normalizeFindingInput(input: FindingInput): FindingInput {
   const summary = input?.summary?.trim();
   if (!summary || summary.length > 4000) throw new FindingError('Finding summary is required');
+  assertSafeProjectMemoryStatement(summary);
   if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
     throw new FindingError('Finding confidence must be between 0 and 1');
   }
@@ -111,6 +126,7 @@ export function selectProjectMemoryContext<T extends ProjectMemoryContextEntry>(
   entries: T[], limit = 20
 ): T[] {
   const safeLimit = Math.max(0, Math.min(100, Math.trunc(limit)));
+  if (safeLimit === 0 || !Number.isFinite(safeLimit)) return [];
   return entries
     .filter(({ lifecycle }) => lifecycle === 'active')
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
@@ -324,14 +340,28 @@ export async function createProjectMemory(
   access: WorkspaceAccess,
   input: { projectId: string; type: MemoryType; statement: string; sourceReferences: string[]; supersedesId?: string }
 ): Promise<string> {
-  const statement = input.statement?.trim();
+  const projectId = typeof input?.projectId === 'string' ? input.projectId.trim() : '';
+  if (!projectId) throw new FindingError('Project is required');
+  const statement = typeof input?.statement === 'string' ? input.statement.trim() : '';
   if (!statement || statement.length > 4000) throw new FindingError('Memory statement is required');
+  assertSafeProjectMemoryStatement(statement);
   const allowedTypes: MemoryType[] = ['decision', 'terminology', 'constraint', 'finding', 'convention', 'rejected_approach'];
   if (!allowedTypes.includes(input.type)) throw new FindingError('Memory type is invalid');
-  const sourceReferences = [...new Set(input.sourceReferences ?? [])];
+  if (!Array.isArray(input.sourceReferences)
+    || input.sourceReferences.some((reference) => typeof reference !== 'string')) {
+    throw new FindingError('Memory requires authorised provenance');
+  }
+  const sourceReferences = [...new Set(input.sourceReferences.map((reference) => reference.trim()))]
+    .filter(Boolean);
   if (sourceReferences.length === 0 || sourceReferences.length > 50) {
     throw new FindingError('Memory requires authorised provenance');
   }
+  const supersedesId = input.supersedesId === undefined
+    ? undefined
+    : typeof input.supersedesId === 'string' && input.supersedesId.trim()
+      ? input.supersedesId.trim()
+      : null;
+  if (supersedesId === null) throw new FindingError('Memory supersession is invalid');
   const id = randomUUID();
   const client = await pool.connect();
   try {
@@ -342,7 +372,7 @@ export async function createProjectMemory(
        JOIN public.project_membership project_member ON project_member.workspace_member_id = member.id
        WHERE membership.id = $2 AND member.workspace_id = $1 AND project_member.project_id = $3
          AND membership.revoked_at IS NULL`,
-      [access.workspace.id, access.membership.id, input.projectId]
+      [access.workspace.id, access.membership.id, projectId]
     );
     if (!actor.rows[0]) throw new FindingError('active Project membership is required');
     for (const reference of sourceReferences) {
@@ -360,7 +390,7 @@ export async function createProjectMemory(
       const found = await client.query<{ allowed: boolean }>(
         `SELECT EXISTS (SELECT 1 FROM ${table}
          WHERE item.id = $1 AND item.workspace_id = $2 AND ${projectPredicate}) AS allowed`,
-        [match[2], access.workspace.id, input.projectId]
+        [match[2], access.workspace.id, projectId]
       );
       if (!found.rows[0]?.allowed) throw new FindingError('Memory provenance is outside the Project');
     }
@@ -373,16 +403,17 @@ export async function createProjectMemory(
        FROM (SELECT 1) seed
        LEFT JOIN public.project_memory prior
          ON prior.id = $8 AND prior.workspace_id = $2 AND prior.project_id = $3
+        AND prior.lifecycle = 'active'
        WHERE $8::text IS NULL OR prior.id IS NOT NULL`,
-      [id, access.workspace.id, input.projectId, actor.rows[0].id, input.type,
-        statement, JSON.stringify(sourceReferences), input.supersedesId ?? null]
+      [id, access.workspace.id, projectId, actor.rows[0].id, input.type,
+        statement, JSON.stringify(sourceReferences), supersedesId ?? null]
     );
     if (inserted.rowCount !== 1) throw new FindingError('Memory provenance is outside the Project');
-    if (input.supersedesId) {
+    if (supersedesId) {
       await client.query(
         `UPDATE public.project_memory SET lifecycle = 'superseded', updated_at = now()
          WHERE id = $1 AND workspace_id = $2 AND project_id = $3 AND lifecycle = 'active'`,
-        [input.supersedesId, access.workspace.id, input.projectId]
+        [supersedesId, access.workspace.id, projectId]
       );
     }
     await client.query('COMMIT');
@@ -406,9 +437,13 @@ export async function setProjectMemoryLifecycle(
   }
   const updated = await pool.query(
     `UPDATE public.project_memory memory
-     SET lifecycle = $4, deleted_at = CASE WHEN $4 = 'deleted' THEN now() ELSE NULL END,
+     SET lifecycle = $4,
+         statement = CASE WHEN $4 = 'deleted' THEN '[deleted]' ELSE statement END,
+         source_references = CASE WHEN $4 = 'deleted' THEN '[]'::jsonb ELSE source_references END,
+         deleted_at = CASE WHEN $4 = 'deleted' THEN now() ELSE NULL END,
          updated_at = now()
      WHERE memory.id = $1 AND memory.workspace_id = $2
+       AND memory.lifecycle <> 'deleted'
        AND EXISTS (
          SELECT 1 FROM public.workspace_member member
          JOIN public.workspace_membership membership ON membership.id = member.pilot_membership_id
@@ -419,6 +454,43 @@ export async function setProjectMemoryLifecycle(
     [memoryId, access.workspace.id, access.membership.id, lifecycle]
   );
   if (updated.rowCount !== 1) throw new FindingError('Project memory was not found');
+}
+
+export async function loadAgentProjectMemoryContext(
+  pool: Pool,
+  scope: { workspaceId: string; projectId: string; agentId: string },
+  limit = 20
+): Promise<ProjectMemoryContextEntry[]> {
+  const rows = await pool.query<{
+    id: string; memory_type: MemoryType; statement: string;
+    lifecycle: ProjectMemoryContextEntry['lifecycle']; created_at: Date;
+  }>(
+    `SELECT memory.id, memory.memory_type, memory.statement, memory.lifecycle, memory.created_at
+     FROM public.project_memory memory
+     WHERE memory.workspace_id = $1 AND memory.project_id = $2
+       AND EXISTS (
+         SELECT 1 FROM public.agent agent
+         JOIN public.workspace_member member
+           ON member.agent_id = agent.id AND member.workspace_id = agent.workspace_id
+         JOIN public.project_membership project_member
+           ON project_member.workspace_member_id = member.id
+          AND project_member.workspace_id = member.workspace_id
+         WHERE agent.id = $3 AND agent.workspace_id = memory.workspace_id
+           AND project_member.project_id = memory.project_id
+       )
+     ORDER BY memory.created_at, memory.id`,
+    [scope.workspaceId, scope.projectId, scope.agentId]
+  );
+  return selectProjectMemoryContext(rows.rows.map((row) => ({
+    id: row.id, type: row.memory_type, statement: row.statement,
+    lifecycle: row.lifecycle, createdAt: row.created_at.toISOString()
+  })), limit);
+}
+
+export function renderProjectMemoryContext(entries: ProjectMemoryContextEntry[]): string {
+  return entries
+    .map(({ type, statement }) => `[${type}] ${statement.slice(0, 1000)}`)
+    .join('\n');
 }
 
 export async function loadProjectMemoryContext(

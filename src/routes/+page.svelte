@@ -1224,7 +1224,11 @@
           <li class="border border-white/8 p-2">
             <span class="badge badge-ghost badge-xs">{memory.type} · {memory.lifecycle}</span>
             <p class="mt-1">{memory.statement}</p>
+            <p class="mt-1 text-base-content/45">Recorded by {memory.authorName}</p>
             <p class="mt-1 truncate text-base-content/35">Sources: {memory.sourceReferences.join(', ')}</p>
+            {#if memory.supersedesId}
+              <p class="mt-1 truncate text-base-content/35">Supersedes: {memory.supersedesId}</p>
+            {/if}
             {#if memory.lifecycle === 'active'}
               <div class="mt-1 flex gap-1">
                 <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctMemory(memory)}>Correct / supersede</button>

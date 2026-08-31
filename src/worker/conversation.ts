@@ -18,7 +18,9 @@ import {
 } from '../lib/server/collaboration/coordination.js';
 import {
   createFindingFromAgentResult,
-  parseFindingResult
+  loadAgentProjectMemoryContext,
+  parseFindingResult,
+  renderProjectMemoryContext
 } from '../lib/server/collaboration/findings.js';
 
 interface ClaimedConversationTurn {
@@ -541,7 +543,10 @@ async function finishConversationTurn(
 
 async function loadConversationMemory(
   pool: Pool,
-  claim: Pick<ClaimedConversationTurn, 'workspace_id' | 'channel_id' | 'id'>
+  claim: Pick<
+    ClaimedConversationTurn,
+    'workspace_id' | 'project_id' | 'channel_id' | 'agent_id' | 'id'
+  >
 ): Promise<string> {
   const [messages, projectMemory, findings] = await Promise.all([
     pool.query<{ author_name: string; body: string }>(
@@ -565,14 +570,11 @@ async function loadConversationMemory(
      ORDER BY memory.created_at, memory.id`,
       [claim.id, claim.workspace_id, claim.channel_id]
     ),
-    pool.query<{ memory_type: string; statement: string }>(
-      `SELECT memory.memory_type, memory.statement
-       FROM public.project_memory memory
-       JOIN public.channel channel ON channel.project_id = memory.project_id
-       WHERE channel.id = $1 AND memory.workspace_id = $2 AND memory.lifecycle = 'active'
-       ORDER BY memory.created_at DESC, memory.id DESC LIMIT 20`,
-      [claim.channel_id, claim.workspace_id]
-    ),
+    loadAgentProjectMemoryContext(pool, {
+      workspaceId: claim.workspace_id,
+      projectId: claim.project_id,
+      agentId: claim.agent_id
+    }),
     pool.query<{
       summary: string; confidence: string; observed_evidence: string[];
       inferences: string[]; assumptions: string[]; open_questions: string[];
@@ -596,9 +598,7 @@ async function loadConversationMemory(
   const rendered = messages.rows
     .map(({ author_name, body }) => `${author_name}: ${body.slice(0, 1200)}`)
     .join('\n');
-  const durable = projectMemory.rows.reverse()
-    .map(({ memory_type, statement }) => `[${memory_type}] ${statement.slice(0, 1000)}`)
-    .join('\n');
+  const durable = renderProjectMemoryContext(projectMemory);
   const structuredFindings = findings.rows.reverse().map((finding) => JSON.stringify({
     summary: finding.summary, confidence: Number(finding.confidence),
     observedEvidence: finding.observed_evidence, inferences: finding.inferences,

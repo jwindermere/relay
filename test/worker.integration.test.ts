@@ -26,6 +26,13 @@ import {
   proposeCoordinationPlan
 } from '../src/lib/server/collaboration/coordination.js';
 import { loadCollaborationAccountability } from '../src/lib/server/collaboration/accountability.js';
+import {
+  createProjectMemory,
+  loadAgentProjectMemoryContext,
+  loadProjectMemoryContext,
+  setProjectMemoryLifecycle,
+  type MemoryType
+} from '../src/lib/server/collaboration/findings.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
@@ -2641,6 +2648,151 @@ if (skipDatabaseTests) {
         accessible: false
       }
     );
+  });
+
+  test('Project memory is provenance-scoped, correctable, revocable, and deterministically bounded', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'project-memory');
+    const otherWorkspace = await seedQueuedAgentRun(pool, 'project-memory-other-workspace');
+    await pool.query(`UPDATE public.agent_run SET available_at = 'infinity' WHERE id = $1`, [
+      otherWorkspace.runId
+    ]);
+    const sourceMessageId = 'message-project-memory';
+    const types: MemoryType[] = [
+      'decision', 'terminology', 'constraint', 'finding', 'convention', 'rejected_approach'
+    ];
+    const memoryIds = new Map<MemoryType, string>();
+
+    for (const type of types) {
+      memoryIds.set(type, await createProjectMemory(pool, ids.ownerAccess, {
+        projectId: ids.projectId,
+        type,
+        statement: `${type} statement`,
+        sourceReferences: [`message:${sourceMessageId}`]
+      }));
+    }
+
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ('project-memory-neighbour', $1, 'Neighbour Project')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.channel (id, workspace_id, project_id, name)
+       VALUES ('channel-project-memory-neighbour', $1, 'project-memory-neighbour', 'neighbour')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES (
+         'message-project-memory-neighbour', $1, 'channel-project-memory-neighbour', $2,
+         'A decision from another Project.'
+       )`,
+      [ids.workspaceId, ids.pilotMemberId]
+    );
+    await assert.rejects(
+      createProjectMemory(pool, ids.ownerAccess, {
+        projectId: ids.projectId,
+        type: 'decision',
+        statement: 'Cross-Project memory',
+        sourceReferences: ['message:message-project-memory-neighbour']
+      }),
+      /provenance is outside the Project/
+    );
+    await assert.rejects(
+      createProjectMemory(pool, ids.ownerAccess, {
+        projectId: ids.projectId,
+        type: 'constraint',
+        statement: 'Authorization: Bearer credential-that-must-not-be-stored',
+        sourceReferences: [`message:${sourceMessageId}`]
+      }),
+      /must not contain credentials/
+    );
+
+    const originalDecisionId = memoryIds.get('decision');
+    assert.ok(originalDecisionId);
+    const correctedDecisionId = await createProjectMemory(pool, ids.memberAccess, {
+      projectId: ids.projectId,
+      type: 'decision',
+      statement: 'corrected decision statement',
+      sourceReferences: [`message:${sourceMessageId}`],
+      supersedesId: originalDecisionId
+    });
+    await setProjectMemoryLifecycle(
+      pool, ids.memberAccess, memoryIds.get('convention')!, 'archived'
+    );
+    await setProjectMemoryLifecycle(
+      pool, ids.ownerAccess, memoryIds.get('constraint')!, 'deleted'
+    );
+
+    const visible = await loadCollaborationAccountability(pool, ids.ownerAccess, ids.projectId);
+    assert.deepEqual(
+      visible.memory.find(({ id }) => id === originalDecisionId)?.lifecycle,
+      'superseded'
+    );
+    assert.deepEqual(
+      visible.memory.find(({ id }) => id === correctedDecisionId)?.supersedesId,
+      originalDecisionId
+    );
+    assert.deepEqual(
+      visible.memory.find(({ id }) => id === memoryIds.get('constraint')),
+      {
+        id: memoryIds.get('constraint'),
+        type: 'constraint',
+        statement: '[deleted]',
+        sourceReferences: [],
+        lifecycle: 'deleted',
+        supersedesId: null,
+        authorName: 'Owner',
+        createdAt: visible.memory.find(({ id }) => id === memoryIds.get('constraint'))?.createdAt
+      }
+    );
+
+    assert.deepEqual(
+      (await loadProjectMemoryContext(pool, ids.ownerAccess, ids.projectId, 2))
+        .map(({ statement }) => statement),
+      ['rejected_approach statement', 'corrected decision statement']
+    );
+    assert.deepEqual(
+      await loadProjectMemoryContext(pool, otherWorkspace.ownerAccess, ids.projectId),
+      []
+    );
+    assert.deepEqual(
+      (await loadAgentProjectMemoryContext(pool, {
+        workspaceId: ids.workspaceId,
+        projectId: ids.projectId,
+        agentId: ids.agentId
+      }, 2)).map(({ statement }) => statement),
+      ['rejected_approach statement', 'corrected decision statement']
+    );
+
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /Active authorised Project memory/);
+      assert.match(input.prompt, /\[terminology\] terminology statement/);
+      assert.match(input.prompt, /\[finding\] finding statement/);
+      assert.match(input.prompt, /\[rejected_approach\] rejected_approach statement/);
+      assert.match(input.prompt, /\[decision\] corrected decision statement/);
+      assert.doesNotMatch(input.prompt, /\[decision\] decision statement/);
+      assert.doesNotMatch(input.prompt, /constraint statement|convention statement|Neighbour Project/);
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'project-memory:completed',
+        turn: { id: 'turn-project-memory', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-project-memory', workspaceRoot
+    }), { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+
+    await pool.query(
+      `DELETE FROM public.project_membership
+       WHERE project_id = $1 AND workspace_member_id = $2`,
+      [ids.projectId, ids.agentMemberId]
+    );
+    assert.deepEqual(await loadAgentProjectMemoryContext(pool, {
+      workspaceId: ids.workspaceId,
+      projectId: ids.projectId,
+      agentId: ids.agentId
+    }), []);
   });
 }
 

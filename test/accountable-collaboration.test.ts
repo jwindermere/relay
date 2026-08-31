@@ -93,6 +93,7 @@ test('Project memory context is active, deterministic, and bounded', () => {
     selectProjectMemoryContext(entries, 3).map(({ id }) => id),
     ['memory-09', 'memory-10', 'memory-11']
   );
+  assert.deepEqual(selectProjectMemoryContext(entries, 0), []);
 });
 
 test('coordination plans reject hidden participants and recursive handoffs', () => {

@@ -98,11 +98,18 @@ export async function loadCollaborationAccountability(
     ),
     pool.query<{
       id: string; memory_type: string; statement: string; source_references: string[];
-      lifecycle: string; supersedes_id: string | null; created_at: Date;
+      lifecycle: string; supersedes_id: string | null; author_name: string; created_at: Date;
     }>(
-      `SELECT id, memory_type, statement, source_references, lifecycle, supersedes_id, created_at
-       FROM public.project_memory WHERE workspace_id = $1 AND project_id = $2
-       ORDER BY created_at, id`,
+      `SELECT memory.id, memory.memory_type, memory.statement, memory.source_references,
+              memory.lifecycle, memory.supersedes_id,
+              COALESCE(pilot_user.name, agent.name) AS author_name, memory.created_at
+       FROM public.project_memory memory
+       JOIN public.workspace_member author ON author.id = memory.author_workspace_member_id
+       LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
+       LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+       LEFT JOIN public.agent agent ON agent.id = author.agent_id
+       WHERE memory.workspace_id = $1 AND memory.project_id = $2
+       ORDER BY memory.created_at, memory.id`,
       [access.workspace.id, projectId]
     ),
     pool.query<{
@@ -292,7 +299,8 @@ export async function loadCollaborationAccountability(
     memory: memory.rows.map((row) => ({
       id: row.id, type: row.memory_type, statement: row.statement,
       sourceReferences: row.source_references, lifecycle: row.lifecycle,
-      supersedesId: row.supersedes_id, createdAt: row.created_at.toISOString()
+      supersedesId: row.supersedes_id, authorName: row.author_name,
+      createdAt: row.created_at.toISOString()
     })),
     inbox: inbox.rows.map((row): AgentInboxItem => ({
       id: row.id, agentId: row.agent_id, agentName: row.agent_name, state: row.state,
