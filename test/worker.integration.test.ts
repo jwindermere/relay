@@ -1277,6 +1277,60 @@ if (skipDatabaseTests) {
     );
   });
 
+  test('queued conversation work does not execute after Agent eligibility is revoked', async () => {
+    for (const eligibilityChange of ['disabled', 'project-membership-revoked'] as const) {
+      const ids = await seedQueuedAgentRun(pool, `conversation-${eligibilityChange}`);
+      await pool.query(
+        `UPDATE public.agent_run
+         SET status = 'completed', completed_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [ids.runId]
+      );
+      await pool.query(`UPDATE public.task SET status = 'completed' WHERE id = $1`, [
+        `task-conversation-${eligibilityChange}`
+      ]);
+      await pool.query(`UPDATE public.agent SET status = 'idle' WHERE id = $1`, [ids.agentId]);
+
+      const request = await postChannelMessage(pool, ids.ownerAccess, {
+        channelId: ids.channelId,
+        body: '@Alex explain what you can help with.',
+        submissionId: `conversation-${eligibilityChange}-request`
+      });
+      assert.equal(request.agentMention?.status, 'conversation');
+      const turnId = request.agentMention?.status === 'conversation'
+        ? request.agentMention.conversationTurnId
+        : '';
+
+      if (eligibilityChange === 'disabled') {
+        await pool.query(
+          `UPDATE public.agent SET enabled = false, status = 'disabled' WHERE id = $1`,
+          [ids.agentId]
+        );
+      } else {
+        await pool.query(
+          `DELETE FROM public.project_membership
+           WHERE project_id = $1 AND workspace_member_id = $2`,
+          [ids.projectId, ids.agentMemberId]
+        );
+      }
+
+      assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+        assert.fail('ineligible Agent work must not reach the Provider');
+      }), {
+        workerId: `worker-conversation-${eligibilityChange}`,
+        workspaceRoot,
+        leaseDurationMs: 10_000
+      }), { kind: 'idle' });
+
+      await pool.query(
+        `UPDATE public.agent_conversation_turn
+         SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+         WHERE id = $1 AND status = 'queued'`,
+        [turnId]
+      );
+    }
+  });
+
   test('a Provider clarification waits visibly for durable Pilot input and continues the same turn', async () => {
     const ids = await seedQueuedAgentRun(pool, 'clarification');
     const provider = new FixtureProvider(async (_input, observer) => {
