@@ -5,6 +5,7 @@
   import BrandMark from '$lib/BrandMark.svelte';
   import JitsiCall from '$lib/JitsiCall.svelte';
   import MarkdownMessage from '$lib/MarkdownMessage.svelte';
+  import { presentFindingEvidence } from '$lib/finding-presentation.js';
   import { highlightMarkdownInput } from '$lib/markdown.js';
   import {
     applyChannelReconciliation,
@@ -49,6 +50,11 @@
   let agentTopics = $state('');
   let agentReplyMode = $state<'adaptive' | 'channel' | 'thread'>('adaptive');
   let agentEnabled = $state(true);
+  let agentTemplateKey = $state('');
+  let inboxAgentFilter = $state('all');
+  let inboxStateFilter = $state('all');
+  let inboxUrgencyFilter = $state('all');
+  let inboxHumanOnly = $state(false);
   let newWorkspaceName = $state('');
   let workspaceBusy = $state(false);
   let workspaceMessage = $state('');
@@ -57,6 +63,8 @@
   let editingWorkspaceName = $state('');
   let realtimeRuns = $state<VisibleAgentRuns>({});
   let realtimeMessages = $state<typeof data.sharedChannel.messages>([]);
+  let realtimeHandoffs = $state<typeof data.reconciliation.handoffs>([]);
+  let realtimeAccountability = $state<typeof data.accountability | null>(null);
   let activeCall = $state<typeof data.activeCall>(null);
   let callBusy = $state(false);
   let callMessage = $state('');
@@ -70,6 +78,22 @@
   let humanTypers = $state<Record<string, { name: string; expiresAt: number }>>({});
   let githubConfiguration = $derived(data.linkedRepository.configuration);
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
+  let accountability = $derived(realtimeAccountability ?? data.accountability);
+  let filteredInbox = $derived(accountability.inbox.filter((item) =>
+    (inboxAgentFilter === 'all' || item.agentId === inboxAgentFilter)
+    && (inboxStateFilter === 'all' || item.state === inboxStateFilter)
+    && (inboxUrgencyFilter === 'all' || item.urgency === inboxUrgencyFilter)
+    && (!inboxHumanOnly || item.requiresHumanAction)
+  ));
+  let selectedAgentTemplate = $derived(
+    data.agentTemplates.find((template) => template.key === agentTemplateKey)
+  );
+  let selectedTemplateOverlap = $derived(selectedAgentTemplate?.ambientTriggers.find((topic) =>
+    data.agentConfiguration.agents.some((agent) => agent.ambientTriggers.includes(topic))
+  ));
+  let agentHandoffs = $derived(
+    realtimeHandoffs.length > 0 ? realtimeHandoffs : data.reconciliation.handoffs
+  );
   let channelMessages = $derived(mergeChannelMessages(
     data.sharedChannel.messages,
     realtimeMessages
@@ -99,10 +123,23 @@
 
   $effect(() => {
     activeCall = data.activeCall;
+    realtimeAccountability = data.accountability;
   });
 
   function repliesFor(rootId: string) {
     return channelMessages.filter((message) => message.parentMessageId === rootId);
+  }
+
+  function handoffForSource(sourceMessageId: string) {
+    return agentHandoffs.find((handoff) => handoff.sourceMessageId === sourceMessageId);
+  }
+
+  function planForSource(sourceMessageId: string) {
+    return accountability.plans.find((plan) => plan.sourceMessageId === sourceMessageId);
+  }
+
+  function steeringForSource(sourceMessageId: string) {
+    return accountability.steering.find((steering) => steering.sourceMessageId === sourceMessageId);
   }
 
   function initials(name: string) {
@@ -402,9 +439,15 @@
         if (!response.ok) throw new Error('Channel status could not be refreshed');
         const update = await response.json() as ChannelReconciliationUpdate & {
           messages: typeof data.sharedChannel.messages;
+          handoffs: typeof data.reconciliation.handoffs;
         };
         realtimeMessages = mergeChannelMessages(realtimeMessages, update.messages);
         realtimeRuns = applyChannelReconciliation(agentRuns, update);
+        realtimeHandoffs = update.handoffs;
+        const accountabilityResponse = await fetch(
+          `/api/workspace/accountability?projectId=${encodeURIComponent(data.sharedChannel.project.id)}`
+        );
+        if (accountabilityResponse.ok) realtimeAccountability = await accountabilityResponse.json();
         await refreshActiveCall();
       }
     })().catch(() => {
@@ -698,6 +741,30 @@
     }
   }
 
+  async function instantiateTemplate() {
+    if (!selectedAgentTemplate) return;
+    agentBusy = true;
+    agentMessage = '';
+    try {
+      const response = await fetch('/api/workspace/agent-templates', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: selectedAgentTemplate.key, availableCapabilities: [] })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message ?? 'Agent template could not be instantiated');
+      agentMessage = result.disabledCapabilities.length > 0
+        ? `Agent added with unavailable capabilities disabled: ${result.disabledCapabilities.join(', ')}.`
+        : 'Agent added from template.';
+      agentTemplateKey = '';
+      await invalidateAll();
+    } catch (error) {
+      agentMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      agentBusy = false;
+    }
+  }
+
   async function deleteMessage(message: (typeof data.sharedChannel.messages)[number]) {
     if (!canDeleteMessage(message)) return;
     if (!window.confirm('Delete this message? Replies and work history will be preserved.')) return;
@@ -710,6 +777,33 @@
       return;
     }
     await requestReconciliation();
+    await invalidateAll();
+  }
+
+  async function cancelHandoff(handoffId: string) {
+    const response = await fetch(
+      `/api/workspace/handoffs/${encodeURIComponent(handoffId)}`,
+      { method: 'DELETE' }
+    );
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      window.alert(result.message ?? 'Agent handoff could not be cancelled');
+      return;
+    }
+    await requestReconciliation();
+  }
+
+  async function decidePlan(planId: string, action: 'approve' | 'reject' | 'pause' | 'cancel') {
+    const response = await fetch(`/api/workspace/coordination/${encodeURIComponent(planId)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action })
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      window.alert(result.message ?? 'Coordination plan could not be updated');
+      return;
+    }
     await invalidateAll();
   }
 
@@ -785,9 +879,96 @@
       workspaceBusy = false;
     }
   }
+
+  async function correctIntent(messageId: string, intent: string) {
+    const response = await fetch(`/api/workspace/messages/${encodeURIComponent(messageId)}/intent`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ intent })
+    });
+    const result = response.status === 204 ? null : await response.json();
+    if (!response.ok) {
+      agentMessage = result?.message ?? 'Routing interpretation could not be corrected.';
+      return;
+    }
+    await invalidateAll();
+  }
+
+  async function setMemoryLifecycle(memoryId: string, lifecycle: 'archived' | 'deleted') {
+    const response = await fetch('/api/workspace/memory', {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ memoryId, lifecycle })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Memory could not be updated.';
+    else await invalidateAll();
+  }
+
+  async function correctMemory(memory: (typeof accountability.memory)[number]) {
+    const statement = window.prompt('Correct this Project memory entry', memory.statement)?.trim();
+    if (!statement || statement === memory.statement) return;
+    const response = await fetch('/api/workspace/memory', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: data.sharedChannel.project.id, type: memory.type, statement,
+        sourceReferences: memory.sourceReferences, supersedesId: memory.id
+      })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Memory correction could not be saved.';
+    else await invalidateAll();
+  }
+
+  async function submitFeedback(outcomeType: string, outcomeId: string, rating: string) {
+    const response = await fetch('/api/workspace/accountability', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: data.sharedChannel.project.id, outcomeType, outcomeId, rating })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Feedback could not be saved.';
+  }
+
+  async function editPlan(plan: (typeof accountability.plans)[number]) {
+    const editable = {
+      goal: plan.goal, constraints: plan.constraints, allowParallel: plan.allowParallel,
+      budget: {
+        maxParticipants: plan.budget.maxParticipants, maxHandoffs: plan.budget.maxHandoffs,
+        maxDepth: plan.budget.maxDepth, maxAgentRuns: plan.budget.maxAgentRuns,
+        maxElapsedSeconds: plan.budget.maxElapsedSeconds,
+        ...(plan.budget.providerUsage.limit === null ? {} : { providerUsageLimit: plan.budget.providerUsage.limit })
+      },
+      steps: plan.steps.map((step) => ({
+        key: step.key, agentId: step.agentId, instruction: step.instruction,
+        dependencies: step.dependencies, expectedOutput: step.expectedOutput,
+        ...(step.artifactId ? { artifactId: step.artifactId } : {})
+      }))
+    };
+    const source = window.prompt('Edit the proposed plan JSON', JSON.stringify(editable, null, 2));
+    if (!source) return;
+    let edited;
+    try { edited = JSON.parse(source); } catch { agentMessage = 'Plan JSON is invalid.'; return; }
+    const response = await fetch(`/api/workspace/coordination/${encodeURIComponent(plan.id)}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'edit', plan: edited })
+    });
+    if (!response.ok) agentMessage = (await response.json()).message ?? 'Plan could not be edited.';
+    else await invalidateAll();
+  }
+
 </script>
 
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
+  {@const handoff = handoffForSource(message.id)}
+  {@const plan = planForSource(message.id)}
+  {@const steering = steeringForSource(message.id)}
+  {#if message.routingDecision}
+    <p class="mt-2 flex flex-wrap items-center gap-2 text-xs text-base-content/55">
+      <span class="badge badge-ghost badge-xs">{message.routingDecision.intent.replaceAll('_', ' ')}</span>
+      <span>{Math.round(message.routingDecision.confidence * 100)}% · {message.routingDecision.rationale}</span>
+      {#if message.routingDecision.correctedAt}<span class="text-info">Pilot corrected</span>{/if}
+      {#if message.routingDecision.intent === 'engineering_delegation' && !message.routingDecision.correctedAt}
+        <button class="btn btn-primary btn-xs" type="button" onclick={() => void correctIntent(message.id, 'engineering_delegation')}>Confirm engineering work</button>
+        <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctIntent(message.id, 'conversation')}>Treat as conversation</button>
+      {/if}
+    </p>
+  {/if}
   {#if message.agentMention?.status === 'accepted'}
     {@const run = latestVisibleAgentRunForSource(agentRuns, message.id)}
     <p class="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-success" role="status">
@@ -823,6 +1004,75 @@
     </p>
   {:else if message.agentMention?.status === 'rejected'}
     <p class="mt-2 text-xs text-warning" role="status">{message.agentMention.reason}</p>
+  {/if}
+  {#if handoff}
+    <div class="mt-2 border-l-2 border-primary/45 pl-3 text-xs" role="status">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="badge badge-sm rounded-sm border-primary/35 bg-primary/8 text-primary">
+          Handoff · {handoff.status}
+        </span>
+        <strong>{handoff.sourceAgentName} → {handoff.targetAgentName}</strong>
+        <span class="text-base-content/55">{handoff.summary}</span>
+        {#if handoff.status === 'queued'}
+          <button
+            class="btn btn-ghost btn-xs ml-auto"
+            type="button"
+            onclick={() => void cancelHandoff(handoff.id)}
+          >Cancel</button>
+        {/if}
+      </div>
+      <p class="mt-1 text-base-content/55">{handoff.question}</p>
+    </div>
+  {/if}
+  {#if steering}
+    <p class="mt-2 text-xs text-info" role="status">
+      Steering {steering.status}: {steering.guidance}
+    </p>
+  {/if}
+  {#if plan}
+    <div class="mt-3 border border-primary/25 bg-primary/5 p-3 text-xs" role="status">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="badge badge-sm badge-primary">Plan · {plan.status}</span>
+        <strong>{plan.goal}</strong>
+      </div>
+      <p class="mt-1 text-base-content/55">
+        {plan.steps.length} steps · {plan.allowParallel ? 'parallel when dependencies allow' : 'sequential'}
+        · {plan.budget.maxParticipants} participants max
+        · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs
+        · depth {plan.budget.maxDepth} · {plan.budget.maxAgentRuns} AgentRuns max
+        · {plan.budget.maxElapsedSeconds}s max
+        · provider usage {plan.budget.providerUsage.known ? `${plan.budget.providerUsage.consumed}/${plan.budget.providerUsage.limit ?? '∞'}` : 'unknown'}
+      </p>
+      <ol class="mt-2 list-inside list-decimal space-y-1">
+        {#each plan.steps as step}
+          <li>
+            {step.agentName}: {step.instruction}
+            <span class="text-base-content/45">
+              ({step.status}; depends on {step.dependencies.length ? step.dependencies.join(', ') : 'nothing'}; expects {step.expectedOutput.replaceAll('_', ' ')})
+            </span>
+          </li>
+        {/each}
+      </ol>
+      {#if plan.status === 'proposed'}
+        <div class="mt-2 flex gap-2">
+          <button class="btn btn-primary btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'approve')}>Approve</button>
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void editPlan(plan)}>Edit</button>
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'reject')}>Reject</button>
+        </div>
+      {:else if ['approved', 'active'].includes(plan.status)}
+        <div class="mt-2 flex gap-2">
+          <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'pause')}>Pause</button>
+          <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
+        </div>
+      {/if}
+      {#if ['completed', 'rejected', 'cancelled', 'failed'].includes(plan.status)}
+        <div class="mt-2 flex flex-wrap gap-1">
+          {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
+            <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('coordination_plan', plan.id, rating)}>{rating.replaceAll('_', ' ')}</button>
+          {/each}
+        </div>
+      {/if}
+    </div>
   {/if}
 {/snippet}
 
@@ -895,6 +1145,86 @@
         </li>
       {/each}
     </ul>
+
+    <div class="eyebrow mt-8">Agent workload</div>
+    <div class="mt-2 grid grid-cols-2 gap-1">
+      <select class="select select-xs bg-base-300" aria-label="Filter workload by Agent" bind:value={inboxAgentFilter}>
+        <option value="all">All Agents</option>
+        {#each data.agentConfiguration.agents as agent (agent.id)}<option value={agent.id}>{agent.name}</option>{/each}
+      </select>
+      <select class="select select-xs bg-base-300" aria-label="Filter workload by state" bind:value={inboxStateFilter}>
+        <option value="all">All states</option>
+        {#each ['queued', 'active', 'waiting', 'blocked', 'review_ready', 'completed'] as state}<option value={state}>{state.replaceAll('_', ' ')}</option>{/each}
+      </select>
+      <select class="select select-xs bg-base-300" aria-label="Filter workload by urgency" bind:value={inboxUrgencyFilter}>
+        <option value="all">All urgency</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option>
+      </select>
+      <label class="flex items-center gap-1 text-[0.65rem]"><input type="checkbox" class="checkbox checkbox-xs" bind:checked={inboxHumanOnly} /> Human action</label>
+    </div>
+    <p class="mt-1 text-[0.6rem] text-base-content/35">Project: {data.sharedChannel.project.name}</p>
+    <ul class="mt-1 max-h-40 space-y-1 overflow-y-auto text-xs text-base-content/55">
+      {#each filteredInbox as item (item.id)}
+        <li class="border-b border-white/6 py-1.5">
+          <a class="block hover:text-primary" href={`#message-${item.sourceMessageId}`}>
+            <span class:badge-warning={item.requiresHumanAction} class="badge badge-ghost badge-xs">{item.urgency}</span>
+            <strong>{item.agentName}</strong> · {item.state.replaceAll('_', ' ')}
+            <span class="block truncate">{item.summary}</span>
+          </a>
+        </li>
+      {:else}
+        <li class="py-2 text-base-content/35">No matching work.</li>
+      {/each}
+    </ul>
+
+    {#if accountability.findings.length > 0}
+      <div class="eyebrow mt-6">Findings</div>
+      <ul class="mt-2 max-h-52 space-y-2 overflow-y-auto text-xs">
+        {#each accountability.findings as finding (finding.id)}
+          <li class="border border-white/8 p-2">
+            <strong>{finding.summary}</strong>
+            <span class="ml-1 text-base-content/45">{Math.round(finding.confidence * 100)}% confidence · {finding.evidenceStrength}</span>
+            {#if finding.assumptions.length}<p class="mt-1 text-warning">Assumptions: {finding.assumptions.join('; ')}</p>{/if}
+            {#if finding.openQuestions.length}<p class="mt-1 text-info">Open: {finding.openQuestions.join('; ')}</p>{/if}
+            <ul class="mt-1 space-y-1">
+              {#each finding.evidence as evidence}
+                {@const presentedEvidence = presentFindingEvidence(evidence)}
+                <li>
+                  {#if presentedEvidence.href}<a class="link link-primary" href={presentedEvidence.href} target="_blank" rel="noopener noreferrer">{presentedEvidence.title}</a>{:else}<span>{presentedEvidence.title}</span>{/if}
+                  {#if presentedEvidence.status === 'inaccessible'}<span class="badge badge-warning badge-xs ml-1">Source inaccessible</span>{/if}
+                  <span class="block text-base-content/45">{presentedEvidence.provenance}</span>
+                  <span class="block text-base-content/55">{presentedEvidence.claim}</span>
+                </li>
+              {/each}
+            </ul>
+            <div class="mt-1 flex flex-wrap gap-1">
+              {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
+                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('finding', finding.id, rating)}>{rating.replaceAll('_', ' ')}</button>
+              {/each}
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if accountability.memory.length > 0}
+      <div class="eyebrow mt-6">Project memory</div>
+      <ul class="mt-2 max-h-40 space-y-2 overflow-y-auto text-xs">
+        {#each accountability.memory as memory (memory.id)}
+          <li class="border border-white/8 p-2">
+            <span class="badge badge-ghost badge-xs">{memory.type} · {memory.lifecycle}</span>
+            <p class="mt-1">{memory.statement}</p>
+            <p class="mt-1 truncate text-base-content/35">Sources: {memory.sourceReferences.join(', ')}</p>
+            {#if memory.lifecycle === 'active'}
+              <div class="mt-1 flex gap-1">
+                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctMemory(memory)}>Correct / supersede</button>
+                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'archived')}>Archive</button>
+                <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'deleted')}>Delete</button>
+              </div>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
 
     <div class="mt-8 border-t border-white/10 pt-3 lg:mt-auto">
       <button
@@ -1062,7 +1392,7 @@
                 <span>{formatDateDivider(message.createdAt)}</span>
               </div>
             {/if}
-            <article class="border-b border-white/8 p-4 sm:p-5">
+            <article id={`message-${message.id}`} class="border-b border-white/8 p-4 sm:p-5">
               <div class="message-row relative flex gap-3 pr-10">
                 <div class="message-actions" aria-label="Message actions">
                   <button
@@ -1459,6 +1789,9 @@
     <section class="settings-section" aria-label="Workspace Agents">
       <div class="eyebrow">04 / Agents</div>
       <h3 class="mt-2 text-base font-medium text-[#f1efe8]">Specialist teammates</h3>
+      <p class="mt-3 text-sm leading-6 text-base-content/48">
+        A specialist answering you may hand one concrete question to one other Agent. Engineering work still requires a Pilot member to delegate it.
+      </p>
       <div class="mt-4 space-y-2">
         {#each data.agentConfiguration.agents as agent (agent.id)}
           <button class="flex w-full items-center gap-3 border border-white/10 p-3 text-left hover:border-primary/60" type="button" onclick={() => editAgent(agent)}>
@@ -1473,6 +1806,27 @@
       </div>
       {#if data.agentConfiguration.canManage}
         <div class="mt-5 space-y-3 border-t border-white/10 pt-5">
+          <div class="space-y-2 border border-white/10 p-3">
+            <label class="text-xs text-base-content/60" for="agent-template">Optional bounded template</label>
+            <select id="agent-template" class="select select-sm w-full border-white/18 bg-transparent" bind:value={agentTemplateKey}>
+              <option value="">Choose a specialist template</option>
+              {#each data.agentTemplates as template (template.key)}
+                <option value={template.key}>{template.name} · v{template.version}</option>
+              {/each}
+            </select>
+            {#if selectedAgentTemplate}
+              <div class="text-xs leading-5 text-base-content/55">
+                <strong class="text-[#f1efe8]">{selectedAgentTemplate.roleLabel}</strong>
+                <p>{selectedAgentTemplate.instructions}</p>
+                <p>Permission ceiling: {selectedAgentTemplate.permissionCeiling.replaceAll('_', ' ')}.</p>
+                <p>Does not own: {selectedAgentTemplate.nonResponsibilities.join(', ')}.</p>
+                {#if selectedTemplateOverlap}<p class="text-warning">Ambient topic “{selectedTemplateOverlap}” overlaps an existing Agent.</p>{/if}
+              </div>
+              <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy} onclick={() => void instantiateTemplate()}>
+                Add from template
+              </button>
+            {/if}
+          </div>
           <div class="flex items-center justify-between gap-2">
             <strong class="text-sm">{editingAgentId ? 'Edit Agent' : 'Add an Agent'}</strong>
             {#if editingAgentId}<button class="btn btn-ghost btn-xs" type="button" onclick={resetAgentForm}>New instead</button>{/if}

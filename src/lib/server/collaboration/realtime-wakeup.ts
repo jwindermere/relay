@@ -23,7 +23,12 @@ export async function subscribeToChannelWakeups(
   const drain = async () => {
     const pending = await pool.query<WakeupRow>(
       `SELECT outbox.id::text AS outbox_id, outbox.workspace_id,
-              COALESCE(channel_message.channel_id, source_message.channel_id, channel_call.channel_id) AS channel_id
+              COALESCE(
+                channel_message.channel_id,
+                source_message.channel_id,
+                channel_call.channel_id,
+                handoff_message.channel_id
+              ) AS channel_id
        FROM public.notification_outbox outbox
        LEFT JOIN public.message channel_message ON channel_message.id = outbox.message_id
        LEFT JOIN public.agent_run_event event ON event.id = outbox.agent_run_event_id
@@ -31,7 +36,11 @@ export async function subscribeToChannelWakeups(
        LEFT JOIN public.task task ON task.id = run.task_id
        LEFT JOIN public.message source_message ON source_message.id = task.source_message_id
        LEFT JOIN public.channel_call channel_call ON channel_call.id = outbox.channel_call_id
-       WHERE outbox.topic IN ('channel.message', 'agent_run.event', 'channel.call')
+       LEFT JOIN public.agent_handoff handoff ON handoff.id = outbox.agent_handoff_id
+       LEFT JOIN public.message handoff_message ON handoff_message.id = handoff.source_message_id
+       WHERE outbox.topic IN (
+         'channel.message', 'agent_run.event', 'channel.call', 'agent_handoff.status'
+       )
          AND outbox.published_at IS NULL
        ORDER BY outbox.id`,
       []

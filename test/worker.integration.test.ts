@@ -17,6 +17,15 @@ import {
 import { ingestGitHubWebhook } from '../src/lib/server/github/webhooks.js';
 import { AgentRunGitHubWorkspaceBroker } from '../src/lib/server/github/workspace.js';
 import { postChannelMessage } from '../src/lib/server/collaboration/channel.js';
+import { correctMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
+import { acceptAgentConversation } from '../src/lib/server/collaboration/conversation.js';
+import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js';
+import {
+  claimCoordinationStep,
+  decideCoordinationPlan,
+  proposeCoordinationPlan
+} from '../src/lib/server/collaboration/coordination.js';
+import { loadCollaborationAccountability } from '../src/lib/server/collaboration/accountability.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
@@ -792,6 +801,479 @@ if (skipDatabaseTests) {
     assert.equal(
       recoveryReply.rows[0]?.body,
       'I lost the active response during a worker restart. Please send that message again.'
+    );
+
+    const productAgentId = 'agent-conversation-product';
+    const productMemberId = `${productAgentId}:member`;
+    await pool.query(
+      `INSERT INTO public.agent (
+         id, workspace_id, name, agent_type, role_label, instructions,
+         participation_mode, ambient_triggers
+       ) VALUES ($1, $2, 'Maya', 'product', 'Product manager',
+                 'Clarify the product outcome.', 'reactive', ARRAY[]::text[])`,
+      [productAgentId, ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ($1, $2, 'agent', $3)`,
+      [productMemberId, ids.workspaceId, productAgentId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ids.workspaceId, ids.projectId, productMemberId]
+    );
+    const suppliedArtifactUrl = 'https://github.test/relay-owner/pilot/pull/39';
+    await pool.query(`UPDATE public.task SET status = 'completed' WHERE id = 'task-conversation'`);
+    await pool.query(
+      `UPDATE public.agent_run SET status = 'completed' WHERE id = 'run-conversation'`
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES (
+         'artifact-result-conversation', $1, $2, $3, 'message-conversation',
+         'Pull request #39 is ready for review.'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.artifact (
+         id, workspace_id, project_id, task_id, agent_run_id, result_message_id,
+         kind, repository_id, branch, commit_sha, pull_request_number, url
+       ) VALUES (
+         'artifact-conversation', $1, $2, 'task-conversation', 'run-conversation',
+         'artifact-result-conversation', 'github_pull_request', $3,
+         'relay/run-conversation', $4, 39, $5
+       )`,
+      [
+        ids.workspaceId,
+        ids.projectId,
+        `repo-conversation`,
+        'a'.repeat(40),
+        suppliedArtifactUrl
+      ]
+    );
+
+    const coordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex help decide what Artifact artifact-conversation must achieve.',
+      submissionId: 'conversation-coordination'
+    });
+    assert.equal(coordination.agentMention?.status, 'conversation');
+    const coordinatingProvider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /one bounded handoff/);
+      assert.match(input.prompt, /@Maya \(Product manager\)/);
+      await observer.threadStarted('thread-conversation-coordination');
+      await observer.turnStarted('turn-conversation-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-coordination:message:completed',
+        item: {
+          id: 'message-conversation-coordination',
+          type: 'agentMessage',
+          text: '@Maya Which user outcome should define success for this fix?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-coordination:completed',
+        turn: { id: 'turn-conversation-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, coordinatingProvider, {
+      workerId: 'worker-conversation-coordination', workspaceRoot, leaseDurationMs: 10_000
+    });
+
+    const queuedHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(queuedHandoffView.handoffs.map((handoff) => ({
+      sourceMessageId: handoff.sourceMessageId,
+      sourceAgentName: handoff.sourceAgentName,
+      targetAgentName: handoff.targetAgentName,
+      question: handoff.question,
+      expectedResponseShape: handoff.expectedResponseShape,
+      status: handoff.status,
+      summary: handoff.summary,
+      resultMessageId: handoff.resultMessageId
+    })), [{
+      sourceMessageId: `conversation-result:${coordination.agentMention?.status === 'conversation'
+        ? coordination.agentMention.conversationTurnId
+        : ''}`,
+      sourceAgentName: 'Alex',
+      targetAgentName: 'Maya',
+      question: 'Which user outcome should define success for this fix?',
+      expectedResponseShape: 'concise_text',
+      status: 'queued',
+      summary: 'Waiting for Maya',
+      resultMessageId: null
+    }]);
+
+    const handoff = await pool.query<{ id: string; handoff_depth: number; agent_id: string }>(
+      `SELECT turn.id, turn.handoff_depth, conversation.agent_id
+       FROM public.agent_conversation_turn turn
+       JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
+       WHERE turn.request_message_id = $1`,
+      [`conversation-result:${coordination.agentMention?.status === 'conversation'
+        ? coordination.agentMention.conversationTurnId : ''}`]
+    );
+    assert.deepEqual(handoff.rows[0] && {
+      handoffDepth: handoff.rows[0].handoff_depth,
+      agentId: handoff.rows[0].agent_id
+    }, { handoffDepth: 1, agentId: productAgentId });
+
+    const handoffSourceMessageId = `conversation-result:${
+      coordination.agentMention?.status === 'conversation'
+        ? coordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const retryClient = await pool.connect();
+    try {
+      await retryClient.query('BEGIN');
+      const retry = await acceptAgentConversation(retryClient, {
+        messageId: handoffSourceMessageId,
+        workspaceId: ids.workspaceId,
+        channelId: ids.channelId,
+        parentMessageId: null,
+        body: '@Maya Which user outcome should define success for this fix?'
+      });
+      await retryClient.query('COMMIT');
+      assert.deepEqual(
+        retry?.status === 'conversation' && retry.conversationTurnId,
+        handoff.rows[0]?.id
+      );
+    } catch (error) {
+      await retryClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      retryClient.release();
+    }
+    const durableHandoff = await pool.query<{
+      originating_pilot_member_id: string;
+      source_agent_id: string;
+      target_agent_id: string;
+      project_id: string;
+      context_snapshot: {
+        projectId: string;
+        channelId: string;
+        sourceMessageId: string;
+        originatingRequest: { messageId: string; body: string };
+      };
+      artifact_references: unknown[];
+      expected_response_shape: string;
+      outcome_snapshot: unknown;
+    }>(
+      `SELECT originating_pilot_member_id, source_agent_id, target_agent_id, project_id,
+              context_snapshot, artifact_references, expected_response_shape, outcome_snapshot
+       FROM public.agent_handoff WHERE receiving_turn_id = $1`,
+      [handoff.rows[0]?.id]
+    );
+    assert.deepEqual(durableHandoff.rows[0], {
+      originating_pilot_member_id: ids.pilotMemberId,
+      source_agent_id: ids.agentId,
+      target_agent_id: productAgentId,
+      project_id: ids.projectId,
+      context_snapshot: {
+        projectId: ids.projectId,
+        channelId: ids.channelId,
+        sourceConversationTurnId: coordination.agentMention?.status === 'conversation'
+          ? coordination.agentMention.conversationTurnId
+          : '',
+        sourceMessageId: handoffSourceMessageId,
+        originatingRequest: {
+          messageId: coordination.id,
+          body: coordination.body
+        }
+      },
+      artifact_references: [{
+        artifactId: 'artifact-conversation',
+        kind: 'github_pull_request',
+        resultMessageId: 'artifact-result-conversation',
+        url: suppliedArtifactUrl
+      }],
+      expected_response_shape: 'concise_text',
+      outcome_snapshot: null
+    });
+
+    const handoffProvider = new FixtureProvider(async (input, observer) => {
+      const workingHandoffView = await loadChannelReconciliation(
+        pool,
+        ids.ownerAccess,
+        ids.channelId,
+        {}
+      );
+      assert.deepEqual(workingHandoffView.handoffs.map(({ status, summary }) => ({
+        status,
+        summary
+      })), [{ status: 'working', summary: 'Maya is responding' }]);
+      assert.match(input.prompt, /bounded Agent handoff/);
+      assert.doesNotMatch(input.prompt, /you may make one bounded handoff/);
+      await observer.threadStarted('thread-conversation-product');
+      await observer.turnStarted('turn-conversation-product');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-product:message:completed',
+        item: {
+          id: 'message-conversation-product',
+          type: 'agentMessage',
+          text: 'Success means users reconnect without losing in-flight work. @Alex implement it.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-product:completed',
+        turn: { id: 'turn-conversation-product', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, handoffProvider, {
+      workerId: 'worker-conversation-product', workspaceRoot, leaseDurationMs: 10_000
+    });
+    const completedHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(completedHandoffView.handoffs.map(({ status, summary, resultMessageId }) => ({
+      status,
+      summary,
+      resultMessageId
+    })), [{
+      status: 'completed',
+      summary: 'Maya responded',
+      resultMessageId: `conversation-result:${handoff.rows[0]?.id}`
+    }]);
+    const completedOutcome = await pool.query<{ outcome_snapshot: unknown }>(
+      `SELECT outcome_snapshot FROM public.agent_handoff WHERE receiving_turn_id = $1`,
+      [handoff.rows[0]?.id]
+    );
+    assert.deepEqual(completedOutcome.rows[0]?.outcome_snapshot, {
+      kind: 'completed',
+      resultMessageId: `conversation-result:${handoff.rows[0]?.id}`,
+      body: 'Success means users reconnect without losing in-flight work. @Alex implement it.',
+      errorCode: null
+    });
+    assert.equal(
+      completedHandoffView.runs.find(
+        ({ sourceMessageId }) => sourceMessageId === `conversation-result:${handoff.rows[0]?.id}`
+      ),
+      undefined
+    );
+    const cascaded = await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count
+       FROM public.agent_conversation_turn
+       WHERE requested_by_workspace_member_id = $1`,
+      [productMemberId]
+    );
+    assert.equal(cascaded.rows[0]?.count, 0);
+
+    const expiringCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask for one more product decision.',
+      submissionId: 'conversation-expiring-coordination'
+    });
+    const expiringCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-expiring-coordination');
+      await observer.turnStarted('turn-conversation-expiring-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-expiring-coordination:message:completed',
+        item: {
+          id: 'message-conversation-expiring-coordination',
+          type: 'agentMessage',
+          text: '@Maya Which constraint matters most?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-expiring-coordination:completed',
+        turn: { id: 'turn-conversation-expiring-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, expiringCoordinator, {
+      workerId: 'worker-conversation-expiring-coordination',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const expiringSourceMessageId = `conversation-result:${
+      expiringCoordination.agentMention?.status === 'conversation'
+        ? expiringCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    await pool.query(
+      `UPDATE public.agent_handoff SET expires_at = now() - interval '1 minute'
+       WHERE source_message_id = $1`,
+      [expiringSourceMessageId]
+    );
+    assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+      assert.fail('an expired handoff must not execute');
+    }), {
+      workerId: 'worker-conversation-expired', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'idle' });
+    const expiredHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(
+      expiredHandoffView.handoffs.find(
+        ({ sourceMessageId }) => sourceMessageId === expiringSourceMessageId
+      )?.status,
+      'expired'
+    );
+
+    const cancellableCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask Product about a cancellable decision.',
+      submissionId: 'conversation-cancellable-coordination'
+    });
+    const cancellableCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-cancellable-coordination');
+      await observer.turnStarted('turn-conversation-cancellable-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-cancellable-coordination:message:completed',
+        item: {
+          id: 'message-conversation-cancellable-coordination',
+          type: 'agentMessage',
+          text: '@Maya Which option should we cancel?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-cancellable-coordination:completed',
+        turn: { id: 'turn-conversation-cancellable-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, cancellableCoordinator, {
+      workerId: 'worker-conversation-cancellable-coordination',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const cancellableSourceMessageId = `conversation-result:${
+      cancellableCoordination.agentMention?.status === 'conversation'
+        ? cancellableCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const cancellableHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    const cancellableHandoff = cancellableHandoffView.handoffs.find(
+      ({ sourceMessageId }) => sourceMessageId === cancellableSourceMessageId
+    );
+    assert.ok(cancellableHandoff);
+    await cancelAgentHandoff(pool, ids.ownerAccess, cancellableHandoff.id);
+    assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+      assert.fail('a cancelled handoff must not execute');
+    }), {
+      workerId: 'worker-conversation-cancelled', workspaceRoot, leaseDurationMs: 10_000
+    }), { kind: 'idle' });
+    const cancelledHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(
+      cancelledHandoffView.handoffs.find(
+        ({ sourceMessageId }) => sourceMessageId === cancellableSourceMessageId
+      )?.status,
+      'cancelled'
+    );
+
+    const recoveryCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask Product about recovery.',
+      submissionId: 'conversation-recovery-coordination'
+    });
+    const recoveryCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-recovery-coordination');
+      await observer.turnStarted('turn-conversation-recovery-coordination');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-recovery-coordination:message:completed',
+        item: {
+          id: 'message-conversation-recovery-coordination',
+          type: 'agentMessage',
+          text: '@Maya What must recovery preserve?'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-recovery-coordination:completed',
+        turn: { id: 'turn-conversation-recovery-coordination', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, recoveryCoordinator, {
+      workerId: 'worker-conversation-recovery-coordination',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const recoverySourceMessageId = `conversation-result:${
+      recoveryCoordination.agentMention?.status === 'conversation'
+        ? recoveryCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const recoveryHandoff = await pool.query<{ receiving_turn_id: string }>(
+      `UPDATE public.agent_handoff
+       SET status = 'working', started_at = now() - interval '2 minutes'
+       WHERE source_message_id = $1
+       RETURNING receiving_turn_id`,
+      [recoverySourceMessageId]
+    );
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'working', lease_owner = 'lost-handoff-worker',
+           lease_token = 'lost-handoff-lease',
+           lease_expires_at = now() - interval '1 minute',
+           started_at = now() - interval '2 minutes'
+       WHERE id = $1`,
+      [recoveryHandoff.rows[0]?.receiving_turn_id]
+    );
+    assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+      assert.fail('an uncertain handoff must not be replayed');
+    }), {
+      workerId: 'worker-conversation-handoff-recovery',
+      workspaceRoot,
+      leaseDurationMs: 10_000
+    }), {
+      kind: 'conversation',
+      conversationTurnId: recoveryHandoff.rows[0]?.receiving_turn_id,
+      status: 'failed'
+    });
+    const failedHandoffView = await loadChannelReconciliation(
+      pool,
+      ids.ownerAccess,
+      ids.channelId,
+      {}
+    );
+    assert.deepEqual(
+      failedHandoffView.handoffs.find(
+        ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+      ) && {
+        status: failedHandoffView.handoffs.find(
+          ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+        )?.status,
+        summary: failedHandoffView.handoffs.find(
+          ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+        )?.summary,
+        resultMessageId: failedHandoffView.handoffs.find(
+          ({ sourceMessageId }) => sourceMessageId === recoverySourceMessageId
+        )?.resultMessageId
+      },
+      {
+        status: 'failed',
+        summary: 'Maya could not respond',
+        resultMessageId: `conversation-result:${recoveryHandoff.rows[0]?.receiving_turn_id}`
+      }
     );
   });
 
@@ -1660,6 +2142,250 @@ if (skipDatabaseTests) {
     assert.equal(stored.rows[0]?.task_count, 1);
     assert.ok(stored.rows[0]?.delivery_attempted_at);
     assert.ok(stored.rows[0]?.delivered_at);
+  });
+
+  test('Pilot steering is ordered, visible, and delivered at the next Provider boundary', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'steering-guidance');
+    const steering = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-steering-guidance',
+      body: 'steer: add regression coverage and do not change deployment files',
+      submissionId: 'steering-guidance-input'
+    });
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /add regression coverage and do not change deployment files/);
+      await observer.threadStarted('thread-steering-guidance');
+      await observer.turnStarted('turn-steering-guidance');
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'steering-guidance:completed',
+        turn: { id: 'turn-steering-guidance', status: 'completed' }
+      });
+    });
+    assert.equal((await processNextAgentRun(pool, provider, {
+      workerId: 'worker-steering-guidance', workspaceRoot
+    })).kind, 'executed');
+    const stored = await pool.query<{
+      source_message_id: string; ordinal: number; status: string;
+      provider_thread_id: string; provider_turn_id: string;
+    }>(
+      `SELECT source_message_id, ordinal, status, provider_thread_id, provider_turn_id
+       FROM public.agent_run_steering WHERE agent_run_id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(stored.rows, [{
+      source_message_id: steering.id, ordinal: 1, status: 'delivered',
+      provider_thread_id: 'thread-steering-guidance', provider_turn_id: 'turn-steering-guidance'
+    }]);
+  });
+
+  test('a Pilot intent correction stops queued repository work before execution', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'intent-correction');
+    const messageId = 'message-intent-correction';
+    await pool.query(
+      `INSERT INTO public.message_intent_decision (
+         id, workspace_id, project_id, message_id, selected_intent,
+         target_agent_id, confidence, policy_version, rationale
+       ) VALUES ($1, $2, $3, $4, 'engineering_delegation', $5, 1, 'rules-v1',
+         'A repository outcome was requested.')`,
+      ['decision-intent-correction', ids.workspaceId, ids.projectId, messageId, ids.agentId]
+    );
+    await correctMessageIntent(pool, ids.ownerAccess, messageId, { intent: 'conversation' });
+    const stopped = await pool.query<{ run_status: string; task_status: string; mention_status: string }>(
+      `SELECT run.status AS run_status, task.status AS task_status,
+              message.agent_mention_status AS mention_status
+       FROM public.agent_run run JOIN public.task task ON task.id = run.task_id
+       JOIN public.message message ON message.id = task.source_message_id
+       WHERE run.id = $1`,
+      [ids.runId]
+    );
+    assert.deepEqual(stopped.rows[0], {
+      run_status: 'cancelled', task_status: 'cancelled', mention_status: 'communication'
+    });
+    assert.deepEqual(await processNextAgentRun(pool, new FixtureProvider(async () => {
+      assert.fail('corrected repository work must not reach the Provider');
+    }), { workerId: 'worker-intent-correction', workspaceRoot }), { kind: 'idle' });
+  });
+
+  test('coordination remains inert until Pilot approval and cannot create engineering AgentRuns', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-approval');
+    const researchAgentId = 'research-coordination-approval';
+    const researchMemberId = `${researchAgentId}:member`;
+    await pool.query(
+      `INSERT INTO public.agent (id, workspace_id, name, role_label, agent_type)
+       VALUES ($1, $2, 'Riley', 'Research agent', 'research')`,
+      [researchAgentId, ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ($1, $2, 'agent', $3)`,
+      [researchMemberId, ids.workspaceId, researchAgentId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ids.workspaceId, ids.projectId, researchMemberId]
+    );
+    const conversationId = 'conversation-coordination-approval';
+    const turnId = 'turn-coordination-approval-source';
+    const resultMessageId = 'message-coordination-approval-plan';
+    await pool.query(
+      `INSERT INTO public.agent_conversation (
+         id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [conversationId, ids.workspaceId, ids.channelId, 'message-coordination-approval',
+        ids.agentId, ids.providerConnectionId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES ($1, $2, $3, $4, $5, 'I propose a bounded research step.')`,
+      [resultMessageId, ids.workspaceId, ids.channelId, ids.agentMemberId,
+        'message-coordination-approval']
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, response_message_id, status,
+         response_placement, response_parent_message_id, completed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      [turnId, ids.workspaceId, conversationId, 'message-coordination-approval',
+        ids.pilotMemberId, resultMessageId]
+    );
+    const planId = await proposeCoordinationPlan(pool, {
+      workspaceId: ids.workspaceId, projectId: ids.projectId,
+      coordinatingAgentId: ids.agentId, sourceMessageId: resultMessageId,
+      goal: 'Assess evidence', allowParallel: false,
+      budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 },
+      steps: [{ key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] }]
+    });
+    assert.equal(await claimCoordinationStep(pool, planId), null);
+    await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
+    assert.ok(await claimCoordinationStep(pool, planId));
+    const created = await pool.query<{ turns: number; runs: number; depth: number }>(
+      `SELECT
+         count(*) FILTER (WHERE turn.id IS NOT NULL)::integer AS turns,
+         (SELECT count(*)::integer FROM public.agent_run WHERE workspace_id = $1) AS runs,
+         max(turn.handoff_depth)::integer AS depth
+       FROM public.coordination_plan_step step
+       LEFT JOIN public.agent_conversation_turn turn ON turn.id = step.conversation_turn_id
+       WHERE step.plan_id = $2`,
+      [ids.workspaceId, planId]
+    );
+    assert.deepEqual(created.rows[0], { turns: 1, runs: 1, depth: 1 });
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+       WHERE id IN (
+         SELECT conversation_turn_id FROM public.coordination_plan_step WHERE plan_id = $1
+       ) AND status = 'queued'`,
+      [planId]
+    );
+  });
+
+  test('Research Agents preserve inaccessible cross-Project evidence as visible provenance', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'structured-finding');
+    const researchAgentId = 'research-structured-finding';
+    const researchMemberId = `${researchAgentId}:member`;
+    await pool.query(
+      `INSERT INTO public.agent (
+         id, workspace_id, name, role_label, agent_type, participation_mode
+       ) VALUES ($1, $2, 'Riley', 'Research agent', 'research', 'reactive')`,
+      [researchAgentId, ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ($1, $2, 'agent', $3)`,
+      [researchMemberId, ids.workspaceId, researchAgentId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ids.workspaceId, ids.projectId, researchMemberId]
+    );
+    const request = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Riley research the release evidence.',
+      submissionId: 'structured-finding-request'
+    });
+    assert.equal(request.routingDecision?.intent, 'research_request');
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ('project-structured-finding-other', $1, 'Other Project')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.channel (id, workspace_id, project_id, name)
+       VALUES ('channel-structured-finding-other', $1, 'project-structured-finding-other', 'other-project')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES (
+         'message-structured-finding-other', $1, 'channel-structured-finding-other', $2,
+         'The other Project chose a phased release.'
+       )`,
+      [ids.workspaceId, ids.pilotMemberId]
+    );
+    const researchTurnId = request.agentMention?.status === 'conversation'
+      ? request.agentMention.conversationTurnId : '';
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+       WHERE status = 'queued' AND id <> $1`,
+      [researchTurnId]
+    );
+    const provider = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-structured-finding');
+      await observer.turnStarted('turn-structured-finding');
+      await observer.notification({
+        method: 'item/completed', providerEventId: 'structured-finding:message',
+        item: {
+          id: 'structured-finding-message', type: 'agentMessage',
+          text: `The release evidence is current.
+
+\`\`\`relay-finding
+{"summary":"The release evidence is current.","confidence":0.9,"observedEvidence":["The release record is dated today."],"inferences":[],"assumptions":[],"openQuestions":[],"evidence":[{"type":"external","stableReference":"https://example.test/release","title":"Release record","retrievedAt":"2026-08-30T12:00:00.000Z","claim":"The release record is current."},{"type":"message","stableReference":"message-structured-finding-other","title":"Release decision","retrievedAt":"2026-08-30T12:00:00.000Z","claim":"The other Project chose a phased release."}]}
+\`\`\``
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'structured-finding:completed',
+        turn: { id: 'turn-structured-finding', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextConversationTurn(pool, provider, {
+      workerId: 'worker-structured-finding', workspaceRoot
+    }), {
+      kind: 'conversation',
+      conversationTurnId: researchTurnId,
+      status: 'completed'
+    });
+    const stored = await pool.query<{ findings: number; evidence: number; memory: number }>(
+      `SELECT
+         (SELECT count(*)::integer FROM public.agent_finding WHERE project_id = $1) AS findings,
+         (SELECT count(*)::integer FROM public.finding_evidence WHERE project_id = $1) AS evidence,
+         (SELECT count(*)::integer FROM public.project_memory
+          WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory`,
+      [ids.projectId]
+    );
+    assert.deepEqual(stored.rows[0], { findings: 1, evidence: 2, memory: 1 });
+    const accountability = await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    );
+    assert.deepEqual(
+      accountability.findings[0]?.evidence.find(({ stableReference }) =>
+        stableReference === 'message-structured-finding-other'
+      ),
+      {
+        type: 'message',
+        stableReference: 'message-structured-finding-other',
+        title: 'Release decision',
+        retrievedAt: '2026-08-30T12:00:00+00:00',
+        claim: 'The other Project chose a phased release.',
+        accessible: false
+      }
+    );
   });
 }
 

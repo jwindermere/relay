@@ -12,9 +12,11 @@ import {
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
 import { loadWorkspaceAgents } from '$lib/server/collaboration/agents.js';
+import { listAgentTemplates } from '$lib/server/collaboration/agent-templates.js';
 import { loadActiveChannelCall } from '$lib/server/collaboration/calls.js';
 import { loadAvailableWorkspaces } from '$lib/server/collaboration/workspaces.js';
 import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliation.js';
+import { loadCollaborationAccountability } from '$lib/server/collaboration/accountability.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
 import { isJitsiEmbeddingEnabled } from '$lib/server/configuration.js';
 import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
@@ -40,9 +42,10 @@ export async function load({ request }) {
       loadWorkspaceAgents(pool, access),
       loadAvailableWorkspaces(pool, access)
     ]);
-    const [reconciliation, activeCall] = await Promise.all([
+    const [reconciliation, activeCall, accountability] = await Promise.all([
       loadChannelReconciliation(pool, access, sharedChannel.channel.id, {}),
-      loadActiveChannelCall(pool, access, sharedChannel.channel.id)
+      loadActiveChannelCall(pool, access, sharedChannel.channel.id),
+      loadCollaborationAccountability(pool, access, sharedChannel.project.id)
     ]);
     return {
       email: access.identity.email,
@@ -57,8 +60,10 @@ export async function load({ request }) {
       providerConnection,
       linkedRepository,
       agentConfiguration,
+      agentTemplates: listAgentTemplates(),
       workspaces,
       reconciliation,
+      accountability,
       activeCall,
       jitsiEmbeddingEnabled: isJitsiEmbeddingEnabled(),
       messageSubmissionId: randomUUID(),

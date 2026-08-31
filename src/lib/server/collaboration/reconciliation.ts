@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 
 import type { PullRequestArtifact, VisibleAgentRunStatus } from '../../reconciliation.js';
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import type { AgentHandoffStatus } from './handoffs.js';
 import {
   loadAuthorizedChannelMessages,
   type ChannelMessage
@@ -26,10 +27,23 @@ export interface ReconciledAgentRun {
   artifact?: PullRequestArtifact;
 }
 
+export interface ReconciledAgentHandoff {
+  id: string;
+  sourceMessageId: string;
+  sourceAgentName: string;
+  targetAgentName: string;
+  question: string;
+  expectedResponseShape: 'concise_text' | 'structured_finding';
+  status: AgentHandoffStatus;
+  summary: string;
+  resultMessageId: string | null;
+}
+
 export interface ChannelReconciliation {
   channelId: string;
   messages: ChannelMessage[];
   runs: ReconciledAgentRun[];
+  handoffs: ReconciledAgentHandoff[];
 }
 
 interface RunRow {
@@ -49,6 +63,17 @@ interface EventRow {
   sequence: number;
   status: AgentRunStatus;
   event_type: string;
+}
+
+interface HandoffRow {
+  id: string;
+  source_message_id: string;
+  source_agent_name: string;
+  target_agent_name: string;
+  question: string;
+  expected_response_shape: 'concise_text' | 'structured_finding';
+  status: AgentHandoffStatus;
+  result_message_id: string | null;
 }
 
 export async function loadChannelReconciliation(
@@ -103,6 +128,26 @@ export async function loadChannelReconciliation(
     });
     eventsByRun.set(event.agent_run_id, runEvents);
   }
+  const handoffs = await pool.query<HandoffRow>(
+    `SELECT handoff.id, handoff.source_message_id,
+            source_agent.name AS source_agent_name,
+            target_agent.name AS target_agent_name,
+            handoff.question, handoff.expected_response_shape,
+            handoff.status, handoff.result_message_id
+     FROM public.agent_handoff handoff
+     JOIN public.message source_message
+       ON source_message.id = handoff.source_message_id
+      AND source_message.workspace_id = handoff.workspace_id
+     JOIN public.agent source_agent
+       ON source_agent.id = handoff.source_agent_id
+      AND source_agent.workspace_id = handoff.workspace_id
+     JOIN public.agent target_agent
+       ON target_agent.id = handoff.target_agent_id
+      AND target_agent.workspace_id = handoff.workspace_id
+     WHERE source_message.channel_id = $1 AND handoff.workspace_id = $2
+     ORDER BY handoff.created_at, handoff.id`,
+    [channelId, access.workspace.id]
+  );
 
   return {
     channelId,
@@ -124,8 +169,31 @@ export async function loadChannelReconciliation(
             }
           }
         : {})
+    })),
+    handoffs: handoffs.rows.map((handoff) => ({
+      id: handoff.id,
+      sourceMessageId: handoff.source_message_id,
+      sourceAgentName: handoff.source_agent_name,
+      targetAgentName: handoff.target_agent_name,
+      question: handoff.question,
+      expectedResponseShape: handoff.expected_response_shape,
+      status: handoff.status,
+      summary: visibleAgentHandoffSummary(handoff.status, handoff.target_agent_name),
+      resultMessageId: handoff.result_message_id
     }))
   };
+}
+
+function visibleAgentHandoffSummary(status: AgentHandoffStatus, targetAgentName: string): string {
+  const summaries: Record<AgentHandoffStatus, string> = {
+    queued: `Waiting for ${targetAgentName}`,
+    working: `${targetAgentName} is responding`,
+    completed: `${targetAgentName} responded`,
+    failed: `${targetAgentName} could not respond`,
+    cancelled: `Handoff to ${targetAgentName} cancelled`,
+    expired: `Handoff to ${targetAgentName} expired`
+  };
+  return summaries[status];
 }
 
 function visibleAgentRunSummary(status: AgentRunStatus, eventType?: string): string {

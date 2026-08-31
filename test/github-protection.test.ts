@@ -38,7 +38,7 @@ const protectedRepository: GitHubRepositoryEvidence = {
           parameters: {
             requiredApprovingReviewCount: 1,
             dismissStaleReviewsOnPush: true,
-            requireLastPushApproval: true
+            requireLastPushApproval: false
           }
         },
         {
@@ -60,7 +60,7 @@ const protectedRepository: GitHubRepositoryEvidence = {
           parameters: {
             requiredApprovingReviewCount: 2,
             dismissStaleReviewsOnPush: true,
-            requireLastPushApproval: true
+            requireLastPushApproval: false
           }
         },
         {

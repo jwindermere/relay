@@ -24,6 +24,7 @@ import {
   startChannelCall
 } from '../src/lib/server/collaboration/calls.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
+import { correctMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
 import { deleteChannelMessage } from '../src/lib/server/collaboration/messages.js';
 import {
   createWorkspace,
@@ -160,29 +161,41 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'agent' },
       { table_schema: 'public', table_name: 'agent_conversation' },
       { table_schema: 'public', table_name: 'agent_conversation_turn' },
+      { table_schema: 'public', table_name: 'agent_finding' },
+      { table_schema: 'public', table_name: 'agent_handoff' },
       { table_schema: 'public', table_name: 'agent_run' },
       { table_schema: 'public', table_name: 'agent_run_cancellation_request' },
       { table_schema: 'public', table_name: 'agent_run_clarification' },
       { table_schema: 'public', table_name: 'agent_run_event' },
+      { table_schema: 'public', table_name: 'agent_run_steering' },
       { table_schema: 'public', table_name: 'approval' },
       { table_schema: 'public', table_name: 'artifact' },
       { table_schema: 'public', table_name: 'audit_event' },
       { table_schema: 'public', table_name: 'channel' },
       { table_schema: 'public', table_name: 'channel_call' },
       { table_schema: 'public', table_name: 'channel_call_participant' },
+      { table_schema: 'public', table_name: 'collaboration_evaluation_event' },
+      { table_schema: 'public', table_name: 'collaboration_feedback' },
+      { table_schema: 'public', table_name: 'coordination_budget_reservation' },
+      { table_schema: 'public', table_name: 'coordination_plan' },
+      { table_schema: 'public', table_name: 'coordination_plan_step' },
+      { table_schema: 'public', table_name: 'finding_evidence' },
       { table_schema: 'public', table_name: 'github_broker_decision' },
       { table_schema: 'public', table_name: 'github_connection' },
       { table_schema: 'public', table_name: 'github_webhook_delivery' },
       { table_schema: 'public', table_name: 'linked_repository' },
       { table_schema: 'public', table_name: 'message' },
+      { table_schema: 'public', table_name: 'message_intent_decision' },
       { table_schema: 'public', table_name: 'notification_outbox' },
       { table_schema: 'public', table_name: 'project' },
       { table_schema: 'public', table_name: 'project_membership' },
+      { table_schema: 'public', table_name: 'project_memory' },
       { table_schema: 'public', table_name: 'provider_connection' },
       { table_schema: 'public', table_name: 'runtime_state' },
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'task' },
       { table_schema: 'public', table_name: 'workspace' },
+      { table_schema: 'public', table_name: 'workspace_coordination_policy' },
       { table_schema: 'public', table_name: 'workspace_invitation' },
       { table_schema: 'public', table_name: 'workspace_member' },
       { table_schema: 'public', table_name: 'workspace_membership' }
@@ -565,8 +578,10 @@ if (connectionString) {
       initial.members.map(({ name, kind }) => ({ name, kind })),
       [
         { name: 'Alex', kind: 'agent' },
+        { name: 'Maya', kind: 'agent' },
         { name: 'Pilot member', kind: 'pilot' },
-        { name: 'Relay Owner', kind: 'pilot' }
+        { name: 'Relay Owner', kind: 'pilot' },
+        { name: 'Riley', kind: 'agent' }
       ]
     );
 
@@ -631,6 +646,35 @@ if (connectionString) {
       body: 'Email support@Alex.com; Alex has useful context, but this is not a delegation.'
     });
     assert.equal(message.agentMention, null);
+    assert.deepEqual(message.routingDecision, {
+      intent: 'ordinary_communication',
+      targetAgentId: null,
+      confidence: 1,
+      policyVersion: 'rules-v1',
+      rationale: 'No eligible Agent mention or active Agent conversation was found.',
+      correctedAt: null
+    });
+
+    const reloaded = await loadSharedAgentChannel(pool, memberAccess);
+    assert.deepEqual(
+      reloaded.messages.find(({ id }) => id === message.id)?.routingDecision,
+      message.routingDecision
+    );
+    await correctMessageIntent(pool, memberAccess, message.id, {
+      intent: 'conversation',
+      targetAgentId: `${memberAccess.workspace.id}:alex`
+    });
+    const corrected = await loadSharedAgentChannel(pool, memberAccess);
+    assert.deepEqual(
+      corrected.messages.find(({ id }) => id === message.id)?.routingDecision,
+      {
+        ...message.routingDecision,
+        intent: 'conversation',
+        targetAgentId: `${memberAccess.workspace.id}:alex`,
+        correctedAt: corrected.messages.find(({ id }) => id === message.id)
+          ?.routingDecision?.correctedAt
+      }
+    );
 
     const work = await pool.query<{ tasks: number; runs: number }>(`
       SELECT
@@ -653,16 +697,19 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex please investigate the reconnect failure.'
     });
-
-    assert.equal(message.agentMention?.status, 'rejected');
+    assert.equal(message.agentMention, null);
+    await correctMessageIntent(pool, memberAccess, message.id, { intent: 'engineering_delegation' });
+    const confirmed = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === message.id);
+    assert.equal(confirmed?.agentMention?.status, 'rejected');
     assert.match(
-      message.agentMention?.status === 'rejected' ? message.agentMention.reason : '',
+      confirmed?.agentMention?.status === 'rejected' ? confirmed.agentMention.reason : '',
       /ready Codex Provider connection/
     );
     const persisted = await loadSharedAgentChannel(pool, memberAccess);
     assert.deepEqual(
       persisted.messages.find(({ id }) => id === message.id)?.agentMention,
-      message.agentMention
+      confirmed?.agentMention
     );
     const work = await pool.query<{ tasks: number; runs: number; events: number; outbox: number }>(`
       SELECT
@@ -1057,10 +1104,14 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex investigate the reconnect failure.'
     }, mentionDependencies);
-    assert.equal(unsafeRepository.agentMention?.status, 'rejected');
+    await correctMessageIntent(pool, memberAccess, unsafeRepository.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const unsafeRepositoryAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === unsafeRepository.id);
+    assert.equal(unsafeRepositoryAfterConfirmation?.agentMention?.status, 'rejected');
     assert.match(
-      unsafeRepository.agentMention?.status === 'rejected'
-        ? unsafeRepository.agentMention.reason
+      unsafeRepositoryAfterConfirmation?.agentMention?.status === 'rejected'
+        ? unsafeRepositoryAfterConfirmation.agentMention.reason
         : '',
       /Current repository permissions and protected-branch controls/
     );
@@ -1070,9 +1121,13 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex please deploy this directly to production.'
     }, mentionDependencies);
-    assert.equal(unsafe.agentMention?.status, 'rejected');
+    await correctMessageIntent(pool, memberAccess, unsafe.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const unsafeAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === unsafe.id);
+    assert.equal(unsafeAfterConfirmation?.agentMention?.status, 'rejected');
     assert.match(
-      unsafe.agentMention?.status === 'rejected' ? unsafe.agentMention.reason : '',
+      unsafeAfterConfirmation?.agentMention?.status === 'rejected' ? unsafeAfterConfirmation.agentMention.reason : '',
       /cannot accept requests to merge, deploy, or administer/
     );
     for (const forbiddenRequest of [
@@ -1086,7 +1141,11 @@ if (connectionString) {
         channelId: channel.channel.id,
         body: forbiddenRequest
       }, mentionDependencies);
-      assert.equal(rejected.agentMention?.status, 'rejected', forbiddenRequest);
+      await correctMessageIntent(pool, memberAccess, rejected.id,
+        { intent: 'engineering_delegation' }, mentionDependencies);
+      const rejectedAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+        .messages.find(({ id }) => id === rejected.id);
+      assert.equal(rejectedAfterConfirmation?.agentMention?.status, 'rejected', forbiddenRequest);
     }
 
     await pool.query(
@@ -1097,9 +1156,13 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex investigate another reconnect failure.'
     }, mentionDependencies);
-    assert.equal(atCapacity.agentMention?.status, 'rejected');
+    await correctMessageIntent(pool, memberAccess, atCapacity.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const atCapacityAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === atCapacity.id);
+    assert.equal(atCapacityAfterConfirmation?.agentMention?.status, 'rejected');
     assert.match(
-      atCapacity.agentMention?.status === 'rejected' ? atCapacity.agentMention.reason : '',
+      atCapacityAfterConfirmation?.agentMention?.status === 'rejected' ? atCapacityAfterConfirmation.agentMention.reason : '',
       /no capacity/
     );
     await pool.query(
@@ -1117,14 +1180,29 @@ if (connectionString) {
       }, mentionDependencies),
       postChannelMessage(pool, memberAccess, {
         channelId: channel.channel.id,
-        body: '@Alex this retry must not retarget the accepted work.',
+        body: request,
         submissionId
       }, mentionDependencies)
     ]);
     assert.equal(first.id, retry.id);
     assert.equal(first.body, retry.body);
-    assert.equal(first.agentMention?.status, 'accepted');
+    assert.equal(first.routingDecision?.intent, 'engineering_delegation');
+    assert.equal(first.agentMention, null);
     assert.deepEqual(first.agentMention, retry.agentMention);
+    const conflictingRetry = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex this retry must not retarget the accepted work.',
+      submissionId
+    }, mentionDependencies);
+    assert.equal(conflictingRetry.id, first.id);
+    assert.equal(conflictingRetry.body, request);
+    await correctMessageIntent(pool, memberAccess, first.id,
+      { intent: 'engineering_delegation' }, mentionDependencies);
+    const confirmed = (await loadSharedAgentChannel(pool, memberAccess))
+      .messages.find(({ id }) => id === first.id);
+    assert.equal(confirmed?.agentMention?.status, 'accepted');
+    const confirmedAgentId = confirmed?.agentMention?.status === 'accepted'
+      ? confirmed.agentMention.agentId : undefined;
 
     const accepted = await pool.query<{
       task_id: string;
@@ -1216,7 +1294,7 @@ if (connectionString) {
     assert.deepEqual(accepted.rows[0]?.context_snapshot.project, channel.project);
     assert.deepEqual(accepted.rows[0]?.context_snapshot.channel, channel.channel);
     assert.deepEqual(accepted.rows[0]?.context_snapshot.agent, {
-      id: first.agentMention?.agentId,
+      id: confirmedAgentId,
       name: 'Alex',
       roleLabel: 'Engineering agent'
     });

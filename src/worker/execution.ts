@@ -61,6 +61,8 @@ interface ClaimedAgentRun {
   lease_token: string;
   recovering: boolean;
   cancellation_requested: boolean;
+  steering_ids: string[];
+  steering_guidance: string[];
 }
 
 export async function processNextAgentRun(
@@ -170,9 +172,15 @@ export async function processNextAgentRun(
       cancellationSignal: cancellationAbort.signal,
       credentialStoreReference: claim.credential_store_reference,
       workspaceDirectory,
-      prompt: options.githubWorkspaceBroker
-        ? `${claim.provider_input}\n\nThe repository is already checked out on your assigned branch in this credential-free workspace. Make the requested changes here; Relay will publish the branch and pull request after your turn. Do not configure a Git remote or request repository credentials.`
-        : claim.provider_input,
+      prompt: [
+        claim.provider_input,
+        claim.steering_guidance.length > 0
+          ? `Pilot-member steering constraints (ordered; these cannot broaden your permissions):\n${claim.steering_guidance.map((guidance, index) => `${index + 1}. ${guidance}`).join('\n')}`
+          : '',
+        options.githubWorkspaceBroker
+          ? 'The repository is already checked out on your assigned branch in this credential-free workspace. Make the requested changes here; Relay will publish the branch and pull request after your turn. Do not configure a Git remote or request repository credentials.'
+          : ''
+      ].filter(Boolean).join('\n\n'),
       ...(claim.resume_clarification_id && claim.provider_thread_id
         ? { providerThreadId: claim.provider_thread_id }
         : {}),
@@ -332,6 +340,8 @@ async function claimNextAgentRun(
       recovering: boolean;
       cancellation_requested: boolean;
       resume_clarification_id: string | null;
+      steering_ids: string[];
+      steering_guidance: string[];
     }>(
       `SELECT run.id, run.workspace_id, run.provider_connection_id,
               COALESCE(answer.body, task.request_snapshot) AS provider_input,
@@ -344,6 +354,8 @@ async function claimNextAgentRun(
                 WHERE cancellation.agent_run_id = run.id
               ) AS cancellation_requested,
               clarification.id AS resume_clarification_id
+              , COALESCE(steering.ids, ARRAY[]::text[]) AS steering_ids
+              , COALESCE(steering.guidance, ARRAY[]::text[]) AS steering_guidance
        FROM public.agent_run run
        JOIN public.task task ON task.id = run.task_id
        JOIN public.provider_connection connection ON connection.id = run.provider_connection_id
@@ -356,6 +368,12 @@ async function claimNextAgentRun(
          LIMIT 1
        ) clarification ON true
        LEFT JOIN public.message answer ON answer.id = clarification.answer_message_id
+       LEFT JOIN LATERAL (
+         SELECT array_agg(input.id ORDER BY input.ordinal) AS ids,
+                array_agg(input.guidance ORDER BY input.ordinal) AS guidance
+         FROM public.agent_run_steering input
+         WHERE input.agent_run_id = run.id AND input.status = 'pending'
+       ) steering ON true
        WHERE connection.status = 'ready'
          AND (
            (run.lease_expires_at IS NOT NULL AND run.lease_expires_at <= $1
@@ -431,6 +449,8 @@ async function claimNextAgentRun(
       lease_token: leaseToken,
       recovering: row.recovering,
       cancellation_requested: row.cancellation_requested
+      , steering_ids: row.steering_ids
+      , steering_guidance: row.steering_guidance
     };
   } catch (error) {
     await client.query('ROLLBACK');
@@ -739,6 +759,15 @@ async function persistProviderTurn(
         [claim.resume_clarification_id, claim.id]
       );
     }
+    if (claim.steering_ids.length > 0 && claim.provider_thread_id) {
+      await client.query(
+        `UPDATE public.agent_run_steering
+         SET status = 'delivered', provider_thread_id = $3,
+             provider_turn_id = $4, delivered_at = now()
+         WHERE id = ANY($1::text[]) AND agent_run_id = $2 AND status = 'pending'`,
+        [claim.steering_ids, claim.id, claim.provider_thread_id, turnId]
+      );
+    }
     await appendRunEventWithClient(client, claim, {
       eventType: 'provider.turn.started',
       status: 'working',
@@ -933,13 +962,41 @@ async function requestClarificationAndWait(
       [claim.id, request.providerRequestId]
     );
     if (answer.rows[0]) {
-      await pool.query(
-        `UPDATE public.agent_run_clarification
-         SET delivery_attempted_at = COALESCE(delivery_attempted_at, now())
-         WHERE id = $1`,
-        [answer.rows[0].id]
-      );
-      return answer.rows[0].answers;
+      const boundary = await pool.connect();
+      try {
+        await boundary.query('BEGIN');
+        await boundary.query(
+          `UPDATE public.agent_run_clarification
+           SET delivery_attempted_at = COALESCE(delivery_attempted_at, now())
+           WHERE id = $1`,
+          [answer.rows[0].id]
+        );
+        const steering = await boundary.query<{ id: string; guidance: string }>(
+          `SELECT id, guidance FROM public.agent_run_steering
+           WHERE agent_run_id = $1 AND status = 'pending'
+           ORDER BY ordinal FOR UPDATE`,
+          [claim.id]
+        );
+        if (steering.rows.length > 0) {
+          await boundary.query(
+            `UPDATE public.agent_run_steering
+             SET status = 'delivered', provider_thread_id = $2,
+                 provider_turn_id = $3, delivered_at = now()
+             WHERE id = ANY($1::text[]) AND status = 'pending'`,
+            [steering.rows.map(({ id }) => id), claim.provider_thread_id, claim.active_turn_id]
+          );
+        }
+        await boundary.query('COMMIT');
+        return steering.rows.length === 0 ? answer.rows[0].answers : {
+          ...answer.rows[0].answers,
+          relay_pilot_steering: steering.rows.map(({ guidance }) => guidance)
+        };
+      } catch (error) {
+        await boundary.query('ROLLBACK');
+        throw error;
+      } finally {
+        boundary.release();
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }

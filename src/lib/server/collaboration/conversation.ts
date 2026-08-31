@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import type { AgentMentionResult } from './delegation.js';
-import { explicitAgentMentionPattern } from './delegation.js';
+import {
+  explicitAgentMentionPattern,
+  isConcreteEngineeringRequest
+} from './delegation.js';
+
+export { isConcreteEngineeringRequest } from './delegation.js';
 
 interface ConversationContext {
   messageId: string;
@@ -36,23 +41,17 @@ function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean
   return normalizedBody.includes(normalized);
 }
 
-export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
-  const normalizedBody = body.toLocaleLowerCase();
-  return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
-}
-
-export function isConcreteEngineeringRequest(body: string, agentName: string): boolean {
-  const request = body
+function handoffQuestion(body: string, agentName: string): string {
+  return body
     .replace(explicitAgentMentionPattern(agentName), ' ')
     .trim()
     .replace(/^[\s,.:;!?-]+/u, '')
-    .replace(
-      /^(?:(?:hey|hi)\s+)?(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|i\s+(?:need|want)\s+you\s+to\s+|go\s+ahead\s+and\s+)*/iu,
-      ''
-    )
     .trim();
-  return /^(?:implement|build|create|fix|change|refactor|add|remove|test|debug|investigate|inspect|document|update|write|rename|repair|cover|prove|deploy|merge|administer|destroy|truncate|delete|wipe|erase|purge|push|publish|release|force[- ]?push|git\s+)\s*\S+/iu.test(request)
-    || /^run\s+(?:the\s+)?(?:tests?|checks?|build|lint|typecheck)\b/iu.test(request);
+}
+
+export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
+  const normalizedBody = body.toLocaleLowerCase();
+  return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
 }
 
 export async function acceptAgentConversation(
@@ -69,6 +68,22 @@ export async function acceptAgentConversation(
   const mentioned = agents.rows.find(({ name }) =>
     explicitAgentMentionPattern(name).test(context.body)
   );
+  const requestAuthor = await client.query<{
+    kind: 'pilot' | 'agent';
+    agent_id: string | null;
+  }>(
+    `SELECT author.kind, author.agent_id
+     FROM public.message message
+     JOIN public.workspace_member author
+       ON author.id = message.author_workspace_member_id
+      AND author.workspace_id = message.workspace_id
+     WHERE message.id = $1 AND message.workspace_id = $2`,
+    [context.messageId, context.workspaceId]
+  );
+  const agentAuthored = requestAuthor.rows[0]?.kind === 'agent';
+  // Agent output is only routable as an explicit, bounded handoff. In particular,
+  // a reply in an existing Thread must not implicitly wake the same Agent again.
+  if (agentAuthored && !mentioned) return null;
   const rootMessageId = context.parentMessageId ?? context.messageId;
   const existing = context.parentMessageId
     ? await client.query<{ id: string; agent_id: string }>(
@@ -134,6 +149,14 @@ export async function acceptAgentConversation(
 
   const readiness = await client.query<{
     author_is_active_pilot: boolean;
+    valid_agent_handoff: boolean;
+    handoff_depth: number;
+    project_id: string | null;
+    source_agent_id: string | null;
+    originating_pilot_member_id: string | null;
+    source_turn_id: string | null;
+    source_request_message_id: string | null;
+    source_request_body: string | null;
     author_is_project_member: boolean;
     agent_is_project_member: boolean;
     provider_connection_id: string | null;
@@ -141,6 +164,19 @@ export async function acceptAgentConversation(
   }>(
     `SELECT
        (author.kind = 'pilot' AND membership.revoked_at IS NULL) AS author_is_active_pilot,
+       (author.kind = 'agent'
+         AND author.agent_id <> $4
+         AND source_turn.id IS NOT NULL
+         AND source_turn.handoff_depth = 0
+         AND source_requester.kind = 'pilot') AS valid_agent_handoff,
+       CASE WHEN author.kind = 'agent' THEN COALESCE(source_turn.handoff_depth + 1, 2)
+            ELSE 0 END AS handoff_depth,
+       channel.project_id,
+       author.agent_id AS source_agent_id,
+       source_turn.requested_by_workspace_member_id AS originating_pilot_member_id,
+       source_turn.id AS source_turn_id,
+       source_request.id AS source_request_message_id,
+       source_request.body AS source_request_body,
        EXISTS (
          SELECT 1 FROM public.project_membership author_project
          WHERE author_project.project_id = channel.project_id
@@ -158,11 +194,21 @@ export async function acceptAgentConversation(
      JOIN public.workspace_member author ON author.id = message.author_workspace_member_id
      LEFT JOIN public.workspace_membership membership ON membership.id = author.pilot_membership_id
      LEFT JOIN public.provider_connection provider ON provider.workspace_id = message.workspace_id
+     LEFT JOIN public.agent_conversation_turn source_turn
+       ON source_turn.response_message_id = message.id
+      AND source_turn.workspace_id = message.workspace_id
+     LEFT JOIN public.workspace_member source_requester
+       ON source_requester.id = source_turn.requested_by_workspace_member_id
+      AND source_requester.workspace_id = source_turn.workspace_id
+     LEFT JOIN public.message source_request
+       ON source_request.id = source_turn.request_message_id
+      AND source_request.workspace_id = source_turn.workspace_id
      WHERE message.id = $1 AND message.workspace_id = $2 AND channel.id = $3`,
     [context.messageId, context.workspaceId, context.channelId, agent.id]
   );
   const ready = readiness.rows[0];
-  const rejection = !ready?.author_is_active_pilot
+  if (agentAuthored && !ready?.valid_agent_handoff) return null;
+  const rejection = !ready?.author_is_active_pilot && !ready?.valid_agent_handoff
     ? 'Active Pilot member access is required.'
     : !ready.author_is_project_member
       ? 'This Channel is not eligible for Agent conversation.'
@@ -222,15 +268,15 @@ export async function acceptAgentConversation(
     `INSERT INTO public.agent_conversation_turn (
        id, workspace_id, conversation_id, request_message_id,
        requested_by_workspace_member_id, status, response_placement,
-       response_parent_message_id, ambient
+       response_parent_message_id, ambient, handoff_depth
      )
-     SELECT $1, $2, $3, message.id, message.author_workspace_member_id, 'queued', $5, $6, $7
+     SELECT $1, $2, $3, message.id, message.author_workspace_member_id, 'queued', $5, $6, $7, $8
      FROM public.message message WHERE message.id = $4 AND message.workspace_id = $2
      ON CONFLICT (request_message_id) DO NOTHING
      RETURNING id`,
     [
       turnId, context.workspaceId, storedConversationId, context.messageId,
-      responsePlacement, responseParentMessageId, ambient
+      responsePlacement, responseParentMessageId, ambient, ready.handoff_depth
     ]
   );
   const storedTurnId = turn.rows[0]?.id ?? (await client.query<{ id: string }>(
@@ -238,6 +284,73 @@ export async function acceptAgentConversation(
     [context.messageId]
   )).rows[0]?.id;
   if (!storedTurnId) throw new Error('Agent conversation turn could not be created');
+  if (agentAuthored) {
+    if (!ready.project_id || !ready.source_agent_id
+      || !ready.originating_pilot_member_id || !ready.source_turn_id) {
+      throw new Error('Agent handoff provenance could not be established');
+    }
+    const question = handoffQuestion(context.body, agent.name);
+    if (!question) throw new Error('Agent handoff must contain a concrete question');
+    const suppliedArtifacts = await client.query<{
+      id: string;
+      kind: string;
+      result_message_id: string;
+      url: string;
+    }>(
+      `SELECT artifact.id, artifact.kind, artifact.result_message_id, artifact.url
+       FROM public.artifact artifact
+       WHERE artifact.workspace_id = $1 AND artifact.project_id = $2
+         AND (
+           strpos($3, artifact.id) > 0
+           OR strpos($3, artifact.url) > 0
+           OR strpos($3, artifact.result_message_id) > 0
+           OR strpos(COALESCE($4, ''), artifact.id) > 0
+           OR strpos(COALESCE($4, ''), artifact.url) > 0
+           OR strpos(COALESCE($4, ''), artifact.result_message_id) > 0
+         )
+       ORDER BY artifact.created_at, artifact.id`,
+      [
+        context.workspaceId,
+        ready.project_id,
+        context.body,
+        ready.source_request_body
+      ]
+    );
+    const artifactReferences = suppliedArtifacts.rows.map((artifact) => ({
+      artifactId: artifact.id,
+      kind: artifact.kind,
+      resultMessageId: artifact.result_message_id,
+      url: artifact.url
+    }));
+    const expectedResponseShape = agent.agent_type === 'research'
+      ? 'structured_finding'
+      : 'concise_text';
+    await client.query(
+      `INSERT INTO public.agent_handoff (
+         id, workspace_id, project_id, originating_pilot_member_id,
+         source_agent_id, target_agent_id, source_message_id, receiving_turn_id,
+         question, context_snapshot, artifact_references, expected_response_shape
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (source_message_id) DO NOTHING`,
+      [
+        randomUUID(), context.workspaceId, ready.project_id,
+        ready.originating_pilot_member_id, ready.source_agent_id, agent.id,
+        context.messageId, storedTurnId, question,
+        {
+          channelId: context.channelId,
+          projectId: ready.project_id,
+          sourceConversationTurnId: ready.source_turn_id,
+          sourceMessageId: context.messageId,
+          originatingRequest: {
+            messageId: ready.source_request_message_id,
+            body: ready.source_request_body
+          }
+        },
+        JSON.stringify(artifactReferences),
+        expectedResponseShape
+      ]
+    );
+  }
   await client.query(
     `UPDATE public.message
      SET agent_mention_status = 'conversation', mentioned_agent_id = $2

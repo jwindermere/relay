@@ -3,7 +3,12 @@ import type { PoolClient } from 'pg';
 export const pilotCollaborationIds = (workspaceId: string) => ({
   projectId: `${workspaceId}:relay-mvp`,
   channelId: `${workspaceId}:agent-work`,
-  agentId: `${workspaceId}:alex`
+  agentId: `${workspaceId}:alex`,
+  agentIds: {
+    engineering: `${workspaceId}:alex`,
+    product: `${workspaceId}:maya`,
+    research: `${workspaceId}:riley`
+  }
 });
 
 export async function createPilotCollaborationSurface(
@@ -11,15 +16,25 @@ export async function createPilotCollaborationSurface(
   workspaceId: string,
   ownerMembershipId: string
 ): Promise<void> {
-  const { projectId, channelId, agentId } = pilotCollaborationIds(workspaceId);
+  const { projectId, channelId, agentIds } = pilotCollaborationIds(workspaceId);
   await client.query(
     `INSERT INTO public.project (id, workspace_id, name) VALUES ($1, $2, 'Relay MVP')`,
     [projectId, workspaceId]
   );
   await client.query(
-    `INSERT INTO public.agent (id, workspace_id, name, role_label)
-     VALUES ($1, $2, 'Alex', 'Engineering agent')`,
-    [agentId, workspaceId]
+    `INSERT INTO public.agent (
+       id, workspace_id, name, agent_type, role_label, instructions, ambient_triggers
+     ) VALUES
+       ($1, $4, 'Alex', 'engineering', 'Engineering agent',
+        'Own software delivery, code investigation, testing, and reviewable repository changes.',
+        ARRAY['code', 'engineering', 'repository', 'github', 'bug', 'test']),
+       ($2, $4, 'Maya', 'product', 'Product manager',
+        'Clarify outcomes, priorities, requirements, trade-offs, and coordinate specialist input.',
+        ARRAY['product', 'priority', 'roadmap', 'requirement', 'customer', 'coordination']),
+       ($3, $4, 'Riley', 'research', 'Research agent',
+        'Investigate questions, assess evidence and sources, and return concise findings.',
+        ARRAY['research', 'evidence', 'source', 'market', 'competitor', 'investigate'])`,
+    [agentIds.engineering, agentIds.product, agentIds.research, workspaceId]
   );
   await client.query(
     `INSERT INTO public.channel (id, workspace_id, project_id, name)
@@ -31,11 +46,12 @@ export async function createPilotCollaborationSurface(
      VALUES ($1, $2, 'pilot', $1)`,
     [ownerMembershipId, workspaceId]
   );
-  const agentWorkspaceMemberId = `${agentId}:member`;
   await client.query(
     `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
-     VALUES ($1, $2, 'agent', $3)`,
-    [agentWorkspaceMemberId, workspaceId, agentId]
+     SELECT agent.id || ':member', agent.workspace_id, 'agent', agent.id
+     FROM public.agent agent
+     WHERE agent.id = ANY($1::text[])`,
+    [[agentIds.engineering, agentIds.product, agentIds.research]]
   );
   await client.query(
     `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
@@ -44,8 +60,10 @@ export async function createPilotCollaborationSurface(
   );
   await client.query(
     `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
-     VALUES ($1, $2, $3)`,
-    [workspaceId, projectId, agentWorkspaceMemberId]
+     SELECT $1, $2, member.id
+     FROM public.workspace_member member
+     WHERE member.agent_id = ANY($3::text[])`,
+    [workspaceId, projectId, [agentIds.engineering, agentIds.product, agentIds.research]]
   );
 }
 
