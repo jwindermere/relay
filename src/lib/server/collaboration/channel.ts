@@ -9,8 +9,12 @@ import { handleAgentRunCommand } from './agent-run-commands.js';
 import { handleWaitingAgentRunReply } from './clarifications.js';
 import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
 import { acceptAgentConversation } from './conversation.js';
+import { acceptCoordinationPlanConstraint } from './coordination-constraints.js';
 import { answerAgentProgressRequest } from './progress.js';
-import { acceptAgentRunSteering } from './steering.js';
+import {
+  acceptAgentRunSteering,
+  parseGuidanceInput
+} from './steering.js';
 import {
   classifyMessageIntent,
   type MessageRoutingDecision
@@ -349,21 +353,29 @@ export async function postChannelMessage(
         parentMessageId,
         body
       });
-      const steeringAccepted = await acceptAgentRunSteering(client, {
+      const constraintContext = {
+        messageId,
+        workspaceId: access.workspace.id,
+        channelId: input.channelId,
+        parentMessageId,
+        body
+      };
+      const guidance = parseGuidanceInput(constraintContext);
+      const coordinationConstraintAccepted = guidance && parentMessageId
+        ? await acceptCoordinationPlanConstraint(client, {
+            ...constraintContext, parentMessageId
+          }, guidance)
+        : false;
+      const guidanceAccepted = coordinationConstraintAccepted
+        || await acceptAgentRunSteering(client, constraintContext, guidance ?? undefined);
+      const agentProgressAnswered = !guidanceAccepted && await answerAgentProgressRequest(client, {
         messageId,
         workspaceId: access.workspace.id,
         channelId: input.channelId,
         parentMessageId,
         body
       });
-      const agentProgressAnswered = !steeringAccepted && await answerAgentProgressRequest(client, {
-        messageId,
-        workspaceId: access.workspace.id,
-        channelId: input.channelId,
-        parentMessageId,
-        body
-      });
-      const agentRunCommandHandled = !steeringAccepted && !agentProgressAnswered && parentMessageId
+      const agentRunCommandHandled = !guidanceAccepted && !agentProgressAnswered && parentMessageId
         ? await handleAgentRunCommand(client, {
             messageId,
             workspaceId: access.workspace.id,
@@ -372,7 +384,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      const approvalAnswered = !steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled && parentMessageId
+      const approvalAnswered = !guidanceAccepted && !agentProgressAnswered && !agentRunCommandHandled && parentMessageId
         ? await handleApprovalReply(client, {
             messageId,
             workspaceId: access.workspace.id,
@@ -381,7 +393,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      const waitingAgentRunReply = !steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
+      const waitingAgentRunReply = !guidanceAccepted && !agentProgressAnswered && !agentRunCommandHandled
         && !approvalAnswered && parentMessageId
         ? await handleWaitingAgentRunReply(client, {
             messageId,
@@ -391,7 +403,7 @@ export async function postChannelMessage(
             body
           })
         : false;
-      if (!steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
+      if (!guidanceAccepted && !agentProgressAnswered && !agentRunCommandHandled
         && !approvalAnswered && !waitingAgentRunReply) {
         const conversation = routingDecision?.intent === 'engineering_delegation'
           ? null

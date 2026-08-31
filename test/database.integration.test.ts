@@ -178,6 +178,7 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'collaboration_feedback' },
       { table_schema: 'public', table_name: 'coordination_budget_reservation' },
       { table_schema: 'public', table_name: 'coordination_plan' },
+      { table_schema: 'public', table_name: 'coordination_plan_constraint' },
       { table_schema: 'public', table_name: 'coordination_plan_step' },
       { table_schema: 'public', table_name: 'finding_evidence' },
       { table_schema: 'public', table_name: 'github_broker_decision' },

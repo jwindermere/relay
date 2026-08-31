@@ -412,11 +412,13 @@ export async function claimCoordinationStep(
     const step = await client.query<{
       id: string; target_agent_id: string; instruction: string; expected_output: string;
       artifact_id: string | null;
+      constraints: string[];
       workspace_id: string; project_id: string; source_message_id: string;
       channel_id: string; root_message_id: string; coordinator_member_id: string;
       originating_pilot_member_id: string; provider_connection_id: string;
     }>(
       `SELECT step.id, step.target_agent_id, step.instruction, step.expected_output, step.artifact_id,
+              plan.constraints,
               step.workspace_id, step.project_id, plan.source_message_id,
               source.channel_id, COALESCE(source.parent_message_id, source.id) AS root_message_id,
               coordinator_member.id AS coordinator_member_id,
@@ -481,6 +483,16 @@ export async function claimCoordinationStep(
       return null;
     }
     const reservationId = randomUUID();
+    const pendingConstraints = await client.query<{ id: string; guidance: string }>(
+      `SELECT id, guidance FROM public.coordination_plan_constraint
+       WHERE plan_id = $1 AND status = 'pending'
+       ORDER BY ordinal FOR UPDATE`,
+      [planId]
+    );
+    const effectiveConstraints = [
+      ...step.rows[0].constraints,
+      ...pendingConstraints.rows.map(({ guidance }) => guidance)
+    ];
     await client.query(
       `INSERT INTO public.coordination_budget_reservation (
          id, workspace_id, plan_id, step_id, reservation_kind
@@ -492,6 +504,11 @@ export async function claimCoordinationStep(
       [step.rows[0].id]
     );
     const requestMessageId = `coordination-step:${step.rows[0].id}`;
+    const requestBody = effectiveConstraints.length === 0
+      ? step.rows[0].instruction
+      : `${step.rows[0].instruction}\n\nApproved coordination constraints:\n${
+          effectiveConstraints.map((constraint) => `- ${constraint}`).join('\n')
+        }`;
     const conversationId = randomUUID();
     const turnId = randomUUID();
     await client.query(
@@ -500,7 +517,7 @@ export async function claimCoordinationStep(
        ) VALUES ($1, $2, $3, $4, $5, $6)`,
       [requestMessageId, step.rows[0].workspace_id, step.rows[0].channel_id,
         step.rows[0].coordinator_member_id, step.rows[0].root_message_id,
-        step.rows[0].instruction]
+        requestBody]
     );
     await client.query(
       `INSERT INTO public.agent_conversation (
@@ -537,10 +554,19 @@ export async function claimCoordinationStep(
     );
     await client.query(
       `UPDATE public.coordination_plan
-       SET status = 'active', started_at = COALESCE(started_at, now()), updated_at = now()
+       SET status = 'active', constraints = $2,
+           started_at = COALESCE(started_at, now()), updated_at = now()
        WHERE id = $1`,
-      [planId]
+      [planId, JSON.stringify(effectiveConstraints)]
     );
+    if (pendingConstraints.rows.length > 0) {
+      await client.query(
+        `UPDATE public.coordination_plan_constraint
+         SET status = 'delivered', delivery_conversation_turn_id = $2, delivered_at = now()
+         WHERE id = ANY($1::text[]) AND status = 'pending'`,
+        [pendingConstraints.rows.map(({ id }) => id), turnId]
+      );
+    }
     await client.query('COMMIT');
     return { stepId: step.rows[0].id, agentId: step.rows[0].target_agent_id, instruction: step.rows[0].instruction };
   } catch (error) {

@@ -44,6 +44,7 @@ interface ClaimedConversationTurn {
   lease_token: string;
   recovering: boolean;
   routing_intent: string | null;
+  eligible: boolean;
 }
 
 export type ConversationWorkerResult =
@@ -64,6 +65,17 @@ export async function processNextConversationTurn(
     new Date()
   );
   if (!claim) return { kind: 'idle' };
+
+  if (!claim.eligible) {
+    await finishConversationTurn(
+      pool,
+      claim,
+      'I could not continue because this Agent is disabled or is no longer a member of this Project.',
+      'failed',
+      'agent_unavailable'
+    );
+    return { kind: 'conversation', conversationTurnId: claim.id, status: 'failed' };
+  }
 
   if (claim.recovering) {
     await finishConversationTurn(
@@ -221,6 +233,11 @@ async function claimNextConversationTurn(
               COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
               connection.credential_store_reference,
+              agent.enabled AND agent.status <> 'disabled' AND EXISTS (
+                SELECT 1 FROM public.project_membership agent_project
+                WHERE agent_project.workspace_member_id = agent_member.id
+                  AND agent_project.project_id = channel.project_id
+              ) AS eligible,
               (turn.lease_expires_at IS NOT NULL AND turn.lease_expires_at <= $1) AS recovering
        FROM public.agent_conversation_turn turn
        JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
@@ -232,15 +249,11 @@ async function claimNextConversationTurn(
        JOIN public.workspace_member agent_member
          ON agent_member.agent_id = conversation.agent_id
         AND agent_member.workspace_id = conversation.workspace_id
-       JOIN public.project_membership agent_project
-         ON agent_project.workspace_member_id = agent_member.id
-        AND agent_project.project_id = channel.project_id
        JOIN public.agent agent ON agent.id = conversation.agent_id
        WHERE (
            (turn.status = 'queued' AND turn.available_at <= $1 AND turn.lease_expires_at IS NULL)
            OR (turn.status = 'working' AND turn.lease_expires_at <= $1)
          )
-         AND agent.enabled = true AND agent.status <> 'disabled'
          AND NOT EXISTS (
            SELECT 1 FROM public.agent_conversation_turn earlier
            WHERE earlier.conversation_id = turn.conversation_id

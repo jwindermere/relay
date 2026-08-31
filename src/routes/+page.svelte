@@ -1043,6 +1043,17 @@
         · {plan.budget.maxElapsedSeconds}s max
         · provider usage {plan.budget.providerUsage.known ? `${plan.budget.providerUsage.consumed}/${plan.budget.providerUsage.limit ?? '∞'}` : 'unknown'}
       </p>
+      {#if plan.constraints.length > 0}
+        <p class="mt-1 text-info">Active constraints: {plan.constraints.join('; ')}</p>
+      {/if}
+      {#if plan.constraintInputs.some((constraint) => constraint.status === 'pending')}
+        <p class="mt-1 text-warning">
+          Pending constraints: {plan.constraintInputs
+            .filter((constraint) => constraint.status === 'pending')
+            .map((constraint) => constraint.guidance)
+            .join('; ')}
+        </p>
+      {/if}
       <ol class="mt-2 list-inside list-decimal space-y-1">
         {#each plan.steps as step}
           <li>

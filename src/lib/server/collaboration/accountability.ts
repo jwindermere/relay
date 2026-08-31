@@ -111,6 +111,11 @@ export async function loadCollaborationAccountability(
       max_elapsed_seconds: number; provider_usage_limit: string | null;
       provider_usage_consumed: string | null; provider_usage_known: boolean;
       steps: VisibleCoordinationStep[]; consumed_handoffs: number;
+      constraint_inputs: Array<{
+        id: string; sourceMessageId: string; guidance: string; ordinal: number;
+        status: 'pending' | 'delivered'; deliveryConversationTurnId: string | null;
+        suppliedBy: string; createdAt: string;
+      }>;
     }>(
       `SELECT plan.id, plan.source_message_id, plan.goal, plan.constraints, plan.status, plan.allow_parallel,
               plan.max_participants, plan.max_handoffs, plan.max_depth, plan.max_agent_runs,
@@ -124,7 +129,26 @@ export async function loadCollaborationAccountability(
                 'artifactId', step.artifact_id
               ) ORDER BY step.position, step.id) FILTER (WHERE step.id IS NOT NULL), '[]') AS steps,
               (SELECT count(*)::integer FROM public.coordination_budget_reservation reservation
-               WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'handoff') AS consumed_handoffs
+               WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'handoff') AS consumed_handoffs,
+              COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'id', constraint_input.id,
+                  'sourceMessageId', constraint_input.source_message_id,
+                  'guidance', constraint_input.guidance,
+                  'ordinal', constraint_input.ordinal,
+                  'status', constraint_input.status,
+                  'deliveryConversationTurnId', constraint_input.delivery_conversation_turn_id,
+                  'suppliedBy', pilot_user.name,
+                  'createdAt', constraint_input.created_at
+                ) ORDER BY constraint_input.ordinal)
+                FROM public.coordination_plan_constraint constraint_input
+                JOIN public.workspace_member supplied_by
+                  ON supplied_by.id = constraint_input.supplied_by_workspace_member_id
+                JOIN public.workspace_membership pilot
+                  ON pilot.id = supplied_by.pilot_membership_id
+                JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+                WHERE constraint_input.plan_id = plan.id
+              ), '[]') AS constraint_inputs
        FROM public.coordination_plan plan
        LEFT JOIN public.coordination_plan_step step ON step.plan_id = plan.id
        LEFT JOIN public.agent agent ON agent.id = step.target_agent_id
@@ -248,6 +272,7 @@ export async function loadCollaborationAccountability(
     plans: plans.rows.map((row) => ({
       id: row.id, sourceMessageId: row.source_message_id, goal: row.goal,
       constraints: row.constraints, status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
+      constraintInputs: row.constraint_inputs,
       budget: {
         maxParticipants: row.max_participants, maxHandoffs: row.max_handoffs,
         consumedHandoffs: row.consumed_handoffs, maxDepth: row.max_depth,
