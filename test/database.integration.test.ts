@@ -718,6 +718,7 @@ if (connectionString) {
       confidence: 1,
       policyVersion: 'rules-v1',
       rationale: 'No eligible Agent mention or active Agent conversation was found.',
+      requiresConfirmation: false,
       correctedAt: null
     });
 
@@ -751,6 +752,111 @@ if (connectionString) {
          WHERE task.source_message_id = $1) AS runs
     `, [message.id]);
     assert.deepEqual(work.rows[0], { tasks: 0, runs: 0 });
+  });
+
+  test('the Message intent decision selects the only Agent considered for a Message', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+
+    const message = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex could you discuss the rollout with @Riley?'
+    });
+
+    assert.equal(message.routingDecision?.intent, 'conversation');
+    assert.equal(message.routingDecision?.targetAgentId, `${memberAccess.workspace.id}:alex`);
+    assert.equal(message.agentMention?.status, 'rejected');
+    assert.equal(message.agentMention?.agentId, message.routingDecision?.targetAgentId);
+  });
+
+  test('research and repository-affecting Message intent decisions wait for Pilot member confirmation', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+
+    const research = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Riley research the rollout evidence.'
+    });
+    assert.equal(research.routingDecision?.intent, 'research_request');
+    assert.equal(research.agentMention, null);
+    await assert.rejects(
+      correctMessageIntent(pool, memberAccess, research.id, {
+        intent: 'engineering_delegation',
+        targetAgentId: `${memberAccess.workspace.id}:riley`
+      }),
+      /Corrected engineering Agent is unavailable/
+    );
+    await correctMessageIntent(pool, memberAccess, research.id, { intent: 'research_request' });
+    const confirmedResearch = (await loadSharedAgentChannel(pool, memberAccess)).messages
+      .find(({ id }) => id === research.id);
+    assert.equal(confirmedResearch?.agentMention?.status, 'rejected');
+
+    const engineering = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex fix the progress view.'
+    });
+    assert.equal(engineering.routingDecision?.intent, 'engineering_delegation');
+    assert.equal(engineering.agentMention, null);
+  });
+
+  test('a Pilot member correction retargets a queued Agent conversation without editing the Message', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+    await pool.query(
+      `INSERT INTO public.provider_connection (
+         id, workspace_id, owner_membership_id, status,
+         credential_store_reference, connected_at
+       )
+       SELECT $2, $1, membership.id, 'ready', $3, now()
+       FROM public.workspace_membership membership
+       WHERE membership.workspace_id = $1 AND membership.role = 'owner'
+       ON CONFLICT (workspace_id) DO UPDATE
+       SET status = 'ready', connected_at = COALESCE(provider_connection.connected_at, now())`,
+      [memberAccess.workspace.id, `${memberAccess.workspace.id}:intent-provider`,
+        `codex:${memberAccess.workspace.id}:intent-retarget`]
+    );
+
+    const message = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex hello.'
+    });
+    assert.equal(message.agentMention?.status, 'conversation');
+    await correctMessageIntent(pool, memberAccess, message.id, {
+      intent: 'conversation',
+      targetAgentId: `${memberAccess.workspace.id}:riley`
+    });
+
+    const retargeted = await pool.query<{ agent_id: string; status: string }>(
+      `SELECT conversation.agent_id, turn.status
+       FROM public.agent_conversation_turn turn
+       JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
+       WHERE turn.request_message_id = $1`,
+      [message.id]
+    );
+    assert.deepEqual(retargeted.rows, [{
+      agent_id: `${memberAccess.workspace.id}:riley`, status: 'queued'
+    }]);
+    const corrected = (await loadSharedAgentChannel(pool, memberAccess)).messages
+      .find(({ id }) => id === message.id);
+    assert.equal(corrected?.body, '@Alex hello.');
+    assert.equal(corrected?.routingDecision?.targetAgentId, `${memberAccess.workspace.id}:riley`);
+
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+       WHERE request_message_id = $1`,
+      [message.id]
+    );
+    await pool.query(
+      `UPDATE public.provider_connection SET status = 'disconnected' WHERE workspace_id = $1`,
+      [memberAccess.workspace.id]
+    );
   });
 
   test('an ineligible Agent mention retains its Message without partial work', async () => {
@@ -1275,7 +1381,7 @@ if (connectionString) {
     const unsafeRepository = await postChannelMessage(pool, memberAccess, {
       channelId: channel.channel.id,
       body: '@Alex investigate the reconnect failure.'
-    }, mentionDependencies);
+    });
     await correctMessageIntent(pool, memberAccess, unsafeRepository.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const unsafeRepositoryAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1292,7 +1398,7 @@ if (connectionString) {
     const unsafe = await postChannelMessage(pool, memberAccess, {
       channelId: channel.channel.id,
       body: '@Alex please deploy this directly to production.'
-    }, mentionDependencies);
+    });
     await correctMessageIntent(pool, memberAccess, unsafe.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const unsafeAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1312,7 +1418,7 @@ if (connectionString) {
       const rejected = await postChannelMessage(pool, memberAccess, {
         channelId: channel.channel.id,
         body: forbiddenRequest
-      }, mentionDependencies);
+      });
       await correctMessageIntent(pool, memberAccess, rejected.id,
         { intent: 'engineering_delegation' }, mentionDependencies);
       const rejectedAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1327,7 +1433,7 @@ if (connectionString) {
     const atCapacity = await postChannelMessage(pool, memberAccess, {
       channelId: channel.channel.id,
       body: '@Alex investigate another reconnect failure.'
-    }, mentionDependencies);
+    });
     await correctMessageIntent(pool, memberAccess, atCapacity.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const atCapacityAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1349,12 +1455,12 @@ if (connectionString) {
         channelId: channel.channel.id,
         body: request,
         submissionId
-      }, mentionDependencies),
+      }),
       postChannelMessage(pool, memberAccess, {
         channelId: channel.channel.id,
         body: request,
         submissionId
-      }, mentionDependencies)
+      })
     ]);
     assert.equal(first.id, retry.id);
     assert.equal(first.body, retry.body);
@@ -1365,7 +1471,7 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex this retry must not retarget the accepted work.',
       submissionId
-    }, mentionDependencies);
+    });
     assert.equal(conflictingRetry.id, first.id);
     assert.equal(conflictingRetry.body, request);
     await correctMessageIntent(pool, memberAccess, first.id,
@@ -1514,7 +1620,7 @@ if (connectionString) {
           channelId: channel.channel.id,
           body: '@Alex prove the transaction rolls back.',
           submissionId: failedSubmissionId
-        }, mentionDependencies),
+        }),
         /test outbox failure/
       );
     } finally {

@@ -31,6 +31,7 @@ interface MentionContext {
   workspaceId: string;
   channelId: string;
   body: string;
+  targetAgentId?: string | null;
   getRepositoryGateway?: () => GitHubRepositoryGateway;
 }
 
@@ -80,6 +81,16 @@ const forbiddenAutonomousRequestPatterns: Array<{ pattern: RegExp; reason: strin
 export function explicitAgentMentionPattern(agentName: string): RegExp {
   const escaped = agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   return new RegExp(`(?<![\\p{L}\\p{N}_.+@-])@${escaped}(?![\\p{L}\\p{N}_-])`, 'iu');
+}
+
+export function resolveMessageAgentTarget<T extends { id: string; name: string }>(
+  agents: T[],
+  body: string,
+  targetAgentId?: string | null
+): T | undefined {
+  return targetAgentId
+    ? agents.find(({ id }) => id === targetAgentId)
+    : agents.find(({ name }) => explicitAgentMentionPattern(name).test(body));
 }
 
 export function isConcreteEngineeringRequest(body: string, agentName: string): boolean {
@@ -139,7 +150,7 @@ export async function acceptEligibleAgentMention(
      FOR UPDATE`,
     [context.workspaceId]
   );
-  const agent = agents.rows.find(({ name }) => explicitAgentMentionPattern(name).test(context.body));
+  const agent = resolveMessageAgentTarget(agents.rows, context.body, context.targetAgentId);
   if (!agent) return null;
 
   const scope = await client.query<{

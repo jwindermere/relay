@@ -80,6 +80,10 @@
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
   let accountability = $derived(realtimeAccountability ?? data.accountability);
   const feedbackRatings = ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as const;
+  const messageIntents = [
+    'ordinary_communication', 'conversation', 'research_request', 'engineering_delegation',
+    'progress_request', 'human_authority_decision', 'coordination_candidate'
+  ] as const;
   let filteredInbox = $derived(accountability.inbox.filter((item) =>
     (inboxAgentFilter === 'all' || item.agentId === inboxAgentFilter)
     && (inboxStateFilter === 'all' || item.state === inboxStateFilter)
@@ -881,11 +885,11 @@
     }
   }
 
-  async function correctIntent(messageId: string, intent: string) {
+  async function correctIntent(messageId: string, intent: string, targetAgentId?: string) {
     const response = await fetch(`/api/workspace/messages/${encodeURIComponent(messageId)}/intent`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ intent })
+      body: JSON.stringify({ intent, ...(targetAgentId ? { targetAgentId } : {}) })
     });
     const result = response.status === 204 ? null : await response.json();
     if (!response.ok) {
@@ -893,6 +897,33 @@
       return;
     }
     await invalidateAll();
+  }
+
+  async function promptIntentCorrection(
+    message: (typeof data.sharedChannel.messages)[number]
+  ) {
+    const intent = window.prompt(
+      `Choose Message intent:\n${messageIntents.join('\n')}`,
+      message.routingDecision?.intent
+    )?.trim();
+    if (!intent || !messageIntents.includes(intent as (typeof messageIntents)[number])) return;
+    let targetAgentId: string | undefined;
+    if (intent === 'engineering_delegation' || intent === 'research_request') {
+      const agents = sidebarMembers.filter(({ kind }) => kind === 'agent');
+      const currentName = agents.find(({ id }) => id === message.routingDecision?.targetAgentId)?.name;
+      const targetName = window.prompt(
+        `Choose target Agent:\n${agents.map(({ name }) => name).join('\n')}`,
+        currentName
+      )?.trim();
+      if (!targetName) return;
+      targetAgentId = agents.find(({ name }) =>
+        name.toLocaleLowerCase() === targetName.toLocaleLowerCase())?.id;
+      if (!targetAgentId) {
+        agentMessage = 'Target Agent was not found.';
+        return;
+      }
+    }
+    await correctIntent(message.id, intent, targetAgentId);
   }
 
   async function setMemoryLifecycle(memoryId: string, lifecycle: 'archived' | 'deleted') {
@@ -983,9 +1014,11 @@
       <span class="badge badge-ghost badge-xs">{message.routingDecision.intent.replaceAll('_', ' ')}</span>
       <span>{Math.round(message.routingDecision.confidence * 100)}% · {message.routingDecision.rationale}</span>
       {#if message.routingDecision.correctedAt}<span class="text-info">Pilot corrected</span>{/if}
-      {#if message.routingDecision.intent === 'engineering_delegation' && !message.routingDecision.correctedAt}
-        <button class="btn btn-primary btn-xs" type="button" onclick={() => void correctIntent(message.id, 'engineering_delegation')}>Confirm engineering work</button>
-        <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctIntent(message.id, 'conversation')}>Treat as conversation</button>
+      {#if !message.routingDecision.correctedAt}
+        {#if message.routingDecision.requiresConfirmation}
+          <button class="btn btn-primary btn-xs" type="button" onclick={() => void correctIntent(message.id, message.routingDecision!.intent)}>Confirm interpretation</button>
+        {/if}
+        <button class="btn btn-ghost btn-xs" type="button" onclick={() => void promptIntentCorrection(message)}>Correct interpretation</button>
       {/if}
     </p>
   {/if}

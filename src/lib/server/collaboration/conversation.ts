@@ -5,7 +5,8 @@ import type { AgentMentionResult } from './delegation.js';
 import { loadChannelContextBeforeMessage } from './channel-context.js';
 import {
   explicitAgentMentionPattern,
-  isConcreteEngineeringRequest
+  isConcreteEngineeringRequest,
+  resolveMessageAgentTarget
 } from './delegation.js';
 
 export { isConcreteEngineeringRequest } from './delegation.js';
@@ -16,6 +17,7 @@ interface ConversationContext {
   channelId: string;
   parentMessageId: string | null;
   body: string;
+  targetAgentId?: string | null;
 }
 
 interface AgentCandidate {
@@ -29,6 +31,7 @@ interface AgentCandidate {
   reply_mode: 'adaptive' | 'channel' | 'thread';
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
+  configuration_version: number;
 }
 
 function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean {
@@ -71,14 +74,12 @@ export async function acceptAgentConversation(
 ): Promise<AgentMentionResult> {
   const agents = await client.query<AgentCandidate>(
     `SELECT id, name, agent_type, role_label, instructions, participation_mode,
-            ambient_triggers, reply_mode, enabled, status
+            ambient_triggers, reply_mode, enabled, status, configuration_version
      FROM public.agent WHERE workspace_id = $1
      ORDER BY length(name) DESC, id`,
     [context.workspaceId]
   );
-  const mentioned = agents.rows.find(({ name }) =>
-    explicitAgentMentionPattern(name).test(context.body)
-  );
+  const targetAgent = resolveMessageAgentTarget(agents.rows, context.body, context.targetAgentId);
   const requestAuthor = await client.query<{
     kind: 'pilot' | 'agent';
     agent_id: string | null;
@@ -94,7 +95,7 @@ export async function acceptAgentConversation(
   const agentAuthored = requestAuthor.rows[0]?.kind === 'agent';
   // Agent output is only routable as an explicit, bounded handoff. In particular,
   // a reply in an existing Thread must not implicitly wake the same Agent again.
-  if (agentAuthored && !mentioned) return null;
+  if (agentAuthored && !targetAgent) return null;
   const rootMessageId = context.parentMessageId ?? context.messageId;
   const existing = context.parentMessageId
     ? await client.query<{ id: string; agent_id: string }>(
@@ -118,7 +119,7 @@ export async function acceptAgentConversation(
     ? agents.rows.find(({ id }) => id === existing.rows[0]!.agent_id)
     : undefined;
   let ambient = false;
-  let agent = mentioned ?? inherited;
+  let agent = targetAgent ?? inherited;
   if (!agent) {
     const taskOwner = context.parentMessageId
       ? await client.query<{ assigned_agent_id: string }>(
@@ -156,7 +157,7 @@ export async function acceptAgentConversation(
   }
   if (!agent) return null;
   if (agentAuthored && !requestsBoundedSpecialistInput(context.body, agent.name)) return null;
-  if (mentioned && (
+  if (targetAgent && (
     (agent.agent_type === 'engineering' && isConcreteEngineeringRequest(context.body, agent.name))
   )) return null;
 
@@ -244,8 +245,11 @@ export async function acceptAgentConversation(
     return { status: 'rejected', agentId: agent.id, reason: rejection };
   }
 
-  const conversationId = existing.rows[0]?.id ?? randomUUID();
-  if (!existing.rows[0]) {
+  const selectedConversation = existing.rows[0]?.agent_id === agent.id
+    ? existing.rows[0]
+    : undefined;
+  const conversationId = selectedConversation?.id ?? randomUUID();
+  if (!selectedConversation) {
     await client.query(
       `INSERT INTO public.agent_conversation (
          id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
@@ -261,7 +265,7 @@ export async function acceptAgentConversation(
       ]
     );
   }
-  const storedConversationId = existing.rows[0]?.id ?? (await client.query<{ id: string }>(
+  const storedConversationId = selectedConversation?.id ?? (await client.query<{ id: string }>(
     `SELECT id FROM public.agent_conversation
      WHERE workspace_id = $1 AND root_message_id = $2 AND agent_id = $3`,
     [context.workspaceId, rootMessageId, agent.id]
@@ -297,6 +301,21 @@ export async function acceptAgentConversation(
     [context.messageId]
   )).rows[0]?.id;
   if (!storedTurnId) throw new Error('Agent conversation turn could not be created');
+  if (!turn.rows[0]) {
+    const retargeted = await client.query(
+      `UPDATE public.agent_conversation_turn
+       SET conversation_id = $2, response_placement = $3,
+           response_parent_message_id = $4, ambient = $5,
+           agent_configuration_version = $6, agent_type_snapshot = $7,
+           updated_at = now()
+       WHERE id = $1 AND status = 'queued'`,
+      [storedTurnId, storedConversationId, responsePlacement, responseParentMessageId,
+        ambient, agent.configuration_version, agent.agent_type]
+    );
+    if (retargeted.rowCount !== 1) {
+      throw new Error('Agent conversation cannot be retargeted after execution starts');
+    }
+  }
   if (agentAuthored) {
     if (!routingContext.project_id || !routingContext.source_agent_id
       || !routingContext.originating_pilot_member_id || !routingContext.source_turn_id) {

@@ -19,7 +19,6 @@ import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliat
 import { loadCollaborationAccountability } from '$lib/server/collaboration/accountability.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
 import { isJitsiEmbeddingEnabled } from '$lib/server/configuration.js';
-import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 import { loadLinkedRepository } from '$lib/server/github/connection.js';
 import { loadProviderConnection } from '$lib/server/provider/connection.js';
 
@@ -102,8 +101,7 @@ export const actions = {
           body,
           submissionId,
           ...(typeof parentMessageId === 'string' && parentMessageId ? { parentMessageId } : {})
-        },
-        { getRepositoryGateway: getGitHubRepositoryGateway }
+        }
       );
       return { sent: true };
     } catch (error) {
