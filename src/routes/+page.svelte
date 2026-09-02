@@ -757,7 +757,8 @@
           participationMode: agentParticipation,
           ambientTriggers: agentTopics.split(',').map((topic) => topic.trim()).filter(Boolean),
           replyMode: agentReplyMode,
-          enabled: agentEnabled
+          enabled: agentEnabled,
+          projectId: data.sharedChannel.project.id
         })
       });
       const result = response.status === 204 ? {} : await response.json();
@@ -780,7 +781,10 @@
       const response = await fetch('/api/workspace/agent-templates', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ key: selectedAgentTemplate.key })
+        body: JSON.stringify({
+          key: selectedAgentTemplate.key,
+          projectId: data.sharedChannel.project.id
+        })
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.message ?? 'Agent template could not be instantiated');

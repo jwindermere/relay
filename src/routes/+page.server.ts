@@ -35,8 +35,8 @@ export async function load({ request }) {
       getRelayAuth(),
       request.headers
     );
-    const [sharedChannel, providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces, agentTemplateCapabilities] = await Promise.all([
-      loadSharedAgentChannel(pool, access),
+    const sharedChannel = await loadSharedAgentChannel(pool, access);
+    const [providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces, agentTemplateCapabilities] = await Promise.all([
       loadProviderConnection(pool, access),
       loadLinkedRepository(pool, access),
       pool.query<{ name: string }>(
@@ -45,7 +45,7 @@ export async function load({ request }) {
       ),
       loadWorkspaceAgents(pool, access),
       loadAvailableWorkspaces(pool, access),
-      loadAvailableAgentTemplateCapabilities(pool, access)
+      loadAvailableAgentTemplateCapabilities(pool, access, sharedChannel.project.id)
     ]);
     const [reconciliation, activeCall, accountability] = await Promise.all([
       loadChannelReconciliation(pool, access, sharedChannel.channel.id, {}),

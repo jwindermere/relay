@@ -671,9 +671,12 @@ if (connectionString) {
       auth,
       new Headers({ cookie: ownerCookie.split(';', 1)[0] })
     );
+    const projectId = (await loadSharedAgentChannel(pool, ownerAccess)).project.id;
     const existingAgents = (await loadWorkspaceAgents(pool, ownerAccess)).agents;
-    const availableCapabilities = await loadAvailableAgentTemplateCapabilities(pool, ownerAccess);
-    const created = await instantiateAgentTemplate(pool, ownerAccess, 'designer', {
+    const availableCapabilities = await loadAvailableAgentTemplateCapabilities(
+      pool, ownerAccess, projectId
+    );
+    const created = await instantiateAgentTemplate(pool, ownerAccess, projectId, 'designer', {
       availableCapabilities,
       existingAgents,
       name: 'Journey Designer',
@@ -684,6 +687,16 @@ if (connectionString) {
 
     assert.deepEqual(created.agent.templateProvenance, { key: 'designer', version: 2 });
     assert.deepEqual(created.disabledCapabilities, ['design_assets']);
+    const createdMembership = await pool.query<{ project_id: string }>(
+      `SELECT membership.project_id
+       FROM public.project_membership membership
+       JOIN public.workspace_member member
+         ON member.id = membership.workspace_member_id
+        AND member.workspace_id = membership.workspace_id
+       WHERE member.agent_id = $1`,
+      [created.agent.id]
+    );
+    assert.deepEqual(createdMembership.rows, [{ project_id: projectId }]);
     await updateWorkspaceAgent(pool, ownerAccess, created.agent.id, {
       ...created.agent,
       roleLabel: 'Activation designer',
@@ -704,6 +717,99 @@ if (connectionString) {
         roleLabel: 'Engineering designer'
       }),
       /permission ceiling/i
+    );
+  });
+
+  test('Agent template preview and instantiation stay in the explicitly selected Project', async () => {
+    const auth = createTestAuth();
+    const signIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({ email: 'owner@example.com', password: 'correct horse battery staple' })
+    }));
+    const ownerCookie = signIn.headers.get('set-cookie');
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const ownerMember = await pool.query<{ id: string }>(
+      `SELECT id FROM public.workspace_member
+       WHERE workspace_id = $1 AND pilot_membership_id = $2`,
+      [ownerAccess.workspace.id, ownerAccess.membership.id]
+    );
+    assert.ok(ownerMember.rows[0]);
+    const selectedProjectId = randomUUID();
+    const inaccessibleProjectId = randomUUID();
+    const foreignWorkspaceId = randomUUID();
+    const foreignProjectId = randomUUID();
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name) VALUES
+         ($1, $3, 'Selected Project'),
+         ($2, $3, 'Inaccessible Project')`,
+      [selectedProjectId, inaccessibleProjectId, ownerAccess.workspace.id]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ownerAccess.workspace.id, selectedProjectId, ownerMember.rows[0].id]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace (id, name) VALUES ($1, 'Foreign Workspace')`,
+      [foreignWorkspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ($1, $2, 'Foreign Project')`,
+      [foreignProjectId, foreignWorkspaceId]
+    );
+
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, selectedProjectId),
+      ['project_data']
+    );
+    await assert.rejects(
+      loadAvailableAgentTemplateCapabilities(pool, ownerAccess, inaccessibleProjectId),
+      /active Project membership is required/
+    );
+    await assert.rejects(
+      loadAvailableAgentTemplateCapabilities(pool, ownerAccess, foreignProjectId),
+      /active Project membership is required/
+    );
+
+    const created = await instantiateAgentTemplate(
+      pool,
+      ownerAccess,
+      selectedProjectId,
+      'support',
+      {
+        availableCapabilities: ['project_data'],
+        existingAgents: (await loadWorkspaceAgents(pool, ownerAccess)).agents,
+        name: 'Selected Project Support'
+      }
+    );
+    const membership = await pool.query<{ project_id: string }>(
+      `SELECT project_membership.project_id
+       FROM public.project_membership project_membership
+       JOIN public.workspace_member member
+         ON member.id = project_membership.workspace_member_id
+        AND member.workspace_id = project_membership.workspace_id
+       WHERE member.agent_id = $1`,
+      [created.agent.id]
+    );
+    assert.deepEqual(membership.rows, [{ project_id: selectedProjectId }]);
+    await assert.rejects(
+      instantiateAgentTemplate(pool, ownerAccess, inaccessibleProjectId, 'support', {
+        availableCapabilities: [], existingAgents: [], name: 'Inaccessible Project Support'
+      }),
+      /active Project membership is required/
+    );
+    await assert.rejects(
+      instantiateAgentTemplate(pool, ownerAccess, foreignProjectId, 'support', {
+        availableCapabilities: [], existingAgents: [], name: 'Foreign Project Support'
+      }),
+      /active Project membership is required/
     );
   });
 
@@ -1284,6 +1390,7 @@ if (connectionString) {
       new Headers({ cookie: ownerCookie.split(';', 1)[0] })
     );
     const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const projectId = (await loadSharedAgentChannel(pool, ownerAccess)).project.id;
     const inspected: GitHubRepositoryEvidence[] = [];
     let inspectionFails = false;
     let evidence = protectedRepositoryEvidence();
@@ -1298,7 +1405,7 @@ if (connectionString) {
     };
 
     assert.deepEqual(
-      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess),
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, projectId),
       ['project_data']
     );
 
@@ -1328,7 +1435,7 @@ if (connectionString) {
       releaseBranches: ['release']
     });
     assert.deepEqual(
-      await loadAvailableAgentTemplateCapabilities(pool, memberAccess),
+      await loadAvailableAgentTemplateCapabilities(pool, memberAccess, projectId),
       ['project_data', 'repository_read']
     );
     const linkedProject = await pool.query<{ project_id: string }>(
@@ -1346,7 +1453,7 @@ if (connectionString) {
       [ownerAccess.workspace.id, otherProjectId]
     );
     assert.deepEqual(
-      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess),
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, projectId),
       ['project_data']
     );
     await pool.query(
@@ -1451,7 +1558,7 @@ if (connectionString) {
     assert.equal(disabled.githubConnectionState, 'disabled');
     assert.equal(disabled.readyForAutonomousWork, false);
     assert.deepEqual(
-      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess),
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, projectId),
       ['project_data']
     );
     const disabledVerification = await verifyLinkedRepository(pool, ownerAccess, gateway);

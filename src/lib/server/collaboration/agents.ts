@@ -164,6 +164,7 @@ export async function loadWorkspaceAgents(
 export async function createWorkspaceAgent(
   pool: Pool,
   access: WorkspaceAccess,
+  projectId: string,
   input: AgentInput,
   provenance?: {
     key: string; version: number; snapshot: object;
@@ -178,10 +179,24 @@ export async function createWorkspaceAgent(
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
     const project = await client.query<{ id: string }>(
-      'SELECT id FROM public.project WHERE workspace_id = $1 ORDER BY created_at, id LIMIT 1 FOR SHARE',
-      [access.workspace.id]
+      `SELECT project.id FROM public.project project
+       JOIN public.project_membership project_member
+         ON project_member.workspace_id = project.workspace_id
+        AND project_member.project_id = project.id
+       JOIN public.workspace_member member
+         ON member.workspace_id = project.workspace_id
+        AND member.id = project_member.workspace_member_id
+       JOIN public.workspace_membership membership
+         ON membership.workspace_id = member.workspace_id
+        AND membership.id = member.pilot_membership_id
+       WHERE project.workspace_id = $1
+         AND project.id = $2
+         AND membership.id = $3
+         AND membership.revoked_at IS NULL
+       FOR SHARE OF project, project_member, member, membership`,
+      [access.workspace.id, projectId, access.membership.id]
     );
-    if (!project.rows[0]) throw new AgentConfigurationError('A Project is required before adding an Agent');
+    if (!project.rows[0]) throw new WorkspaceAccessError('active Project membership is required');
     const id = randomUUID();
     const memberId = `${id}:member`;
     const inserted = await client.query<{

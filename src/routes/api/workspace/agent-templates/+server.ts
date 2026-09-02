@@ -20,10 +20,14 @@ import {
 } from '$lib/server/collaboration/agent-templates.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
 
-async function loadAgentTemplateContext(pool: Pool, access: WorkspaceAccess) {
+async function loadAgentTemplateContext(
+  pool: Pool,
+  access: WorkspaceAccess,
+  projectId: string
+) {
   const [{ agents }, availableCapabilities] = await Promise.all([
     loadWorkspaceAgents(pool, access),
-    loadAvailableAgentTemplateCapabilities(pool, access)
+    loadAvailableAgentTemplateCapabilities(pool, access, projectId)
   ]);
   return { agents, availableCapabilities };
 }
@@ -34,7 +38,10 @@ export async function GET({ request, url }) {
     const access = await authorizeWorkspaceRequest(pool, getRelayAuth(), request.headers);
     const key = url.searchParams.get('key');
     if (!key) return json({ templates: listAgentTemplates() });
-    const { agents, availableCapabilities } = await loadAgentTemplateContext(pool, access);
+    const projectId = url.searchParams.get('projectId') ?? '';
+    const { agents, availableCapabilities } = await loadAgentTemplateContext(
+      pool, access, projectId
+    );
     const ambientTriggers = url.searchParams.getAll('ambientTrigger');
     return json({ preview: previewAgentTemplate(key, {
       availableCapabilities, existingAgents: agents,
@@ -54,8 +61,11 @@ export async function POST({ request }) {
     const pool = getDatabasePool();
     const access = await authorizeWorkspaceRequest(pool, getRelayAuth(), request.headers);
     const input = await request.json();
-    const { agents, availableCapabilities } = await loadAgentTemplateContext(pool, access);
-    const result = await instantiateAgentTemplate(pool, access, input.key, {
+    const projectId = typeof input?.projectId === 'string' ? input.projectId.trim() : '';
+    const { agents, availableCapabilities } = await loadAgentTemplateContext(
+      pool, access, projectId
+    );
+    const result = await instantiateAgentTemplate(pool, access, projectId, input.key, {
       ...input, existingAgents: agents, availableCapabilities
     });
     return json(result, { status: 201 });

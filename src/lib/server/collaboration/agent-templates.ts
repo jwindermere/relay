@@ -1,6 +1,9 @@
 import type { Pool } from 'pg';
 
-import type { WorkspaceAccess } from '../authentication/authorization.js';
+import {
+  type WorkspaceAccess,
+  WorkspaceAccessError
+} from '../authentication/authorization.js';
 import { hasActiveLinkedRepositoryForProject } from '../github/connection.js';
 import {
   createWorkspaceAgent,
@@ -202,17 +205,31 @@ export function renderAgentTemplateExecutionBounds(input: {
 
 export async function loadAvailableAgentTemplateCapabilities(
   pool: Pool,
-  access: WorkspaceAccess
+  access: WorkspaceAccess,
+  projectId: string
 ): Promise<AgentCapability[]> {
-  const project = await pool.query<{ id: string }>(
-    `SELECT id FROM public.project
-     WHERE workspace_id = $1
-     ORDER BY created_at, id
-     LIMIT 1`,
-    [access.workspace.id]
+  const membership = await pool.query<{ allowed: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM public.project project
+       JOIN public.project_membership project_member
+         ON project_member.workspace_id = project.workspace_id
+        AND project_member.project_id = project.id
+       JOIN public.workspace_member member
+         ON member.workspace_id = project.workspace_id
+        AND member.id = project_member.workspace_member_id
+       JOIN public.workspace_membership membership
+         ON membership.workspace_id = member.workspace_id
+        AND membership.id = member.pilot_membership_id
+       WHERE project.workspace_id = $1
+         AND membership.id = $2
+         AND project.id = $3
+         AND membership.revoked_at IS NULL
+     ) AS allowed`,
+    [access.workspace.id, access.membership.id, projectId]
   );
-  const projectId = project.rows[0]?.id;
-  if (!projectId) return [];
+  if (!membership.rows[0]?.allowed) {
+    throw new WorkspaceAccessError('active Project membership is required');
+  }
   const available: AgentCapability[] = [];
   available.push('project_data');
   if (await hasActiveLinkedRepositoryForProject(pool, access.workspace.id, projectId)) {
@@ -224,6 +241,7 @@ export async function loadAvailableAgentTemplateCapabilities(
 export async function instantiateAgentTemplate(
   pool: Pool,
   access: WorkspaceAccess,
+  projectId: string,
   key: string,
   input: TemplatePreviewInput & {
     roleLabel?: string;
@@ -237,7 +255,7 @@ export async function instantiateAgentTemplate(
   }
   const template = preview.template;
   assertAgentTemplatePermissionCeiling(template.agentType, template.permissionCeiling);
-  const agent = await createWorkspaceAgent(pool, access, {
+  const agent = await createWorkspaceAgent(pool, access, projectId, {
     name: input.name?.trim() || template.name,
     agentType: template.agentType,
     roleLabel: input.roleLabel?.trim() || template.roleLabel,

@@ -115,10 +115,12 @@ test('Agent template permission ceilings cannot be broadened through customizati
 });
 
 test('Agent template instantiation rejects name collisions before persistence', async () => {
-  await assert.rejects(() => instantiateAgentTemplate({} as never, {} as never, 'designer', {
+  await assert.rejects(() => instantiateAgentTemplate(
+    {} as never, {} as never, 'project-1', 'designer', {
     availableCapabilities: ['design_assets'],
     existingAgents: [{ name: 'Designer', roleLabel: 'Another role', ambientTriggers: [] }]
-  }), /already exists/);
+    }
+  ), /already exists/);
 });
 
 test('Agent template capabilities expose only authorised Project data and integrations', async () => {
@@ -127,18 +129,39 @@ test('Agent template capabilities expose only authorised Project data and integr
     async query(_statement: string, parameters: unknown[]) {
       queries.push(parameters);
       return queries.length === 1
-        ? { rows: [{ id: 'project-1' }] }
+        ? { rows: [{ allowed: true }] }
         : { rows: [{ available: true }] };
     }
   };
 
   const capabilities = await loadAvailableAgentTemplateCapabilities(
     pool as never,
-    { workspace: { id: 'workspace-1' } } as never
+    { workspace: { id: 'workspace-1' }, membership: { id: 'member-1' } } as never,
+    'project-2'
   );
 
   assert.deepEqual(capabilities, ['project_data', 'repository_read']);
-  assert.deepEqual(queries, [['workspace-1'], ['workspace-1', 'project-1']]);
+  assert.deepEqual(queries, [
+    ['workspace-1', 'member-1', 'project-2'],
+    ['workspace-1', 'project-2']
+  ]);
+});
+
+test('Agent template capabilities fail closed for a Project outside active membership', async () => {
+  const pool = {
+    async query() {
+      return { rows: [{ allowed: false }] };
+    }
+  };
+
+  await assert.rejects(
+    loadAvailableAgentTemplateCapabilities(
+      pool as never,
+      { workspace: { id: 'workspace-1' }, membership: { id: 'member-1' } } as never,
+      'project-outside-membership'
+    ),
+    /active Project membership is required/
+  );
 });
 
 test('Agent template versions and permission ceilings are immutable catalog snapshots', () => {
