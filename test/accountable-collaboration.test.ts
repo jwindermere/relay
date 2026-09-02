@@ -158,6 +158,13 @@ test('coordination plans reject hidden participants and recursive handoffs', () 
   }).steps[0]?.artifactId, 'artifact-1');
 });
 
+test('coordination plans cannot authorize unsupported work outputs', () => {
+  assert.throws(() => parseCoordinationPlanProposal(`
+\`\`\`relay-coordination-plan
+{"goal":"Change the repository through coordination","allowParallel":false,"budget":{"maxParticipants":1,"maxHandoffs":1,"maxDepth":1,"maxAgentRuns":1,"maxElapsedSeconds":600},"steps":[{"key":"implement","agentId":"alex","instruction":"Commit the change","dependencies":[],"expectedOutput":"repository_change"}]}
+\`\`\``), /output type is not allowed/);
+});
+
 test('coordination budget reservations never overspend', () => {
   assert.deepEqual(reserveCoordinationBudget({ consumed: 1, limit: 2 }, 1), {
     consumed: 2, remaining: 0

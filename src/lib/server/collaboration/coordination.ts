@@ -13,12 +13,20 @@ export interface CoordinationBudget {
   providerUsageLimit?: number;
 }
 
+const COORDINATION_OUTPUT_TYPES = [
+  'concise_text',
+  'structured_finding',
+  'artifact'
+] as const;
+
+type CoordinationOutputType = typeof COORDINATION_OUTPUT_TYPES[number];
+
 export interface CoordinationStepInput {
   key: string;
   agentId: string;
   instruction: string;
   dependencies: string[];
-  expectedOutput?: 'concise_text' | 'structured_finding' | 'artifact';
+  expectedOutput?: CoordinationOutputType;
   artifactId?: string;
 }
 
@@ -29,6 +37,8 @@ export interface CoordinationPlanInput {
   budget: CoordinationBudget;
   steps: CoordinationStepInput[];
 }
+
+const COORDINATION_OUTPUT_TYPE_SET = new Set<CoordinationOutputType>(COORDINATION_OUTPUT_TYPES);
 
 export class CoordinationError extends Error {
   constructor(message: string) {
@@ -81,6 +91,9 @@ export function normalizeCoordinationPlan(input: CoordinationPlanInput): Coordin
     const instruction = step.instruction?.trim();
     if (!key || key.length > 80 || keys.has(key)) throw new CoordinationError('Coordination step keys must be unique');
     if (!agentId || !instruction || instruction.length > 4000) throw new CoordinationError('Coordination step is incomplete');
+    if (step.expectedOutput !== undefined && !COORDINATION_OUTPUT_TYPE_SET.has(step.expectedOutput)) {
+      throw new CoordinationError('Coordination step output type is not allowed');
+    }
     keys.add(key);
     participants.add(agentId);
     return {
