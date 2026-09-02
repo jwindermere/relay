@@ -430,11 +430,17 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
     id: string; routing_policy_version: string | null; agent_configuration_version: number;
     agent_type_snapshot: string;
   }>(
-    `SELECT turn.id, decision.policy_version AS routing_policy_version,
+    `SELECT turn.id, COALESCE(decision.policy_version, source_decision.policy_version)
+              AS routing_policy_version,
             turn.agent_configuration_version, turn.agent_type_snapshot
      FROM public.agent_conversation_turn turn
      JOIN public.message request ON request.id = turn.request_message_id
+     JOIN public.agent_handoff handoff ON handoff.receiving_turn_id = turn.id
      LEFT JOIN public.message_intent_decision decision ON decision.message_id = request.id
+     LEFT JOIN public.agent_conversation_turn source_turn
+       ON source_turn.id = handoff.context_snapshot ->> 'sourceConversationTurnId'
+     LEFT JOIN public.message_intent_decision source_decision
+       ON source_decision.message_id = source_turn.request_message_id
      WHERE turn.id = ANY($1::text[])`,
     [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id)]
   );

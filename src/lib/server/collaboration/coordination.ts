@@ -1104,8 +1104,9 @@ async function refreshCoordinationProviderUsage(
   workspaceId: string
 ): Promise<void> {
   await client.query(
-    `UPDATE public.coordination_plan plan
-     SET provider_usage_known = (
+    `WITH measurement AS (
+       SELECT plan.id,
+         (
            EXISTS (
              SELECT 1 FROM public.coordination_provider_usage_record usage
              WHERE usage.plan_id = plan.id
@@ -1123,14 +1124,24 @@ async function refreshCoordinationProviderUsage(
                  OR (reservation.outcome = 'cancelled' AND turn.provider_turn_id IS NOT NULL)
                )
            )
-         ),
-         provider_usage_consumed = (
+         ) AS known,
+         (
            SELECT COALESCE(sum(amount), 0)
            FROM public.coordination_provider_usage_record usage
            WHERE usage.plan_id = plan.id
-         ),
+         ) AS consumed
+       FROM public.coordination_plan plan
+       WHERE plan.id = $1 AND plan.workspace_id = $2
+     )
+     UPDATE public.coordination_plan plan
+     SET provider_usage_known = measurement.known,
+         provider_usage_consumed = CASE
+           WHEN measurement.known THEN measurement.consumed
+           ELSE NULL
+         END,
          updated_at = now()
-     WHERE plan.id = $1 AND plan.workspace_id = $2`,
+     FROM measurement
+     WHERE plan.id = measurement.id`,
     [planId, workspaceId]
   );
 }

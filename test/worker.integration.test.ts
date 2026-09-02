@@ -1267,11 +1267,11 @@ if (skipDatabaseTests) {
     );
     assert.deepEqual(interruptedHandoffEvaluation.rows, [
       {
-        event_type: 'outcome.cancelled', routing_policy_version: 'message-intent-v1',
+        event_type: 'outcome.cancelled', routing_policy_version: 'rules-v1',
         agent_configuration_version: 'agent-config-1'
       },
       {
-        event_type: 'outcome.expired', routing_policy_version: 'message-intent-v1',
+        event_type: 'outcome.expired', routing_policy_version: 'rules-v1',
         agent_configuration_version: 'agent-config-1'
       }
     ]);
@@ -3312,7 +3312,7 @@ Supporting results:
     );
     assert.deepEqual(stored.rows[0], {
       findings: 1, evidence: 2, memory: 1, evaluation_events: 1,
-      routing_policy_version: 'message-intent-v1',
+      routing_policy_version: 'rules-v1',
       agent_configuration_version: 'agent-config-1',
       agent_type: 'research'
     });
