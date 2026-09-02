@@ -3,7 +3,7 @@ import type { PoolClient } from 'pg';
 
 import type { AgentMentionResult } from './delegation.js';
 import type { AgentExpectedResultShape } from './agent-templates.js';
-import { selectAmbientTarget } from './ambient-target.js';
+import { matchesAmbientTriggers, selectAmbientTarget } from './ambient-target.js';
 import { loadChannelContextBeforeMessage } from './channel-context.js';
 import {
   explicitAgentMentionPattern,
@@ -70,6 +70,7 @@ export async function acceptAgentConversation(
      ORDER BY length(name) DESC, id`,
     [context.workspaceId]
   );
+  const mentioned = agents.rows.find(({ name }) => explicitAgentMentionPattern(name).test(context.body));
   const targetAgent = resolveMessageAgentTarget(agents.rows, context.body, context.targetAgentId);
   const requestAuthor = await client.query<{
     kind: 'pilot' | 'agent';
@@ -111,6 +112,11 @@ export async function acceptAgentConversation(
     : undefined;
   let ambient = false;
   let agent = targetAgent ?? inherited;
+  if (agent && !mentioned && !inherited
+    && agent.participation_mode === 'ambient'
+    && matchesAmbientTriggers(context.body, agent.ambient_triggers)) {
+    ambient = true;
+  }
   if (!agent) {
     const taskOwner = context.parentMessageId
       ? await client.query<{ assigned_agent_id: string }>(

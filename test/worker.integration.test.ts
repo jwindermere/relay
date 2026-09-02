@@ -3029,7 +3029,7 @@ if (skipDatabaseTests) {
       [ids.runId]
     );
     const conversationId = 'conversation-coordination-output-contract';
-    const sourceMessageId = 'message-coordination-output-contract';
+    const sourceMessageId = 'message-coordination-output-contract-source';
     await pool.query(
       `INSERT INTO public.agent_conversation (
          id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
@@ -3224,6 +3224,12 @@ Supporting results:
     await correctMessageIntent(pool, ids.ownerAccess, request.id, {
       intent: 'research_request'
     });
+    const researchTurn = await pool.query<{ id: string }>(
+      `SELECT id FROM public.agent_conversation_turn
+       WHERE request_message_id = $1 AND workspace_id = $2`,
+      [request.id, ids.workspaceId]
+    );
+    const researchTurnId = researchTurn.rows[0]?.id ?? '';
     await pool.query(
       `INSERT INTO public.project (id, workspace_id, name)
        VALUES ('project-structured-finding-other', $1, 'Other Project')`,
@@ -3243,8 +3249,6 @@ Supporting results:
        )`,
       [ids.workspaceId, ids.pilotMemberId]
     );
-    const researchTurnId = request.agentMention?.status === 'conversation'
-      ? request.agentMention.conversationTurnId : '';
     await pool.query(
       `UPDATE public.agent
        SET configuration_version = configuration_version + 1, agent_type = 'product'
@@ -3641,6 +3645,13 @@ Supporting results:
        WHERE id = $1`,
       [ids.runId]
     );
+    const retryRequestMessageId = 'message-agent-inbox-retry-2';
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES ($1, $2, $3, $4, '@Alex retry the failing test.')`,
+      [retryRequestMessageId, ids.workspaceId, ids.channelId, ids.pilotMemberId]
+    );
     await pool.query(
       `INSERT INTO public.agent_run (
          id, workspace_id, task_id, agent_id, provider_connection_id,
@@ -3649,9 +3660,9 @@ Supporting results:
        )
        SELECT 'run-agent-inbox-retry-2', workspace_id, task_id, agent_id,
               provider_connection_id, linked_repository_id, 2, 'queued',
-              requested_by_workspace_member_id, request_message_id
+              requested_by_workspace_member_id, $2
        FROM public.agent_run WHERE id = $1`,
-      [ids.runId]
+      [ids.runId, retryRequestMessageId]
     );
 
     const taskItems = (await loadCollaborationAccountability(
