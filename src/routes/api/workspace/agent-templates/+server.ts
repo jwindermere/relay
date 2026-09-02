@@ -8,6 +8,7 @@ import {
 import { AgentConfigurationError } from '$lib/server/collaboration/agents.js';
 import {
   AgentTemplateError,
+  AgentTemplateWarningError,
   instantiateAgentTemplate,
   listAgentTemplates,
   loadAgentTemplateContext,
@@ -59,6 +60,9 @@ export async function POST({ request }) {
     return json(result, { status: 201 });
   } catch (error) {
     if (error instanceof WorkspaceAccessError) return json({ message: error.message }, { status: 403 });
+    if (error instanceof AgentTemplateWarningError) {
+      return json({ message: error.message, preview: error.preview }, { status: 409 });
+    }
     if (error instanceof AgentTemplateError || error instanceof AgentConfigurationError || error instanceof SyntaxError) {
       return json({ message: error instanceof Error ? error.message : 'invalid template request' }, { status: 400 });
     }

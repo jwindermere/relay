@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 import {
   assertCurrentWorkspaceOwner,
@@ -115,7 +115,7 @@ function normalizeInput(input: AgentInput): Required<AgentInput> {
 }
 
 export async function loadWorkspaceAgents(
-  pool: Pool,
+  pool: Pool | PoolClient,
   access: WorkspaceAccess
 ): Promise<{ agents: ConfigurableAgent[]; canManage: boolean }> {
   const result = await pool.query<{
@@ -171,7 +171,8 @@ export async function createWorkspaceAgent(
     key: string; version: number; snapshot: object;
     permissionCeiling: ConfigurableAgent['permissionCeiling'];
     requiredCapabilities: string[]; disabledCapabilities: string[];
-  }
+  },
+  validateBeforeCreate?: (client: PoolClient) => Promise<void>
 ): Promise<ConfigurableAgent> {
   if (access.membership.role !== 'owner') throw new WorkspaceAccessError('Workspace owner access is required');
   const agent = normalizeInput(input);
@@ -180,6 +181,11 @@ export async function createWorkspaceAgent(
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
     await requireActivePilotProjectMembership(client, access, projectId, true);
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [access.workspace.id]
+    );
+    await validateBeforeCreate?.(client);
     const id = randomUUID();
     const memberId = `${id}:member`;
     const inserted = await client.query<{
@@ -250,6 +256,10 @@ export async function updateWorkspaceAgent(
   try {
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [access.workspace.id]
+    );
     const existing = await client.query<{
       template_key: string | null;
       permission_ceiling: AgentPermissionCeiling;

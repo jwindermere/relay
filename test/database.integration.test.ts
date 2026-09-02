@@ -18,6 +18,7 @@ import {
   postChannelMessage
 } from '../src/lib/server/collaboration/channel.js';
 import {
+  createWorkspaceAgent,
   loadWorkspaceAgents,
   updateWorkspaceAgent
 } from '../src/lib/server/collaboration/agents.js';
@@ -789,6 +790,22 @@ if (connectionString) {
     await assert.rejects(
       loadAvailableAgentTemplateCapabilities(pool, ownerAccess, foreignProjectId),
       /active Project membership is required/
+    );
+
+    await createWorkspaceAgent(pool, ownerAccess, selectedProjectId, {
+      name: 'Metrics Analyst',
+      agentType: 'general',
+      roleLabel: 'Data analyst',
+      ambientTriggers: ['analysis']
+    });
+    await assert.rejects(
+      instantiateAgentTemplate(pool, ownerAccess, selectedProjectId, 'data-analyst', {
+        availableCapabilities: selectedContext.availableCapabilities,
+        existingAgents: selectedContext.agentConfiguration.agents,
+        existingProjectAgents: selectedContext.projectAgents,
+        warningAcknowledgement: null
+      }),
+      /warnings changed/i
     );
 
     const created = await instantiateAgentTemplate(

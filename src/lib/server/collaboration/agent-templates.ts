@@ -1,4 +1,6 @@
-import type { Pool } from 'pg';
+import { createHash } from 'node:crypto';
+
+import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import { hasActiveLinkedRepositoryForProject } from '../github/connection.js';
@@ -101,6 +103,20 @@ export class AgentTemplateError extends Error {
   }
 }
 
+export type AgentTemplatePreview = {
+  template: AgentTemplate;
+  disabledCapabilities: AgentCapability[];
+  warnings: string[];
+  warningAcknowledgement: string | null;
+};
+
+export class AgentTemplateWarningError extends AgentTemplateError {
+  constructor(public readonly preview: AgentTemplatePreview) {
+    super('Agent template warnings changed. Review and acknowledge them before creation.');
+    this.name = 'AgentTemplateWarningError';
+  }
+}
+
 interface TemplatePreviewInput {
   availableCapabilities: AgentCapability[];
   existingAgents: Array<Pick<ConfigurableAgent, 'name' | 'roleLabel' | 'ambientTriggers'>>;
@@ -122,10 +138,15 @@ function rolesOverlap(left: string, right: string): boolean {
   return [...roleTerms(left)].some((term) => rightTerms.has(term));
 }
 
+function warningAcknowledgement(warnings: string[]): string | null {
+  if (warnings.length === 0) return null;
+  return createHash('sha256').update(JSON.stringify(warnings)).digest('base64url');
+}
+
 export function previewAgentTemplate(
   key: string,
   input: TemplatePreviewInput
-): { template: AgentTemplate; disabledCapabilities: AgentCapability[]; warnings: string[] } {
+): AgentTemplatePreview {
   const template = TEMPLATES[key as AgentTemplateKey];
   if (!template) throw new AgentTemplateError('Agent template was not found');
   const name = input.name?.trim() || template.name;
@@ -156,7 +177,8 @@ export function previewAgentTemplate(
   return {
     template: structuredClone(template),
     disabledCapabilities: template.requiredCapabilities.filter((capability) => !available.has(capability)),
-    warnings
+    warnings,
+    warningAcknowledgement: warningAcknowledgement(warnings)
   };
 }
 
@@ -228,6 +250,20 @@ export async function loadAgentTemplateContext(
   projectAgents: ConfigurableAgent[];
 }> {
   const availableCapabilities = await loadAvailableAgentTemplateCapabilities(pool, access, projectId);
+  const { agentConfiguration, projectAgents } = await loadAgentTemplateWarningContext(
+    pool, access, projectId
+  );
+  return { agentConfiguration, availableCapabilities, projectAgents };
+}
+
+async function loadAgentTemplateWarningContext(
+  pool: Pool | PoolClient,
+  access: WorkspaceAccess,
+  projectId: string
+): Promise<{
+  agentConfiguration: Awaited<ReturnType<typeof loadWorkspaceAgents>>;
+  projectAgents: ConfigurableAgent[];
+}> {
   const [agentConfiguration, projectAgentIds] = await Promise.all([
     loadWorkspaceAgents(pool, access),
     pool.query<{ agent_id: string }>(
@@ -243,11 +279,24 @@ export async function loadAgentTemplateContext(
     )
   ]);
   const projectAgentIdSet = new Set(projectAgentIds.rows.map(({ agent_id }) => agent_id));
-  return {
-    agentConfiguration,
-    availableCapabilities,
-    projectAgents: agentConfiguration.agents.filter(({ id }) => projectAgentIdSet.has(id))
-  };
+  return { agentConfiguration, projectAgents: agentConfiguration.agents.filter(
+    ({ id }) => projectAgentIdSet.has(id)
+  ) };
+}
+
+function assertAgentTemplateWarningsAcknowledged(
+  preview: AgentTemplatePreview,
+  input: TemplatePreviewInput & { warningAcknowledgement?: string | null }
+): void {
+  const name = input.name?.trim() || preview.template.name;
+  if (input.existingAgents.some((agent) =>
+    agent.name.toLocaleLowerCase() === name.toLocaleLowerCase()
+  )) {
+    throw new AgentTemplateError(`An Agent named ${name} already exists.`);
+  }
+  if (preview.warningAcknowledgement !== (input.warningAcknowledgement ?? null)) {
+    throw new AgentTemplateWarningError(preview);
+  }
 }
 
 export async function instantiateAgentTemplate(
@@ -259,12 +308,11 @@ export async function instantiateAgentTemplate(
     roleLabel?: string;
     instructions?: string;
     ambientTriggers?: string[];
+    warningAcknowledgement?: string | null;
   }
 ): Promise<{ agent: ConfigurableAgent; disabledCapabilities: AgentCapability[]; warnings: string[] }> {
   const preview = previewAgentTemplate(key, input);
-  if (preview.warnings.some((warning) => warning.startsWith('An Agent named'))) {
-    throw new AgentTemplateError(preview.warnings[0]!);
-  }
+  assertAgentTemplateWarningsAcknowledged(preview, input);
   const template = preview.template;
   assertAgentTemplatePermissionCeiling(template.agentType, template.permissionCeiling);
   const agent = await createWorkspaceAgent(pool, access, projectId, {
@@ -283,6 +331,14 @@ export async function instantiateAgentTemplate(
     permissionCeiling: template.permissionCeiling,
     requiredCapabilities: template.requiredCapabilities,
     disabledCapabilities: preview.disabledCapabilities
+  }, async (client) => {
+    const current = await loadAgentTemplateWarningContext(client, access, projectId);
+    const currentInput = {
+      ...input,
+      existingAgents: current.agentConfiguration.agents,
+      existingProjectAgents: current.projectAgents
+    };
+    assertAgentTemplateWarningsAcknowledged(previewAgentTemplate(key, currentInput), currentInput);
   });
   return {
     agent: {

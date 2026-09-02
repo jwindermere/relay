@@ -3,6 +3,13 @@
   import { invalidateAll } from '$app/navigation';
   import { onMount, tick } from 'svelte';
   import { canResumeCoordinationPlan } from '$lib/coordination-presentation.js';
+  import {
+    agentTemplatePreviewCacheKey,
+    beginAgentTemplatePreviewRequest,
+    cacheAgentTemplatePreview,
+    createAgentTemplatePreviewCache,
+    invalidateAgentTemplatePreviews
+  } from '$lib/agent-template-preview-cache.js';
   import BrandMark from '$lib/BrandMark.svelte';
   import JitsiCall from '$lib/JitsiCall.svelte';
   import MarkdownMessage from '$lib/MarkdownMessage.svelte';
@@ -54,10 +61,9 @@
   let agentTemplateKey = $state('');
   let agentProjectId = $state('');
   let agentPreviewBusy = $state(false);
-  let agentTemplatePreviewCache = $state<Record<
-    string,
-    (typeof data.agentTemplatePreviews)[string]
-  >>({});
+  let agentTemplatePreviewCache = $state(
+    createAgentTemplatePreviewCache<(typeof data.agentTemplatePreviews)[string]>()
+  );
   let inboxAgentFilter = $state('all');
   let inboxStateFilter = $state('all');
   let inboxUrgencyFilter = $state('all');
@@ -103,9 +109,12 @@
   let selectedAgentProjectId = $derived(agentProjectId || data.sharedChannel.project.id);
   let selectedTemplatePreview = $derived(
     selectedAgentTemplate
-      ? selectedAgentProjectId === data.sharedChannel.project.id
-        ? data.agentTemplatePreviews[selectedAgentTemplate.key]
-        : agentTemplatePreviewCache[`${selectedAgentProjectId}:${selectedAgentTemplate.key}`]
+      ? agentTemplatePreviewCache.entries[
+        agentTemplatePreviewCacheKey(selectedAgentProjectId, selectedAgentTemplate.key)
+      ]
+        ?? (selectedAgentProjectId === data.sharedChannel.project.id
+          ? data.agentTemplatePreviews[selectedAgentTemplate.key]
+          : undefined)
       : undefined
   );
   let agentHandoffs = $derived(
@@ -776,7 +785,9 @@
       if (!response.ok) throw new Error(result.message ?? 'Agent configuration failed');
       agentMessage = editingAgentId ? 'Agent updated.' : 'Agent added.';
       resetAgentForm();
+      agentTemplatePreviewCache = invalidateAgentTemplatePreviews(agentTemplatePreviewCache);
       await invalidateAll();
+      await refreshAgentTemplatePreview(true);
     } catch (error) {
       agentMessage = error instanceof Error ? error.message : String(error);
     } finally {
@@ -794,15 +805,30 @@
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           key: selectedAgentTemplate.key,
-          projectId: selectedAgentProjectId
+          projectId: selectedAgentProjectId,
+          warningAcknowledgement: selectedTemplatePreview?.warningAcknowledgement ?? null
         })
       });
       const result = await response.json();
+      if (response.status === 409 && result.preview) {
+        const cacheKey = agentTemplatePreviewCacheKey(
+          selectedAgentProjectId,
+          selectedAgentTemplate.key
+        );
+        agentTemplatePreviewCache = cacheAgentTemplatePreview(
+          agentTemplatePreviewCache,
+          beginAgentTemplatePreviewRequest(agentTemplatePreviewCache),
+          cacheKey,
+          result.preview
+        );
+        throw new Error(result.message ?? 'Agent template warnings changed');
+      }
       if (!response.ok) throw new Error(result.message ?? 'Agent template could not be instantiated');
       agentMessage = result.disabledCapabilities.length > 0
         ? `Agent added with unavailable capabilities disabled: ${result.disabledCapabilities.join(', ')}.`
         : 'Agent added from Agent template.';
       agentTemplateKey = '';
+      agentTemplatePreviewCache = invalidateAgentTemplatePreviews(agentTemplatePreviewCache);
       await invalidateAll();
     } catch (error) {
       agentMessage = error instanceof Error ? error.message : String(error);
@@ -811,12 +837,13 @@
     }
   }
 
-  async function refreshAgentTemplatePreview() {
+  async function refreshAgentTemplatePreview(force = false) {
     const key = agentTemplateKey;
     const projectId = selectedAgentProjectId;
-    if (!key || projectId === data.sharedChannel.project.id) return;
-    const cacheKey = `${projectId}:${key}`;
-    if (agentTemplatePreviewCache[cacheKey]) return;
+    if (!key) return;
+    const cacheKey = agentTemplatePreviewCacheKey(projectId, key);
+    if (!force && agentTemplatePreviewCache.entries[cacheKey]) return;
+    const request = beginAgentTemplatePreviewRequest(agentTemplatePreviewCache);
     agentPreviewBusy = true;
     agentMessage = '';
     try {
@@ -826,7 +853,12 @@
       const response = await fetch(url);
       const result = await response.json();
       if (!response.ok) throw new Error(result.message ?? 'Agent template preview failed');
-      agentTemplatePreviewCache = { ...agentTemplatePreviewCache, [cacheKey]: result.preview };
+      agentTemplatePreviewCache = cacheAgentTemplatePreview(
+        agentTemplatePreviewCache,
+        request,
+        cacheKey,
+        result.preview
+      );
     } catch (error) {
       agentMessage = error instanceof Error ? error.message : String(error);
     } finally {
@@ -2064,7 +2096,9 @@
                 {/each}
               </div>
               <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy || agentPreviewBusy || !selectedTemplatePreview} onclick={() => void instantiateTemplate()}>
-                Add from Agent template
+                {selectedTemplatePreview?.warnings.length
+                  ? 'Acknowledge warnings and add Agent'
+                  : 'Add from Agent template'}
               </button>
             {/if}
           </div>

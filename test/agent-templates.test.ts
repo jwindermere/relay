@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  agentTemplatePreviewCacheKey,
+  beginAgentTemplatePreviewRequest,
+  cacheAgentTemplatePreview,
+  createAgentTemplatePreviewCache,
+  invalidateAgentTemplatePreviews
+} from '../src/lib/agent-template-preview-cache.js';
+import {
+  AgentTemplateWarningError,
   assertAgentTemplatePermissionCeiling,
   findAgentTemplateUpgrade,
   instantiateAgentTemplate,
@@ -133,6 +141,100 @@ test('Agent template instantiation rejects name collisions before persistence', 
     existingAgents: [{ name: 'Designer', roleLabel: 'Another role', ambientTriggers: [] }]
     }
   ), /already exists/);
+});
+
+test('Agent template instantiation requires current overlap warnings to be acknowledged before persistence', async () => {
+  let queried = false;
+  const pool = {
+    async query() {
+      queried = true;
+      throw new Error('Agent must not be persisted before warnings are acknowledged');
+    }
+  };
+
+  await assert.rejects(
+    () => instantiateAgentTemplate(
+      pool as never,
+      {} as never,
+      'project-1',
+      'data-analyst',
+      {
+        availableCapabilities: ['project_data'],
+        existingAgents: [{
+          name: 'Riley', roleLabel: 'Research analyst', ambientTriggers: ['analysis']
+        }],
+        warningAcknowledgement: null
+      }
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentTemplateWarningError);
+      assert.deepEqual(error.preview.warnings, [
+        'Ambient topic “analysis” overlaps with Riley.',
+        'Role responsibilities overlap with Riley.'
+      ]);
+      return true;
+    }
+  );
+  assert.equal(queried, false);
+});
+
+test('stale Agent template warning acknowledgements cannot silently create an Agent', async () => {
+  const stalePreview = previewAgentTemplate('designer', {
+    availableCapabilities: ['design_assets'],
+    existingAgents: [{
+      name: 'Old Agent', roleLabel: 'Product designer', ambientTriggers: ['journey']
+    }]
+  });
+
+  await assert.rejects(
+    () => instantiateAgentTemplate(
+      {} as never,
+      {} as never,
+      'project-1',
+      'designer',
+      {
+        availableCapabilities: ['design_assets'],
+        existingAgents: [{
+          name: 'Maya', roleLabel: 'Product strategy', ambientTriggers: ['design']
+        }],
+        warningAcknowledgement: stalePreview.warningAcknowledgement
+      }
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentTemplateWarningError);
+      assert.deepEqual(error.preview.warnings, [
+        'Ambient topic “design” overlaps with Maya.',
+        'Role responsibilities overlap with Maya.'
+      ]);
+      return true;
+    }
+  );
+});
+
+test('Agent mutation invalidation rejects an older in-flight template preview', () => {
+  let cache = createAgentTemplatePreviewCache<{ warnings: string[] }>();
+  const staleRequest = beginAgentTemplatePreviewRequest(cache);
+  const cacheKey = agentTemplatePreviewCacheKey('project-1', 'data-analyst');
+
+  cache = invalidateAgentTemplatePreviews(cache);
+  cache = cacheAgentTemplatePreview(
+    cache,
+    staleRequest,
+    cacheKey,
+    { warnings: [] }
+  );
+  assert.equal(cache.entries[cacheKey], undefined);
+
+  const currentRequest = beginAgentTemplatePreviewRequest(cache);
+  cache = cacheAgentTemplatePreview(
+    cache,
+    currentRequest,
+    cacheKey,
+    { warnings: ['Role responsibilities overlap with Riley.'] }
+  );
+  assert.deepEqual(cache.entries[cacheKey]?.warnings, [
+    'Role responsibilities overlap with Riley.'
+  ]);
 });
 
 test('Agent template capabilities expose only authorised Project data and integrations', async () => {
