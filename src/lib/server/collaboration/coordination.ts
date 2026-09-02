@@ -87,26 +87,39 @@ function normalizeCoordinationBudget(input: CoordinationBudget): CoordinationBud
   };
 }
 
+const COORDINATION_PLAN_WITHIN_POLICY_SQL = `
+  plan.max_participants <= policy.default_max_participants
+  AND plan.max_handoffs <= policy.default_max_handoffs
+  AND plan.max_depth <= policy.default_max_depth
+  AND plan.max_agent_runs <= policy.default_max_agent_runs
+  AND plan.max_elapsed_seconds <= policy.default_max_elapsed_seconds
+  AND (NOT plan.allow_parallel OR policy.parallel_permitted)
+  AND (policy.default_provider_usage_limit IS NULL OR (
+    plan.provider_usage_limit IS NOT NULL
+    AND plan.provider_usage_limit <= policy.default_provider_usage_limit
+  ))
+  AND (provider.coordination_provider_usage_limit IS NULL OR (
+    plan.provider_usage_limit IS NOT NULL
+    AND plan.provider_usage_limit <= provider.coordination_provider_usage_limit
+  ))`;
+
 async function assertWithinCurrentCoordinationPolicy(
   client: PoolClient,
   workspaceId: string,
   plan: CoordinationPlanInput
 ): Promise<void> {
   const policy = await client.query<{ allowed: boolean }>(
-    `SELECT ($2 <= default_max_participants
-        AND $3 <= default_max_handoffs
-        AND $4 <= default_max_depth
-        AND $5 <= default_max_agent_runs
-        AND $6 <= default_max_elapsed_seconds
-        AND (NOT $8 OR workspace_policy.parallel_permitted)
-        AND (default_provider_usage_limit IS NULL
-          OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))
-        AND (provider.coordination_provider_usage_limit IS NULL
-          OR ($7::numeric IS NOT NULL
-            AND $7 <= provider.coordination_provider_usage_limit))) AS allowed
-     FROM public.workspace_coordination_policy workspace_policy
-     JOIN public.provider_connection provider ON provider.workspace_id = workspace_policy.workspace_id
-     WHERE workspace_policy.workspace_id = $1 FOR UPDATE OF workspace_policy, provider`,
+    `WITH plan AS (
+       SELECT $2::integer AS max_participants, $3::integer AS max_handoffs,
+              $4::integer AS max_depth, $5::integer AS max_agent_runs,
+              $6::integer AS max_elapsed_seconds, $7::numeric AS provider_usage_limit,
+              $8::boolean AS allow_parallel
+     )
+     SELECT (${COORDINATION_PLAN_WITHIN_POLICY_SQL}) AS allowed
+     FROM plan
+     JOIN public.workspace_coordination_policy policy ON policy.workspace_id = $1
+     JOIN public.provider_connection provider ON provider.workspace_id = policy.workspace_id
+     FOR UPDATE OF policy, provider`,
     [workspaceId, plan.budget.maxParticipants, plan.budget.maxHandoffs,
       plan.budget.maxDepth, plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
       plan.budget.providerUsageLimit ?? null, plan.allowParallel]
@@ -394,21 +407,8 @@ async function assertCoordinationPlanCanActivate(
   }>(
     `SELECT (
        provider.status = 'ready'
-       AND plan.max_participants <= policy.default_max_participants
-       AND plan.max_handoffs <= policy.default_max_handoffs
-       AND plan.max_depth <= policy.default_max_depth
-       AND plan.max_agent_runs <= policy.default_max_agent_runs
-       AND plan.max_elapsed_seconds <= policy.default_max_elapsed_seconds
-       AND (NOT plan.allow_parallel OR policy.parallel_permitted)
+       AND ${COORDINATION_PLAN_WITHIN_POLICY_SQL}
        AND NOT (plan.allow_parallel AND plan.provider_usage_limit IS NOT NULL)
-       AND (policy.default_provider_usage_limit IS NULL OR (
-         plan.provider_usage_limit IS NOT NULL
-         AND plan.provider_usage_limit <= policy.default_provider_usage_limit
-       ))
-       AND (provider.coordination_provider_usage_limit IS NULL OR (
-         plan.provider_usage_limit IS NOT NULL
-         AND plan.provider_usage_limit <= provider.coordination_provider_usage_limit
-       ))
        AND (plan.started_at IS NULL
          OR now() < plan.started_at + plan.max_elapsed_seconds * interval '1 second')
        AND (plan.provider_usage_limit IS NULL OR NOT plan.provider_usage_known

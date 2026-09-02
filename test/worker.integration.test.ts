@@ -23,6 +23,7 @@ import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js'
 import {
   claimCoordinationStep,
   decideCoordinationPlan,
+  editCoordinationPlan,
   loadWorkspaceCoordinationPolicy,
   proposeCoordinationPlan,
   recordCoordinationProviderUsage,
@@ -2805,6 +2806,218 @@ if (skipDatabaseTests) {
       actor_membership_id: ids.ownerAccess.membership.id,
       after: requested
     }]);
+  });
+
+  test('Workspace coordination policy dimensions stay in parity across proposal, edit, approval, and resume', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-policy-parity');
+    const maximumWorkspacePolicy = {
+      maxParticipants: 8,
+      maxHandoffs: 20,
+      maxDepth: 1,
+      maxAgentRuns: 0,
+      maxElapsedSeconds: 86_400,
+      parallelPermitted: true
+    };
+    let proposalSequence = 0;
+    const planInput = (
+      suffix: string,
+      overrides: Partial<{
+        allowParallel: boolean;
+        budget: {
+          maxParticipants: number; maxHandoffs: number; maxDepth: number;
+          maxAgentRuns: number; maxElapsedSeconds: number; providerUsageLimit?: number;
+        };
+      }> = {}
+    ) => ({
+      goal: `Check ${suffix}`,
+      allowParallel: overrides.allowParallel ?? false,
+      budget: overrides.budget ?? {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600
+      },
+      steps: [{
+        key: 'check', agentId: ids.agentId, instruction: `Check ${suffix}`, dependencies: []
+      }]
+    });
+    const propose = async (suffix: string, input: ReturnType<typeof planInput>) => {
+      proposalSequence += 1;
+      const sourceMessageId = `message-coordination-policy-parity-${proposalSequence}-${suffix}`;
+      await pool.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [sourceMessageId, ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId,
+          `Proposed policy parity check ${suffix}`]
+      );
+      return proposeCoordinationPlan(pool, {
+        workspaceId: ids.workspaceId, projectId: ids.projectId,
+        coordinatingAgentId: ids.agentId, sourceMessageId,
+        routingPolicyVersion: 'message-intent-v1', agentConfigurationVersion: 1,
+        agentType: 'engineering', ...input
+      });
+    };
+    const assertRejectedAtEveryGate = async (
+      name: string,
+      input: ReturnType<typeof planInput>,
+      restrict: () => Promise<unknown>
+    ) => {
+      const approvalPlanId = await propose(`approval-${name}`, input);
+      const editPlanId = await propose(`edit-${name}`, input);
+      const resumePlanId = await propose(`resume-${name}`, input);
+      await decideCoordinationPlan(pool, ids.ownerAccess, resumePlanId, 'approve');
+      await decideCoordinationPlan(pool, ids.ownerAccess, resumePlanId, 'pause');
+      await restrict();
+      await assert.rejects(
+        propose(`proposal-reject-${name}`, input),
+        /exceeds Workspace defaults/,
+        `${name} must be enforced while proposing`
+      );
+      await assert.rejects(
+        editCoordinationPlan(pool, ids.memberAccess, editPlanId, input),
+        /exceeds Workspace defaults/,
+        `${name} must be enforced while editing`
+      );
+      await assert.rejects(
+        decideCoordinationPlan(pool, ids.ownerAccess, approvalPlanId, 'approve'),
+        /current Workspace or Provider limits/,
+        `${name} must be enforced while approving`
+      );
+      await assert.rejects(
+        decideCoordinationPlan(pool, ids.ownerAccess, resumePlanId, 'resume'),
+        /current Workspace or Provider limits/,
+        `${name} must be enforced while resuming`
+      );
+    };
+
+    const cases = [
+      {
+        name: 'participant ceiling',
+        input: planInput('participants', {
+          budget: { maxParticipants: 2, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxParticipants: 1 }
+      },
+      {
+        name: 'handoff ceiling',
+        input: planInput('handoffs', {
+          budget: { maxParticipants: 1, maxHandoffs: 2, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxHandoffs: 1 }
+      },
+      {
+        name: 'handoff-depth ceiling',
+        input: planInput('depth', {
+          budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxDepth: 0 }
+      },
+      {
+        name: 'elapsed-time ceiling',
+        input: planInput('elapsed', {
+          budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxElapsedSeconds: 60 }
+      },
+      {
+        name: 'parallel-execution permission',
+        input: planInput('parallel', { allowParallel: true }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, parallelPermitted: false }
+      },
+      {
+        name: 'Workspace Provider-usage ceiling',
+        input: planInput('workspace-provider-usage', {
+          budget: {
+            maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+            maxAgentRuns: 0, maxElapsedSeconds: 600, providerUsageLimit: 50
+          }
+        }),
+        permissiveProviderUsageLimit: 100,
+        restrictedPolicy: { ...maximumWorkspacePolicy, providerUsageLimit: 40 }
+      }
+    ];
+
+    for (const policyCase of cases) {
+      await pool.query(
+        `UPDATE public.provider_connection
+         SET coordination_provider_usage_limit = NULL WHERE id = $1`,
+        [ids.providerConnectionId]
+      );
+      await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+        ...maximumWorkspacePolicy,
+        ...(policyCase.permissiveProviderUsageLimit === undefined
+          ? {} : { providerUsageLimit: policyCase.permissiveProviderUsageLimit })
+      });
+      await assertRejectedAtEveryGate(
+        policyCase.name,
+        policyCase.input,
+        () => updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, policyCase.restrictedPolicy)
+      );
+    }
+
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET coordination_provider_usage_limit = 100 WHERE id = $1`,
+      [ids.providerConnectionId]
+    );
+    const providerPolicy = { ...maximumWorkspacePolicy, providerUsageLimit: 100 };
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, providerPolicy);
+    const providerInput = planInput('Provider connection usage', {
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600, providerUsageLimit: 50
+      }
+    });
+    await assertRejectedAtEveryGate(
+      'Provider connection usage ceiling',
+      providerInput,
+      () => pool.query(
+        `UPDATE public.provider_connection
+         SET coordination_provider_usage_limit = 40 WHERE id = $1`,
+        [ids.providerConnectionId]
+      )
+    );
+
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET coordination_provider_usage_limit = NULL WHERE id = $1`,
+      [ids.providerConnectionId]
+    );
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, maximumWorkspacePolicy);
+    const zeroAgentRunInput = planInput('zero AgentRuns');
+    const zeroAgentRunId = await propose('zero-agent-runs', zeroAgentRunInput);
+    await editCoordinationPlan(pool, ids.memberAccess, zeroAgentRunId, zeroAgentRunInput);
+    const nonzeroAgentRunInput = planInput('nonzero AgentRuns', {
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 1, maxElapsedSeconds: 600
+      }
+    });
+    await assert.rejects(
+      propose('nonzero-agent-runs', nonzeroAgentRunInput),
+      /AgentRun limit must be zero/
+    );
+    await assert.rejects(
+      editCoordinationPlan(pool, ids.memberAccess, zeroAgentRunId, nonzeroAgentRunInput),
+      /AgentRun limit must be zero/
+    );
+    await assert.rejects(
+      pool.query(
+        `UPDATE public.coordination_plan SET max_agent_runs = 1 WHERE id = $1`,
+        [zeroAgentRunId]
+      ),
+      /coordination_plan_max_agent_runs_check/
+    );
+    await assert.rejects(
+      pool.query(
+        `UPDATE public.workspace_coordination_policy
+         SET default_max_agent_runs = 1 WHERE workspace_id = $1`,
+        [ids.workspaceId]
+      ),
+      /workspace_coordination_policy_default_max_agent_runs_check/
+    );
+    await decideCoordinationPlan(pool, ids.ownerAccess, zeroAgentRunId, 'approve');
+    await decideCoordinationPlan(pool, ids.ownerAccess, zeroAgentRunId, 'pause');
+    await decideCoordinationPlan(pool, ids.ownerAccess, zeroAgentRunId, 'resume');
   });
 
   test('Coordination workers enforce the approved structured Finding output', async () => {
