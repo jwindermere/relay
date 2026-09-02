@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 
+import type {
+  CoordinationPlanStatus,
+  CoordinationStepStatus
+} from '../../coordination-presentation.js';
+
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 
 export class AccountabilityError extends Error {
@@ -10,12 +15,146 @@ export class AccountabilityError extends Error {
   }
 }
 
+type CollaborationSignalType =
+  | 'recursive_handoff_attempt'
+  | 'duplicate_investigation'
+  | 'unsupported_certainty'
+  | 'routing_disagreement';
+
+type EvaluationOutcome = 'completed' | 'failed' | 'cancelled' | 'expired' | 'rejected';
+type FeedbackRating = 'useful' | 'incorrect' | 'incomplete' | 'unnecessarily_delegated';
+
+export interface CollaborationEvaluationAttribution {
+  agentType: string;
+  routingPolicyVersion: string;
+  promptVersion: string;
+  permissionPolicyVersion: string;
+  agentConfigurationVersion: string;
+}
+
+interface CollaborationEvaluationAttributionRow {
+  agent_type: string;
+  routing_policy_version: string;
+  prompt_version: string;
+  permission_policy_version: string;
+  agent_configuration_version: string;
+}
+
+function mapCollaborationEvaluationAttribution(
+  row: CollaborationEvaluationAttributionRow
+): CollaborationEvaluationAttribution {
+  return {
+    agentType: row.agent_type,
+    routingPolicyVersion: row.routing_policy_version,
+    promptVersion: row.prompt_version,
+    permissionPolicyVersion: row.permission_policy_version,
+    agentConfigurationVersion: row.agent_configuration_version
+  };
+}
+
+export interface CollaborationEvaluationFixture {
+  id: string;
+  attribution: CollaborationEvaluationAttribution;
+  handoffDepths: number[];
+  findings: Array<{ id: string; summary: string; confidence: number; evidenceReferences: string[] }>;
+  routingDecisions: Array<{ id: string; selectedIntent: string; correctedIntent: string | null }>;
+  outcomes: readonly EvaluationOutcome[];
+  pilotFeedback: readonly FeedbackRating[];
+}
+
+const RESTRICTED_EVALUATION_MATERIAL = [
+  /"(?:authorization|api[ _-]?key|password|secret|token|credential|private[ _-]?key|encrypted_reasoning|provider(?: event)? trace)"\s*:/iu,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
+  /\b(?:sk|ghp)_[A-Za-z0-9_-]{12,}\b/u,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/u,
+  /\bgithub_pat_[A-Za-z0-9_]{12,}\b/u,
+  /\bAKIA[A-Z0-9]{16}\b/u,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/u,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/iu,
+  /\bauthorization\s*:\s*(?:basic|bearer)\s+\S+/iu,
+  /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu,
+  /\b(?:credentialStoreReference|providerEventId|encrypted_reasoning)\b/u,
+  /\b(?:chain[ -]of[ -]thought|private reasoning|hidden reasoning)\b/iu
+];
+
+export function normalizeCollaborationEvaluationText(value: string): string {
+  const normalized = value.trim();
+  if (RESTRICTED_EVALUATION_MATERIAL.some((pattern) => pattern.test(normalized))) {
+    throw new AccountabilityError('Evaluation data must not contain credentials or private reasoning');
+  }
+  return normalized;
+}
+
+export function normalizeCollaborationEvaluationEvidence(
+  evidence: Record<string, unknown>
+): Record<string, unknown> {
+  if (!evidence || Array.isArray(evidence) || Object.getPrototypeOf(evidence) !== Object.prototype) {
+    throw new AccountabilityError('Evaluation evidence must be an object');
+  }
+  let encoded: string;
+  try { encoded = JSON.stringify(evidence); } catch {
+    throw new AccountabilityError('Evaluation evidence must be JSON serializable');
+  }
+  if (encoded.length > 16_000) throw new AccountabilityError('Evaluation evidence exceeds its safe limit');
+  if (RESTRICTED_EVALUATION_MATERIAL.some((pattern) => pattern.test(encoded))) {
+    throw new AccountabilityError('Evaluation evidence must not contain credentials or private reasoning');
+  }
+  return structuredClone(evidence);
+}
+
+function countValues<T extends string>(values: readonly T[]): Partial<Record<T, number>> {
+  const counts: Partial<Record<T, number>> = {};
+  for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
+  return counts;
+}
+
+function deltas<T extends string>(
+  baseline: Partial<Record<T, number>>,
+  candidate: Partial<Record<T, number>>,
+  order: readonly T[]
+): Partial<Record<T, number>> {
+  const result: Partial<Record<T, number>> = {};
+  for (const key of order) {
+    const delta = (candidate[key] ?? 0) - (baseline[key] ?? 0);
+    if (delta !== 0) result[key] = delta;
+  }
+  return result;
+}
+
+export function compareCollaborationEvaluationFixtures(
+  baseline: CollaborationEvaluationFixture,
+  candidate: CollaborationEvaluationFixture
+) {
+  const baselineSignals = countValues(detectCollaborationQualitySignals(baseline).map(({ type }) => type));
+  const candidateSignals = countValues(detectCollaborationQualitySignals(candidate).map(({ type }) => type));
+  return {
+    baselineFixtureId: baseline.id,
+    candidateFixtureId: candidate.id,
+    baselineAttribution: baseline.attribution,
+    candidateAttribution: candidate.attribution,
+    deltas: {
+      automatedSignals: deltas<CollaborationSignalType>(baselineSignals, candidateSignals, [
+        'recursive_handoff_attempt', 'duplicate_investigation',
+        'unsupported_certainty', 'routing_disagreement'
+      ]),
+      completionOutcomes: deltas<EvaluationOutcome>(
+        countValues(baseline.outcomes), countValues(candidate.outcomes),
+        ['completed', 'failed', 'cancelled', 'expired', 'rejected']
+      ),
+      pilotFeedback: deltas<FeedbackRating>(
+        countValues(baseline.pilotFeedback), countValues(candidate.pilotFeedback),
+        ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated']
+      )
+    }
+  };
+}
+
 export function detectCollaborationQualitySignals(input: {
   handoffDepths: number[];
   findings: Array<{ id: string; summary: string; confidence: number; evidenceReferences: string[] }>;
   routingDecisions: Array<{ id: string; selectedIntent: string; correctedIntent: string | null }>;
-}): Array<{ type: 'recursive_handoff_attempt' | 'duplicate_investigation' | 'unsupported_certainty' | 'routing_disagreement'; outcomeId: string }> {
-  const signals: Array<{ type: 'recursive_handoff_attempt' | 'duplicate_investigation' | 'unsupported_certainty' | 'routing_disagreement'; outcomeId: string }> = [];
+}): Array<{ type: CollaborationSignalType; outcomeId: string }> {
+  const signals: Array<{ type: CollaborationSignalType; outcomeId: string }> = [];
   if (input.handoffDepths.some((depth) => depth > 1)) {
     signals.push({ type: 'recursive_handoff_attempt', outcomeId: 'handoff-policy' });
   }
@@ -36,17 +175,45 @@ export function detectCollaborationQualitySignals(input: {
   return signals;
 }
 
+type AgentInboxState = 'queued' | 'active' | 'waiting' | 'blocked' | 'review_ready' | 'completed';
+
+interface AgentInboxLinks {
+  messageId: string;
+  taskId: string | null;
+  agentRunId: string | null;
+  clarificationId: string | null;
+  clarificationMessageId: string | null;
+  approvalId: string | null;
+  approvalMessageId: string | null;
+  handoffId: string | null;
+  coordinationPlanId: string | null;
+  coordinationStepId: string | null;
+  resultMessageId: string | null;
+  artifactId: string | null;
+  artifactMessageId: string | null;
+}
+
+type AgentInboxCounts = Record<AgentInboxState | 'total', number>;
+
+function emptyAgentInboxCounts(): AgentInboxCounts {
+  return {
+    total: 0, queued: 0, active: 0, waiting: 0,
+    blocked: 0, review_ready: 0, completed: 0
+  };
+}
+
 export interface AgentInboxItem {
   id: string;
   agentId: string;
   agentName: string;
-  state: 'queued' | 'active' | 'waiting' | 'blocked' | 'review_ready' | 'completed';
+  state: AgentInboxState;
   kind: 'task' | 'handoff' | 'coordination_step';
   sourceMessageId: string;
   relatedId: string;
   summary: string;
   requiresHumanAction: boolean;
   urgency: 'high' | 'normal' | 'low';
+  links: AgentInboxLinks;
 }
 
 interface VisibleCoordinationStep {
@@ -57,7 +224,7 @@ interface VisibleCoordinationStep {
   instruction: string;
   dependencies: string[];
   expectedOutput: 'concise_text' | 'structured_finding' | 'artifact';
-  status: string;
+  status: CoordinationStepStatus;
   resultMessageId: string | null;
   artifactId: string | null;
 }
@@ -78,6 +245,7 @@ export async function loadCollaborationAccountability(
     [access.workspace.id, access.membership.id, projectId]
   );
   if (!membership.rows[0]?.allowed) throw new AccountabilityError('active Project membership is required');
+  await purgeExpiredCollaborationEvaluation(pool, access.workspace.id, projectId);
 
   const [steering, memory, plans, findings, inbox, capacity, evaluation] = await Promise.all([
     pool.query<{
@@ -98,24 +266,44 @@ export async function loadCollaborationAccountability(
     ),
     pool.query<{
       id: string; memory_type: string; statement: string; source_references: string[];
-      lifecycle: string; supersedes_id: string | null; created_at: Date;
+      lifecycle: string; supersedes_id: string | null; author_name: string; created_at: Date;
     }>(
-      `SELECT id, memory_type, statement, source_references, lifecycle, supersedes_id, created_at
-       FROM public.project_memory WHERE workspace_id = $1 AND project_id = $2
-       ORDER BY created_at, id`,
+      `SELECT memory.id, memory.memory_type, memory.statement, memory.source_references,
+              memory.lifecycle, memory.supersedes_id,
+              COALESCE(pilot_user.name, agent.name) AS author_name, memory.created_at
+       FROM public.project_memory memory
+       JOIN public.workspace_member author ON author.id = memory.author_workspace_member_id
+       LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
+       LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+       LEFT JOIN public.agent agent ON agent.id = author.agent_id
+       WHERE memory.workspace_id = $1 AND memory.project_id = $2
+       ORDER BY memory.created_at, memory.id`,
       [access.workspace.id, projectId]
     ),
     pool.query<{
-      id: string; source_message_id: string; goal: string; constraints: string[]; status: string; allow_parallel: boolean;
+      id: string; source_message_id: string; goal: string; constraints: string[]; status: CoordinationPlanStatus; allow_parallel: boolean;
       max_participants: number; max_handoffs: number; max_depth: number; max_agent_runs: number;
       max_elapsed_seconds: number; provider_usage_limit: string | null;
       provider_usage_consumed: string | null; provider_usage_known: boolean;
-      steps: VisibleCoordinationStep[]; consumed_handoffs: number;
+      started_at: Date | null; budget_stop_reason: string | null;
+      budget_notice_message_id: string | null;
+      steps: VisibleCoordinationStep[]; participant_count: number;
+      consumed_handoffs: number; consumed_agent_runs: number;
+      reservation_accounting: {
+        reserved: number; started: number; failedStart: number;
+        failed: number; cancelled: number; completed: number;
+      };
+      constraint_inputs: Array<{
+        id: string; sourceMessageId: string; guidance: string; ordinal: number;
+        status: 'pending' | 'delivered'; deliveryConversationTurnId: string | null;
+        suppliedBy: string; createdAt: string;
+      }>;
     }>(
       `SELECT plan.id, plan.source_message_id, plan.goal, plan.constraints, plan.status, plan.allow_parallel,
               plan.max_participants, plan.max_handoffs, plan.max_depth, plan.max_agent_runs,
               plan.max_elapsed_seconds, plan.provider_usage_limit,
               plan.provider_usage_consumed, plan.provider_usage_known,
+              plan.started_at, plan.budget_stop_reason, plan.budget_notice_message_id,
               COALESCE(jsonb_agg(jsonb_build_object(
                 'id', step.id, 'key', step.step_key, 'agentId', step.target_agent_id,
                 'agentName', agent.name, 'instruction', step.instruction,
@@ -123,8 +311,41 @@ export async function loadCollaborationAccountability(
                 'status', step.status, 'resultMessageId', step.result_message_id,
                 'artifactId', step.artifact_id
               ) ORDER BY step.position, step.id) FILTER (WHERE step.id IS NOT NULL), '[]') AS steps,
-              (SELECT count(*)::integer FROM public.coordination_budget_reservation reservation
-               WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'handoff') AS consumed_handoffs
+              count(DISTINCT step.target_agent_id)::integer AS participant_count,
+              (SELECT COALESCE(sum(reservation.amount), 0)::integer
+               FROM public.coordination_budget_reservation reservation
+               WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'handoff') AS consumed_handoffs,
+              (SELECT COALESCE(sum(reservation.amount), 0)::integer
+               FROM public.coordination_budget_reservation reservation
+               WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'agent_run') AS consumed_agent_runs,
+              (SELECT jsonb_build_object(
+                 'reserved', COALESCE(sum(amount) FILTER (WHERE outcome = 'reserved'), 0),
+                 'started', COALESCE(sum(amount) FILTER (WHERE outcome = 'started'), 0),
+                 'failedStart', COALESCE(sum(amount) FILTER (WHERE outcome = 'failed_start'), 0),
+                 'failed', COALESCE(sum(amount) FILTER (WHERE outcome = 'failed'), 0),
+                 'cancelled', COALESCE(sum(amount) FILTER (WHERE outcome = 'cancelled'), 0),
+                 'completed', COALESCE(sum(amount) FILTER (WHERE outcome = 'completed'), 0)
+               ) FROM public.coordination_budget_reservation reservation
+               WHERE reservation.plan_id = plan.id) AS reservation_accounting,
+              COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'id', constraint_input.id,
+                  'sourceMessageId', constraint_input.source_message_id,
+                  'guidance', constraint_input.guidance,
+                  'ordinal', constraint_input.ordinal,
+                  'status', constraint_input.status,
+                  'deliveryConversationTurnId', constraint_input.delivery_conversation_turn_id,
+                  'suppliedBy', pilot_user.name,
+                  'createdAt', constraint_input.created_at
+                ) ORDER BY constraint_input.ordinal)
+                FROM public.coordination_plan_constraint constraint_input
+                JOIN public.workspace_member supplied_by
+                  ON supplied_by.id = constraint_input.supplied_by_workspace_member_id
+                JOIN public.workspace_membership pilot
+                  ON pilot.id = supplied_by.pilot_membership_id
+                JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
+                WHERE constraint_input.plan_id = plan.id
+              ), '[]') AS constraint_inputs
        FROM public.coordination_plan plan
        LEFT JOIN public.coordination_plan_step step ON step.plan_id = plan.id
        LEFT JOIN public.agent agent ON agent.id = step.target_agent_id
@@ -158,86 +379,242 @@ export async function loadCollaborationAccountability(
       id: string; agent_id: string; agent_name: string; state: AgentInboxItem['state'];
       kind: AgentInboxItem['kind']; source_message_id: string; related_id: string;
       summary: string; requires_human_action: boolean;
+      task_id: string | null; agent_run_id: string | null;
+      clarification_id: string | null; clarification_message_id: string | null;
+      approval_id: string | null; approval_message_id: string | null;
+      handoff_id: string | null; coordination_plan_id: string | null;
+      coordination_step_id: string | null; result_message_id: string | null;
+      artifact_id: string | null;
+      artifact_message_id: string | null;
     }>(
       `SELECT * FROM (
          SELECT run.id, task.assigned_agent_id AS agent_id, agent.name AS agent_name,
            CASE WHEN run.status = 'queued' THEN 'queued'
                 WHEN run.status IN ('planning', 'working', 'recovering') THEN 'active'
-                WHEN run.status IN ('waiting_for_input', 'waiting_for_approval', 'paused') THEN 'waiting'
-                WHEN run.status = 'completed' THEN 'review_ready'
+                WHEN run.status = 'waiting_for_input' THEN 'waiting'
+                WHEN run.status IN ('waiting_for_approval', 'paused') THEN 'blocked'
+                WHEN run.status = 'failed' AND task.status = 'open' THEN 'blocked'
+                WHEN run.status = 'completed' AND artifact.id IS NOT NULL THEN 'review_ready'
                 ELSE 'completed' END AS state,
            'task'::text AS kind, task.source_message_id, task.id AS related_id,
            task.request_snapshot AS summary,
-           run.status IN ('waiting_for_input', 'waiting_for_approval', 'paused') AS requires_human_action,
-           run.created_at
-         FROM public.task task JOIN public.agent_run run ON run.task_id = task.id
+           clarification.id IS NOT NULL OR approval.state = 'pending'
+             OR run.status = 'paused' OR (run.status = 'failed' AND task.status = 'open')
+             OR artifact.id IS NOT NULL AS requires_human_action,
+           run.updated_at AS activity_at,
+           task.id AS task_id, run.id AS agent_run_id,
+           clarification.id AS clarification_id,
+           clarification.request_message_id AS clarification_message_id,
+           approval.id AS approval_id, approval.request_message_id AS approval_message_id,
+           NULL::text AS handoff_id, NULL::text AS coordination_plan_id,
+           NULL::text AS coordination_step_id, NULL::text AS result_message_id,
+           artifact.id AS artifact_id,
+           artifact.result_message_id AS artifact_message_id
+         FROM public.task task
+         JOIN LATERAL (
+           SELECT candidate.* FROM public.agent_run candidate
+           WHERE candidate.task_id = task.id
+           ORDER BY candidate.attempt_number DESC, candidate.created_at DESC, candidate.id DESC
+           LIMIT 1
+         ) run ON true
          JOIN public.agent agent ON agent.id = task.assigned_agent_id
+         LEFT JOIN public.agent_run_clarification clarification
+           ON clarification.agent_run_id = run.id AND clarification.status = 'pending'
+         LEFT JOIN public.approval approval
+           ON approval.agent_run_id = run.id AND approval.state IN ('pending', 'approved')
+         LEFT JOIN public.artifact artifact ON artifact.agent_run_id = run.id
          WHERE task.workspace_id = $1 AND task.project_id = $2
+           AND (run.status NOT IN ('completed', 'failed', 'cancelled')
+             OR COALESCE(run.completed_at, run.updated_at) >= now() - interval '30 days')
          UNION ALL
          SELECT handoff.id, handoff.target_agent_id, agent.name,
            CASE WHEN handoff.status = 'queued' THEN 'queued' WHEN handoff.status = 'working' THEN 'active'
-                WHEN handoff.status = 'completed' THEN 'completed' ELSE 'blocked' END,
+                WHEN handoff.status IN ('failed', 'expired') THEN 'blocked' ELSE 'completed' END,
            'handoff', handoff.source_message_id, handoff.id, handoff.question,
-           handoff.status IN ('failed', 'expired'), handoff.created_at
+           handoff.status IN ('failed', 'expired'), handoff.updated_at,
+           handoff.source_task_id, NULL::text, NULL::text, NULL::text,
+           NULL::text, NULL::text, handoff.id, NULL::text, NULL::text,
+           handoff.result_message_id, NULL::text, NULL::text
          FROM public.agent_handoff handoff JOIN public.agent agent ON agent.id = handoff.target_agent_id
          WHERE handoff.workspace_id = $1 AND handoff.project_id = $2
+           AND (handoff.status NOT IN ('completed', 'failed', 'expired', 'cancelled')
+             OR COALESCE(handoff.completed_at, handoff.expired_at, handoff.cancelled_at, handoff.updated_at)
+                >= now() - interval '30 days')
          UNION ALL
          SELECT step.id, step.target_agent_id, agent.name,
-           CASE WHEN step.status IN ('pending', 'ready') THEN 'queued'
+           CASE WHEN step.status IN ('completed', 'cancelled') THEN 'completed'
+                WHEN step.status = 'failed' OR plan.status IN ('paused', 'failed') THEN 'blocked'
+                WHEN plan.status IN ('rejected', 'cancelled', 'completed') THEN 'completed'
+                WHEN plan.status = 'proposed' OR step.status = 'blocked' THEN 'blocked'
+                WHEN step.status IN ('pending', 'ready') THEN 'queued'
                 WHEN step.status = 'active' THEN 'active'
-                WHEN step.status = 'completed' THEN 'completed' ELSE 'blocked' END,
+                ELSE 'completed' END,
            'coordination_step', plan.source_message_id, step.plan_id, step.instruction,
-           plan.status IN ('proposed', 'paused') OR step.status IN ('blocked', 'failed'), step.created_at
+           plan.status IN ('proposed', 'paused') OR step.status IN ('blocked', 'failed'),
+           COALESCE(step.completed_at, step.started_at, step.created_at),
+           NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+           NULL::text, plan.id, step.id, step.result_message_id, step.artifact_id,
+           artifact.result_message_id
          FROM public.coordination_plan_step step
          JOIN public.coordination_plan plan ON plan.id = step.plan_id
          JOIN public.agent agent ON agent.id = step.target_agent_id
+         LEFT JOIN public.artifact artifact ON artifact.id = step.artifact_id
          WHERE step.workspace_id = $1 AND step.project_id = $2
-       ) items ORDER BY created_at, id`,
+           AND (step.status NOT IN ('completed', 'failed', 'cancelled')
+             OR COALESCE(step.completed_at, step.started_at, step.created_at)
+                >= now() - interval '30 days')
+       ) items ORDER BY activity_at DESC, id`,
       [access.workspace.id, projectId]
     ),
     pool.query<{
-      agent_id: string; active_work: number; enabled: boolean; provider_ready: boolean;
+      agent_id: string; active_work: number; provider_connection_active_work: number;
+      enabled: boolean; provider_ready: boolean;
     }>(
-      `SELECT agent.id AS agent_id,
-              count(*) FILTER (WHERE work.active)::integer AS active_work,
+      `WITH active_work AS (
+         SELECT run.id AS work_id, run.agent_id, run.provider_connection_id, task.project_id
+         FROM public.agent_run run
+         JOIN public.task task ON task.id = run.task_id
+         WHERE run.status NOT IN ('completed', 'failed', 'cancelled')
+         UNION ALL
+         SELECT turn.id, conversation.agent_id, conversation.provider_connection_id,
+                channel.project_id
+         FROM public.agent_conversation conversation
+         JOIN public.agent_conversation_turn turn ON turn.conversation_id = conversation.id
+         JOIN public.channel channel ON channel.id = conversation.channel_id
+         WHERE turn.status IN ('queued', 'working')
+       )
+       SELECT agent.id AS agent_id,
+              COALESCE(work.active_work, 0)::integer AS active_work,
+              COALESCE(provider_work.active_work, 0)::integer AS provider_connection_active_work,
               agent.enabled AND agent.status <> 'disabled' AS enabled,
-              COALESCE(bool_or(provider.status = 'ready'), false) AS provider_ready
+              provider.status = 'ready' AS provider_ready
        FROM public.agent agent
        LEFT JOIN public.provider_connection provider ON provider.workspace_id = agent.workspace_id
        LEFT JOIN LATERAL (
-         SELECT true AS active FROM public.agent_run run
-         WHERE run.agent_id = agent.id AND run.status NOT IN ('completed', 'failed', 'cancelled')
-         UNION ALL
-         SELECT true FROM public.agent_conversation conversation
-         JOIN public.agent_conversation_turn turn ON turn.conversation_id = conversation.id
-         WHERE conversation.agent_id = agent.id AND turn.status IN ('queued', 'working')
+         SELECT count(*)::integer AS active_work FROM active_work
+         WHERE agent_id = agent.id AND project_id = $2
        ) work ON true
+       LEFT JOIN LATERAL (
+         SELECT count(*)::integer AS active_work FROM active_work
+         WHERE provider_connection_id = provider.id
+       ) provider_work ON true
        WHERE agent.workspace_id = $1
          AND EXISTS (
            SELECT 1 FROM public.workspace_member member
            JOIN public.project_membership project_member ON project_member.workspace_member_id = member.id
            WHERE member.agent_id = agent.id AND project_member.project_id = $2
          )
-       GROUP BY agent.id, agent.enabled, agent.status
        ORDER BY agent.id`,
       [access.workspace.id, projectId]
     ),
-    pool.query<{
-      agent_type: string; routing_policy_version: string | null;
+    pool.query<CollaborationEvaluationAttributionRow & {
       event_count: number; policy_rejections: number; overrides: number;
+      recursive_handoff_attempts: number; duplicate_investigations: number;
+      unsupported_certainty: number; routing_disagreements: number;
+      completed_outcomes: number; failed_outcomes: number; cancelled_outcomes: number;
+      expired_outcomes: number; rejected_outcomes: number;
+      useful: number; incorrect: number; incomplete: number; unnecessarily_delegated: number;
     }>(
-      `SELECT COALESCE(agent.agent_type, 'unattributed') AS agent_type,
-              event.routing_policy_version, count(*)::integer AS event_count,
-              count(*) FILTER (WHERE event.event_type = 'policy.rejected')::integer AS policy_rejections,
-              count(*) FILTER (WHERE event.event_type = 'pilot.override')::integer AS overrides
-       FROM public.collaboration_evaluation_event event
-       LEFT JOIN public.agent agent ON agent.id = event.agent_id
-       WHERE event.workspace_id = $1 AND event.project_id = $2
-       GROUP BY agent.agent_type, event.routing_policy_version
-       ORDER BY agent.agent_type, event.routing_policy_version`,
+      `WITH event_rollup AS (
+         SELECT event.agent_type,
+                event.routing_policy_version, event.prompt_version,
+                event.permission_policy_version, event.agent_configuration_version,
+                count(*)::integer AS event_count,
+                count(*) FILTER (WHERE event.event_type = 'policy.rejected')::integer AS policy_rejections,
+                count(*) FILTER (WHERE event.event_type = 'pilot.override')::integer AS overrides,
+                count(*) FILTER (WHERE event.event_type = 'recursive.handoff_attempt')::integer AS recursive_handoff_attempts,
+                count(*) FILTER (WHERE event.event_type = 'duplicate.investigation')::integer AS duplicate_investigations,
+                count(*) FILTER (WHERE event.event_type = 'unsupported.certainty')::integer AS unsupported_certainty,
+                count(*) FILTER (WHERE event.event_type = 'routing.disagreement')::integer AS routing_disagreements,
+                count(*) FILTER (WHERE event.event_type = 'outcome.completed')::integer AS completed_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.failed')::integer AS failed_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.cancelled')::integer AS cancelled_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.expired')::integer AS expired_outcomes,
+                count(*) FILTER (WHERE event.event_type = 'outcome.rejected')::integer AS rejected_outcomes
+         FROM public.collaboration_evaluation_event event
+         WHERE event.workspace_id = $1 AND event.project_id = $2 AND event.expires_at > now()
+         GROUP BY event.agent_type, event.routing_policy_version, event.prompt_version,
+                  event.permission_policy_version, event.agent_configuration_version
+       ), feedback_rollup AS (
+         SELECT feedback.agent_type,
+                feedback.routing_policy_version, feedback.prompt_version,
+                feedback.permission_policy_version, feedback.agent_configuration_version,
+                count(*) FILTER (WHERE feedback.rating = 'useful')::integer AS useful,
+                count(*) FILTER (WHERE feedback.rating = 'incorrect')::integer AS incorrect,
+                count(*) FILTER (WHERE feedback.rating = 'incomplete')::integer AS incomplete,
+                count(*) FILTER (WHERE feedback.rating = 'unnecessarily_delegated')::integer AS unnecessarily_delegated
+         FROM public.collaboration_feedback feedback
+         WHERE feedback.workspace_id = $1 AND feedback.project_id = $2 AND feedback.expires_at > now()
+         GROUP BY feedback.agent_type, feedback.routing_policy_version, feedback.prompt_version,
+                  feedback.permission_policy_version, feedback.agent_configuration_version
+       ), report_keys AS (
+         SELECT agent_type, routing_policy_version, prompt_version,
+                permission_policy_version, agent_configuration_version FROM event_rollup
+         UNION
+         SELECT agent_type, routing_policy_version, prompt_version,
+                permission_policy_version, agent_configuration_version FROM feedback_rollup
+       )
+       SELECT report_keys.*,
+              COALESCE(event.event_count, 0)::integer AS event_count,
+              COALESCE(event.policy_rejections, 0)::integer AS policy_rejections,
+              COALESCE(event.overrides, 0)::integer AS overrides,
+              COALESCE(event.recursive_handoff_attempts, 0)::integer AS recursive_handoff_attempts,
+              COALESCE(event.duplicate_investigations, 0)::integer AS duplicate_investigations,
+              COALESCE(event.unsupported_certainty, 0)::integer AS unsupported_certainty,
+              COALESCE(event.routing_disagreements, 0)::integer AS routing_disagreements,
+              COALESCE(event.completed_outcomes, 0)::integer AS completed_outcomes,
+              COALESCE(event.failed_outcomes, 0)::integer AS failed_outcomes,
+              COALESCE(event.cancelled_outcomes, 0)::integer AS cancelled_outcomes,
+              COALESCE(event.expired_outcomes, 0)::integer AS expired_outcomes,
+              COALESCE(event.rejected_outcomes, 0)::integer AS rejected_outcomes,
+              COALESCE(feedback.useful, 0)::integer AS useful,
+              COALESCE(feedback.incorrect, 0)::integer AS incorrect,
+              COALESCE(feedback.incomplete, 0)::integer AS incomplete,
+              COALESCE(feedback.unnecessarily_delegated, 0)::integer AS unnecessarily_delegated
+       FROM report_keys
+       LEFT JOIN event_rollup event USING (
+         agent_type, routing_policy_version, prompt_version,
+         permission_policy_version, agent_configuration_version
+       )
+       LEFT JOIN feedback_rollup feedback USING (
+         agent_type, routing_policy_version, prompt_version,
+         permission_policy_version, agent_configuration_version
+       )
+       ORDER BY agent_type, routing_policy_version, prompt_version,
+                permission_policy_version, agent_configuration_version`,
       [access.workspace.id, projectId]
     )
   ]);
+
+  const inboxItems = inbox.rows.map((row): AgentInboxItem => ({
+    id: row.id, agentId: row.agent_id, agentName: row.agent_name, state: row.state,
+    kind: row.kind, sourceMessageId: row.source_message_id, relatedId: row.related_id,
+    summary: row.summary, requiresHumanAction: row.requires_human_action,
+    urgency: row.requires_human_action ? 'high'
+      : ['queued', 'active', 'blocked', 'review_ready'].includes(row.state) ? 'normal' : 'low',
+    links: {
+      messageId: row.source_message_id,
+      taskId: row.task_id,
+      agentRunId: row.agent_run_id,
+      clarificationId: row.clarification_id,
+      clarificationMessageId: row.clarification_message_id,
+      approvalId: row.approval_id,
+      approvalMessageId: row.approval_message_id,
+      handoffId: row.handoff_id,
+      coordinationPlanId: row.coordination_plan_id,
+      coordinationStepId: row.coordination_step_id,
+      resultMessageId: row.result_message_id,
+      artifactId: row.artifact_id,
+      artifactMessageId: row.artifact_message_id
+    }
+  }));
+  const inboxCounts = new Map<string, AgentInboxCounts>();
+  for (const item of inboxItems) {
+    const counts = inboxCounts.get(item.agentId) ?? emptyAgentInboxCounts();
+    counts.total += 1;
+    counts[item.state] += 1;
+    inboxCounts.set(item.agentId, counts);
+  }
 
   return {
     steering: steering.rows.map((row) => ({
@@ -245,18 +622,45 @@ export async function loadCollaborationAccountability(
       guidance: row.guidance, ordinal: row.ordinal, status: row.status,
       suppliedBy: row.supplied_by, createdAt: row.created_at.toISOString()
     })),
-    plans: plans.rows.map((row) => ({
-      id: row.id, sourceMessageId: row.source_message_id, goal: row.goal,
-      constraints: row.constraints, status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
-      budget: {
-        maxParticipants: row.max_participants, maxHandoffs: row.max_handoffs,
-        consumedHandoffs: row.consumed_handoffs, maxDepth: row.max_depth,
-        maxAgentRuns: row.max_agent_runs, maxElapsedSeconds: row.max_elapsed_seconds,
-        providerUsage: row.provider_usage_known
-          ? { known: true, consumed: Number(row.provider_usage_consumed), limit: row.provider_usage_limit === null ? null : Number(row.provider_usage_limit) }
-          : { known: false, consumed: null, limit: row.provider_usage_limit === null ? null : Number(row.provider_usage_limit) }
+    plans: plans.rows.map((row) => {
+      const elapsedSeconds = row.started_at === null
+        ? 0 : Math.max(0, Math.floor((Date.now() - row.started_at.getTime()) / 1000));
+      const providerLimit = row.provider_usage_limit === null ? null : Number(row.provider_usage_limit);
+      const providerConsumed = row.provider_usage_known ? Number(row.provider_usage_consumed ?? 0) : null;
+      const warnings: string[] = [];
+      if (row.max_handoffs - row.consumed_handoffs === 1) warnings.push('handoff_limit');
+      if (row.max_agent_runs > 0 && row.max_agent_runs - row.consumed_agent_runs === 1) {
+        warnings.push('agent_run_limit');
       }
-    })),
+      if (row.started_at && row.max_elapsed_seconds - elapsedSeconds <= Math.max(60, row.max_elapsed_seconds * 0.1)) {
+        warnings.push('elapsed_time_limit');
+      }
+      if (providerLimit !== null && providerConsumed !== null
+        && providerLimit - providerConsumed <= Math.max(1, providerLimit * 0.1)) {
+        warnings.push('provider_usage_limit');
+      }
+      return {
+        id: row.id, sourceMessageId: row.source_message_id, goal: row.goal,
+        constraints: row.constraints, status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
+        constraintInputs: row.constraint_inputs,
+        budget: {
+          state: row.budget_stop_reason ? 'exhausted' as const
+            : warnings.length > 0 ? 'approaching' as const : 'available' as const,
+          warnings,
+          stopReason: row.budget_stop_reason,
+          noticeMessageId: row.budget_notice_message_id,
+          reservationAccounting: row.reservation_accounting,
+          maxParticipants: row.max_participants, consumedParticipants: row.participant_count,
+          maxHandoffs: row.max_handoffs, consumedHandoffs: row.consumed_handoffs,
+          maxDepth: row.max_depth,
+          maxAgentRuns: row.max_agent_runs, consumedAgentRuns: row.consumed_agent_runs,
+          maxElapsedSeconds: row.max_elapsed_seconds, elapsedSeconds,
+          providerUsage: row.provider_usage_known
+            ? { known: true as const, consumed: providerConsumed!, limit: providerLimit }
+            : { known: false as const, consumed: null, limit: providerLimit }
+        }
+      };
+    }),
     findings: findings.rows.map((row) => ({
       id: row.id, resultMessageId: row.result_message_id, sourceHandoffId: row.source_handoff_id,
       summary: row.summary, confidence: Number(row.confidence), observedEvidence: row.observed_evidence,
@@ -267,27 +671,50 @@ export async function loadCollaborationAccountability(
     memory: memory.rows.map((row) => ({
       id: row.id, type: row.memory_type, statement: row.statement,
       sourceReferences: row.source_references, lifecycle: row.lifecycle,
-      supersedesId: row.supersedes_id, createdAt: row.created_at.toISOString()
+      supersedesId: row.supersedes_id, authorName: row.author_name,
+      createdAt: row.created_at.toISOString()
     })),
-    inbox: inbox.rows.map((row): AgentInboxItem => ({
-      id: row.id, agentId: row.agent_id, agentName: row.agent_name, state: row.state,
-      kind: row.kind, sourceMessageId: row.source_message_id, relatedId: row.related_id,
-      summary: row.summary, requiresHumanAction: row.requires_human_action,
-      urgency: row.requires_human_action ? 'high'
-        : ['queued', 'active', 'blocked', 'review_ready'].includes(row.state) ? 'normal' : 'low'
-    })),
+    inbox: inboxItems,
     capacity: capacity.rows.map((row) => ({
       agentId: row.agent_id,
       activeWork: row.active_work,
-      available: row.enabled && row.provider_ready && row.active_work === 0,
-      reason: !row.enabled ? 'disabled' : !row.provider_ready ? 'provider_unavailable'
-        : row.active_work > 0 ? 'occupied' : 'available'
+      providerConnectionActiveWork: row.provider_connection_active_work,
+      inboxCounts: inboxCounts.get(row.agent_id) ?? emptyAgentInboxCounts(),
+      available: row.enabled && row.provider_ready && row.provider_connection_active_work === 0,
+      reason: !row.enabled ? 'disabled' : !row.provider_ready ? 'provider_connection_unavailable'
+        : row.active_work > 0 ? 'occupied'
+          : row.provider_connection_active_work > 0 ? 'provider_connection_occupied' : 'available'
     })),
     evaluation: evaluation.rows.map((row) => ({
-      agentType: row.agent_type, routingPolicyVersion: row.routing_policy_version,
-      eventCount: row.event_count, policyRejections: row.policy_rejections, overrides: row.overrides
+      ...mapCollaborationEvaluationAttribution(row),
+      eventCount: row.event_count, policyRejections: row.policy_rejections, overrides: row.overrides,
+      automatedChecks: {
+        recursiveHandoffAttempts: row.recursive_handoff_attempts,
+        duplicateInvestigations: row.duplicate_investigations,
+        unsupportedCertainty: row.unsupported_certainty,
+        routingDisagreements: row.routing_disagreements
+      },
+      completionOutcomes: {
+        completed: row.completed_outcomes, failed: row.failed_outcomes,
+        cancelled: row.cancelled_outcomes, expired: row.expired_outcomes, rejected: row.rejected_outcomes
+      },
+      pilotFeedback: {
+        useful: row.useful, incorrect: row.incorrect, incomplete: row.incomplete,
+        unnecessarilyDelegated: row.unnecessarily_delegated
+      }
     }))
   };
+}
+
+export async function purgeExpiredCollaborationEvaluation(
+  pool: Pool,
+  workspaceId: string,
+  projectId: string
+): Promise<void> {
+  await pool.query(
+    'SELECT public.purge_expired_collaboration_evaluation($1, $2)',
+    [workspaceId, projectId]
+  );
 }
 
 export async function submitCollaborationFeedback(
@@ -303,7 +730,7 @@ export async function submitCollaborationFeedback(
     || !['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'].includes(input.rating)) {
     throw new AccountabilityError('Feedback target or rating is invalid');
   }
-  const reason = input.reason?.trim() || null;
+  const reason = input.reason ? normalizeCollaborationEvaluationText(input.reason) || null : null;
   if (reason && reason.length > 1000) throw new AccountabilityError('Feedback reason is too long');
   const actor = await pool.query<{ id: string }>(
     `SELECT member.id FROM public.workspace_member member
@@ -322,20 +749,58 @@ export async function submitCollaborationFeedback(
   const projectPredicate = input.outcomeType === 'message'
     ? 'target_channel.project_id = $3'
     : input.outcomeType === 'agent_run' ? 'target_task.project_id = $3' : 'target.project_id = $3';
-  const target = await pool.query<{ allowed: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM ${targetTable}
-     WHERE target.id = $1 AND target.workspace_id = $2 AND ${projectPredicate}) AS allowed`,
-    [input.outcomeId, access.workspace.id, input.projectId]
+  const targetAgent = {
+    message: `(SELECT author.agent_id FROM public.workspace_member author
+               WHERE author.id = target.author_workspace_member_id
+                 AND author.workspace_id = target.workspace_id)`,
+    handoff: 'target.target_agent_id', agent_run: 'target.agent_id',
+    finding: 'target.author_agent_id', coordination_plan: 'target.coordinating_agent_id'
+  }[input.outcomeType];
+  const target = await pool.query<CollaborationEvaluationAttributionRow & { agent_id: string | null }>(
+    `SELECT ${targetAgent} AS agent_id,
+            COALESCE(attribution.agent_type, agent.agent_type, 'unattributed') AS agent_type,
+            COALESCE(attribution.routing_policy_version, 'not-applicable-v1') AS routing_policy_version,
+            COALESCE(attribution.prompt_version, 'not-applicable-v1') AS prompt_version,
+            COALESCE(attribution.permission_policy_version, 'not-applicable-v1') AS permission_policy_version,
+            COALESCE(attribution.agent_configuration_version,
+              CASE WHEN ${targetAgent} IS NULL THEN 'unattributed-v1'
+                   ELSE 'agent-config-' || COALESCE(agent.configuration_version, 1)::text END
+            ) AS agent_configuration_version
+     FROM ${targetTable}
+     LEFT JOIN public.agent agent ON agent.id = ${targetAgent} AND agent.workspace_id = target.workspace_id
+     LEFT JOIN LATERAL (
+       SELECT event.agent_type, event.routing_policy_version, event.prompt_version,
+              event.permission_policy_version, event.agent_configuration_version
+       FROM public.collaboration_evaluation_event event
+       WHERE event.workspace_id = target.workspace_id AND event.project_id = $3
+         AND event.outcome_type = $4 AND event.outcome_id = target.id
+       ORDER BY event.created_at DESC, event.id DESC LIMIT 1
+     ) attribution ON true
+     WHERE target.id = $1 AND target.workspace_id = $2 AND ${projectPredicate}`,
+    [input.outcomeId, access.workspace.id, input.projectId, input.outcomeType]
   );
-  if (!target.rows[0]?.allowed) throw new AccountabilityError('Feedback outcome is outside the Project');
+  const attribution = target.rows[0];
+  if (!attribution) throw new AccountabilityError('Feedback outcome is outside the Project');
   await pool.query(
     `INSERT INTO public.collaboration_feedback (
        id, workspace_id, project_id, submitted_by_workspace_member_id,
-       outcome_type, outcome_id, rating, reason
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       outcome_type, outcome_id, rating, reason, agent_id, agent_type,
+       routing_policy_version, prompt_version, permission_policy_version,
+       agent_configuration_version
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (submitted_by_workspace_member_id, outcome_type, outcome_id)
-     DO UPDATE SET rating = EXCLUDED.rating, reason = EXCLUDED.reason, created_at = now()`,
+     DO UPDATE SET rating = EXCLUDED.rating, reason = EXCLUDED.reason,
+       agent_id = EXCLUDED.agent_id,
+       agent_type = EXCLUDED.agent_type,
+       routing_policy_version = EXCLUDED.routing_policy_version,
+       prompt_version = EXCLUDED.prompt_version,
+       permission_policy_version = EXCLUDED.permission_policy_version,
+       agent_configuration_version = EXCLUDED.agent_configuration_version,
+       created_at = now(), expires_at = DEFAULT`,
     [randomUUID(), access.workspace.id, input.projectId, actor.rows[0].id,
-      input.outcomeType, input.outcomeId, input.rating, reason]
+      input.outcomeType, input.outcomeId, input.rating, reason, attribution.agent_id,
+      attribution.agent_type,
+      attribution.routing_policy_version, attribution.prompt_version,
+      attribution.permission_policy_version, attribution.agent_configuration_version]
   );
 }

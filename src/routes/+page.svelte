@@ -1,7 +1,15 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { canResumeCoordinationPlan } from '$lib/coordination-presentation.js';
+  import {
+    agentTemplatePreviewCacheKey,
+    beginAgentTemplatePreviewRequest,
+    cacheAgentTemplatePreview,
+    createAgentTemplatePreviewCache,
+    invalidateAgentTemplatePreviews
+  } from '$lib/agent-template-preview-cache.js';
   import BrandMark from '$lib/BrandMark.svelte';
   import JitsiCall from '$lib/JitsiCall.svelte';
   import MarkdownMessage from '$lib/MarkdownMessage.svelte';
@@ -51,6 +59,11 @@
   let agentReplyMode = $state<'adaptive' | 'channel' | 'thread'>('adaptive');
   let agentEnabled = $state(true);
   let agentTemplateKey = $state('');
+  let agentProjectId = $state('');
+  let agentPreviewBusy = $state(false);
+  let agentTemplatePreviewCache = $state(
+    createAgentTemplatePreviewCache<(typeof data.agentTemplatePreviews)[string]>()
+  );
   let inboxAgentFilter = $state('all');
   let inboxStateFilter = $state('all');
   let inboxUrgencyFilter = $state('all');
@@ -79,6 +92,11 @@
   let githubConfiguration = $derived(data.linkedRepository.configuration);
   let agentRuns = $derived(applyChannelReconciliation(realtimeRuns, data.reconciliation));
   let accountability = $derived(realtimeAccountability ?? data.accountability);
+  const feedbackRatings = ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as const;
+  const messageIntents = [
+    'ordinary_communication', 'conversation', 'research_request', 'engineering_delegation',
+    'progress_request', 'human_authority_decision', 'coordination_candidate'
+  ] as const;
   let filteredInbox = $derived(accountability.inbox.filter((item) =>
     (inboxAgentFilter === 'all' || item.agentId === inboxAgentFilter)
     && (inboxStateFilter === 'all' || item.state === inboxStateFilter)
@@ -88,9 +106,17 @@
   let selectedAgentTemplate = $derived(
     data.agentTemplates.find((template) => template.key === agentTemplateKey)
   );
-  let selectedTemplateOverlap = $derived(selectedAgentTemplate?.ambientTriggers.find((topic) =>
-    data.agentConfiguration.agents.some((agent) => agent.ambientTriggers.includes(topic))
-  ));
+  let selectedAgentProjectId = $derived(agentProjectId || data.sharedChannel.project.id);
+  let selectedTemplatePreview = $derived(
+    selectedAgentTemplate
+      ? agentTemplatePreviewCache.entries[
+        agentTemplatePreviewCacheKey(selectedAgentProjectId, selectedAgentTemplate.key)
+      ]
+        ?? (selectedAgentProjectId === data.sharedChannel.project.id
+          ? data.agentTemplatePreviews[selectedAgentTemplate.key]
+          : undefined)
+      : undefined
+  );
   let agentHandoffs = $derived(
     realtimeHandoffs.length > 0 ? realtimeHandoffs : data.reconciliation.handoffs
   );
@@ -142,6 +168,10 @@
     return accountability.steering.find((steering) => steering.sourceMessageId === sourceMessageId);
   }
 
+  function workloadForAgent(agentId: string) {
+    return accountability.capacity.find((capacity) => capacity.agentId === agentId);
+  }
+
   function initials(name: string) {
     return name.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
   }
@@ -156,6 +186,24 @@
     openThreadIds = openThreadIds.includes(messageId)
       ? openThreadIds.filter((id) => id !== messageId)
       : [...openThreadIds, messageId];
+  }
+
+  async function revealLinkedMessage(): Promise<void> {
+    const prefix = '#message-';
+    if (!window.location.hash.startsWith(prefix)) return;
+    let messageId: string;
+    try {
+      messageId = decodeURIComponent(window.location.hash.slice(prefix.length));
+    } catch {
+      return;
+    }
+    const message = channelMessages.find(({ id }) => id === messageId);
+    if (!message) return;
+    if (message.parentMessageId && !openThreadIds.includes(message.parentMessageId)) {
+      openThreadIds = [...openThreadIds, message.parentMessageId];
+    }
+    await tick();
+    document.getElementById(`message-${messageId}`)?.scrollIntoView({ block: 'center' });
   }
 
   function formatTime(timestamp: string) {
@@ -545,6 +593,7 @@
     };
     window.addEventListener('focus', wake);
     window.addEventListener('pageshow', wake);
+    window.addEventListener('hashchange', revealLinkedMessage);
     document.addEventListener('visibilitychange', visibilityWake);
     const typingExpiryTimer = setInterval(() => {
       const now = Date.now();
@@ -554,6 +603,7 @@
       if (Object.keys(active).length !== Object.keys(humanTypers).length) humanTypers = active;
     }, 1_000);
     void connect();
+    void revealLinkedMessage();
 
     return () => {
       stopped = true;
@@ -563,6 +613,7 @@
       realtimeSocket?.close();
       window.removeEventListener('focus', wake);
       window.removeEventListener('pageshow', wake);
+      window.removeEventListener('hashchange', revealLinkedMessage);
       document.removeEventListener('visibilitychange', visibilityWake);
     };
   });
@@ -726,14 +777,17 @@
           participationMode: agentParticipation,
           ambientTriggers: agentTopics.split(',').map((topic) => topic.trim()).filter(Boolean),
           replyMode: agentReplyMode,
-          enabled: agentEnabled
+          enabled: agentEnabled,
+          projectId: selectedAgentProjectId
         })
       });
       const result = response.status === 204 ? {} : await response.json();
       if (!response.ok) throw new Error(result.message ?? 'Agent configuration failed');
       agentMessage = editingAgentId ? 'Agent updated.' : 'Agent added.';
       resetAgentForm();
+      agentTemplatePreviewCache = invalidateAgentTemplatePreviews(agentTemplatePreviewCache);
       await invalidateAll();
+      await refreshAgentTemplatePreview(true);
     } catch (error) {
       agentMessage = error instanceof Error ? error.message : String(error);
     } finally {
@@ -749,19 +803,66 @@
       const response = await fetch('/api/workspace/agent-templates', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ key: selectedAgentTemplate.key, availableCapabilities: [] })
+        body: JSON.stringify({
+          key: selectedAgentTemplate.key,
+          projectId: selectedAgentProjectId,
+          warningAcknowledgement: selectedTemplatePreview?.warningAcknowledgement ?? null
+        })
       });
       const result = await response.json();
+      if (response.status === 409 && result.preview) {
+        const cacheKey = agentTemplatePreviewCacheKey(
+          selectedAgentProjectId,
+          selectedAgentTemplate.key
+        );
+        agentTemplatePreviewCache = cacheAgentTemplatePreview(
+          agentTemplatePreviewCache,
+          beginAgentTemplatePreviewRequest(agentTemplatePreviewCache),
+          cacheKey,
+          result.preview
+        );
+        throw new Error(result.message ?? 'Agent template warnings changed');
+      }
       if (!response.ok) throw new Error(result.message ?? 'Agent template could not be instantiated');
       agentMessage = result.disabledCapabilities.length > 0
         ? `Agent added with unavailable capabilities disabled: ${result.disabledCapabilities.join(', ')}.`
-        : 'Agent added from template.';
+        : 'Agent added from Agent template.';
       agentTemplateKey = '';
+      agentTemplatePreviewCache = invalidateAgentTemplatePreviews(agentTemplatePreviewCache);
       await invalidateAll();
     } catch (error) {
       agentMessage = error instanceof Error ? error.message : String(error);
     } finally {
       agentBusy = false;
+    }
+  }
+
+  async function refreshAgentTemplatePreview(force = false) {
+    const key = agentTemplateKey;
+    const projectId = selectedAgentProjectId;
+    if (!key) return;
+    const cacheKey = agentTemplatePreviewCacheKey(projectId, key);
+    if (!force && agentTemplatePreviewCache.entries[cacheKey]) return;
+    const request = beginAgentTemplatePreviewRequest(agentTemplatePreviewCache);
+    agentPreviewBusy = true;
+    agentMessage = '';
+    try {
+      const url = new URL('/api/workspace/agent-templates', window.location.origin);
+      url.searchParams.set('key', key);
+      url.searchParams.set('projectId', projectId);
+      const response = await fetch(url);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message ?? 'Agent template preview failed');
+      agentTemplatePreviewCache = cacheAgentTemplatePreview(
+        agentTemplatePreviewCache,
+        request,
+        cacheKey,
+        result.preview
+      );
+    } catch (error) {
+      agentMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      agentPreviewBusy = false;
     }
   }
 
@@ -793,7 +894,7 @@
     await requestReconciliation();
   }
 
-  async function decidePlan(planId: string, action: 'approve' | 'reject' | 'pause' | 'cancel') {
+  async function decidePlan(planId: string, action: 'approve' | 'reject' | 'pause' | 'resume' | 'cancel') {
     const response = await fetch(`/api/workspace/coordination/${encodeURIComponent(planId)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
@@ -880,11 +981,11 @@
     }
   }
 
-  async function correctIntent(messageId: string, intent: string) {
+  async function correctIntent(messageId: string, intent: string, targetAgentId?: string) {
     const response = await fetch(`/api/workspace/messages/${encodeURIComponent(messageId)}/intent`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ intent })
+      body: JSON.stringify({ intent, ...(targetAgentId ? { targetAgentId } : {}) })
     });
     const result = response.status === 204 ? null : await response.json();
     if (!response.ok) {
@@ -892,6 +993,33 @@
       return;
     }
     await invalidateAll();
+  }
+
+  async function promptIntentCorrection(
+    message: (typeof data.sharedChannel.messages)[number]
+  ) {
+    const intent = window.prompt(
+      `Choose Message intent:\n${messageIntents.join('\n')}`,
+      message.routingDecision?.intent
+    )?.trim();
+    if (!intent || !messageIntents.includes(intent as (typeof messageIntents)[number])) return;
+    let targetAgentId: string | undefined;
+    if (intent === 'engineering_delegation' || intent === 'research_request') {
+      const agents = sidebarMembers.filter(({ kind }) => kind === 'agent');
+      const currentName = agents.find(({ id }) => id === message.routingDecision?.targetAgentId)?.name;
+      const targetName = window.prompt(
+        `Choose target Agent:\n${agents.map(({ name }) => name).join('\n')}`,
+        currentName
+      )?.trim();
+      if (!targetName) return;
+      targetAgentId = agents.find(({ name }) =>
+        name.toLocaleLowerCase() === targetName.toLocaleLowerCase())?.id;
+      if (!targetAgentId) {
+        agentMessage = 'Target Agent was not found.';
+        return;
+      }
+    }
+    await correctIntent(message.id, intent, targetAgentId);
   }
 
   async function setMemoryLifecycle(memoryId: string, lifecycle: 'archived' | 'deleted') {
@@ -918,11 +1046,22 @@
   }
 
   async function submitFeedback(outcomeType: string, outcomeId: string, rating: string) {
+    const reason = window.prompt('Optional reason for this rating (Cancel to leave feedback unchanged)', '');
+    if (reason === null) return;
     const response = await fetch('/api/workspace/accountability', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ projectId: data.sharedChannel.project.id, outcomeType, outcomeId, rating })
+      body: JSON.stringify({
+        projectId: data.sharedChannel.project.id, outcomeType, outcomeId, rating,
+        ...(reason.trim() ? { reason: reason.trim() } : {})
+      })
     });
     if (!response.ok) agentMessage = (await response.json()).message ?? 'Feedback could not be saved.';
+    else {
+      const accountabilityResponse = await fetch(
+        `/api/workspace/accountability?projectId=${encodeURIComponent(data.sharedChannel.project.id)}`
+      );
+      if (accountabilityResponse.ok) realtimeAccountability = await accountabilityResponse.json();
+    }
   }
 
   async function editPlan(plan: (typeof accountability.plans)[number]) {
@@ -954,6 +1093,14 @@
 
 </script>
 
+{#snippet feedbackControls(label: string, outcomeType: string, outcomeId: string)}
+  <div class="mt-2 flex flex-wrap gap-1" aria-label={label}>
+    {#each feedbackRatings as rating}
+      <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback(outcomeType, outcomeId, rating)}>{rating.replaceAll('_', ' ')}</button>
+    {/each}
+  </div>
+{/snippet}
+
 {#snippet agentMentionStatus(message: (typeof data.sharedChannel.messages)[number])}
   {@const handoff = handoffForSource(message.id)}
   {@const plan = planForSource(message.id)}
@@ -963,9 +1110,11 @@
       <span class="badge badge-ghost badge-xs">{message.routingDecision.intent.replaceAll('_', ' ')}</span>
       <span>{Math.round(message.routingDecision.confidence * 100)}% · {message.routingDecision.rationale}</span>
       {#if message.routingDecision.correctedAt}<span class="text-info">Pilot corrected</span>{/if}
-      {#if message.routingDecision.intent === 'engineering_delegation' && !message.routingDecision.correctedAt}
-        <button class="btn btn-primary btn-xs" type="button" onclick={() => void correctIntent(message.id, 'engineering_delegation')}>Confirm engineering work</button>
-        <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctIntent(message.id, 'conversation')}>Treat as conversation</button>
+      {#if !message.routingDecision.correctedAt}
+        {#if message.routingDecision.requiresConfirmation}
+          <button class="btn btn-primary btn-xs" type="button" onclick={() => void correctIntent(message.id, message.routingDecision!.intent)}>Confirm interpretation</button>
+        {/if}
+        <button class="btn btn-ghost btn-xs" type="button" onclick={() => void promptIntentCorrection(message)}>Correct interpretation</button>
       {/if}
     </p>
   {/if}
@@ -987,6 +1136,9 @@
         target="_blank"
         rel="noopener noreferrer"
       >Review pull request #{run.artifact.pullRequestNumber} in GitHub</a>
+    {/if}
+    {#if run && ['completed', 'failed', 'cancelled'].includes(run.status)}
+      {@render feedbackControls('Rate engineering result', 'agent_run', run.id)}
     {/if}
     {#if run && run.milestones.length > 1}
       <ul class="mt-1 space-y-1 text-xs text-base-content/55" aria-label="Engineering request milestones">
@@ -1022,6 +1174,9 @@
         {/if}
       </div>
       <p class="mt-1 text-base-content/55">{handoff.question}</p>
+      {#if ['completed', 'failed', 'cancelled', 'expired'].includes(handoff.status)}
+        {@render feedbackControls('Rate handoff result', 'handoff', handoff.id)}
+      {/if}
     </div>
   {/if}
   {#if steering}
@@ -1037,12 +1192,38 @@
       </div>
       <p class="mt-1 text-base-content/55">
         {plan.steps.length} steps · {plan.allowParallel ? 'parallel when dependencies allow' : 'sequential'}
-        · {plan.budget.maxParticipants} participants max
+        · {plan.budget.consumedParticipants}/{plan.budget.maxParticipants} participants
         · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs
-        · depth {plan.budget.maxDepth} · {plan.budget.maxAgentRuns} AgentRuns max
-        · {plan.budget.maxElapsedSeconds}s max
+        · depth {plan.budget.maxDepth} · AgentRun limit 0 (Engineering delegation is independent)
+        · {plan.budget.elapsedSeconds}/{plan.budget.maxElapsedSeconds}s elapsed
         · provider usage {plan.budget.providerUsage.known ? `${plan.budget.providerUsage.consumed}/${plan.budget.providerUsage.limit ?? '∞'}` : 'unknown'}
       </p>
+      <p class="mt-1 text-base-content/45">
+        Reservations · {plan.budget.reservationAccounting.reserved} queued
+        · {plan.budget.reservationAccounting.started} started
+        · {plan.budget.reservationAccounting.failedStart} failed before start
+        · {plan.budget.reservationAccounting.failed} failed after start
+        · {plan.budget.reservationAccounting.cancelled} cancelled
+        · {plan.budget.reservationAccounting.completed} completed
+      </p>
+      {#if plan.budget.state === 'approaching'}
+        <p class="mt-1 text-warning">Approaching: {plan.budget.warnings.map((warning) => warning.replaceAll('_', ' ')).join(', ')}</p>
+      {:else if plan.budget.state === 'exhausted'}
+        <p class="mt-1 text-error">
+          No new coordination work can start: {plan.budget.stopReason?.replaceAll('_', ' ')}. Pilot direction is required.
+        </p>
+      {/if}
+      {#if plan.constraints.length > 0}
+        <p class="mt-1 text-info">Active constraints: {plan.constraints.join('; ')}</p>
+      {/if}
+      {#if plan.constraintInputs.some((constraint) => constraint.status === 'pending')}
+        <p class="mt-1 text-warning">
+          Pending constraints: {plan.constraintInputs
+            .filter((constraint) => constraint.status === 'pending')
+            .map((constraint) => constraint.guidance)
+            .join('; ')}
+        </p>
+      {/if}
       <ol class="mt-2 list-inside list-decimal space-y-1">
         {#each plan.steps as step}
           <li>
@@ -1064,13 +1245,20 @@
           <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'pause')}>Pause</button>
           <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
         </div>
+      {:else if plan.status === 'paused'}
+        <div class="mt-2 flex gap-2">
+          {#if canResumeCoordinationPlan({
+            status: plan.status,
+            budgetState: plan.budget.state,
+            stepStatuses: plan.steps.map((step) => step.status)
+          })}
+            <button class="btn btn-primary btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'resume')}>Resume approved plan</button>
+          {/if}
+          <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
+        </div>
       {/if}
       {#if ['completed', 'rejected', 'cancelled', 'failed'].includes(plan.status)}
-        <div class="mt-2 flex flex-wrap gap-1">
-          {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
-            <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('coordination_plan', plan.id, rating)}>{rating.replaceAll('_', ' ')}</button>
-          {/each}
-        </div>
+        {@render feedbackControls('Rate coordination result', 'coordination_plan', plan.id)}
       {/if}
     </div>
   {/if}
@@ -1162,19 +1350,61 @@
       <label class="flex items-center gap-1 text-[0.65rem]"><input type="checkbox" class="checkbox checkbox-xs" bind:checked={inboxHumanOnly} /> Human action</label>
     </div>
     <p class="mt-1 text-[0.6rem] text-base-content/35">Project: {data.sharedChannel.project.name}</p>
+    <ul class="mt-2 grid grid-cols-1 gap-1 text-[0.65rem] text-base-content/55">
+      {#each data.agentConfiguration.agents as agent (agent.id)}
+        {@const workload = workloadForAgent(agent.id)}
+        <li class="flex items-center justify-between gap-2 border-b border-white/6 pb-1">
+          <button class="truncate hover:text-primary" type="button" onclick={() => inboxAgentFilter = agent.id}>
+            {agent.name} · {workload?.inboxCounts.total ?? 0} items
+          </button>
+          <span class:badge-success={workload?.available} class="badge badge-ghost badge-xs">
+            {workload?.reason?.replaceAll('_', ' ') ?? 'unavailable'}
+          </span>
+        </li>
+      {/each}
+    </ul>
     <ul class="mt-1 max-h-40 space-y-1 overflow-y-auto text-xs text-base-content/55">
-      {#each filteredInbox as item (item.id)}
+      {#each filteredInbox as item (`${item.kind}:${item.id}`)}
         <li class="border-b border-white/6 py-1.5">
-          <a class="block hover:text-primary" href={`#message-${item.sourceMessageId}`}>
+          <a class="block hover:text-primary" href={`#message-${item.links.clarificationMessageId ?? item.links.approvalMessageId ?? item.links.artifactMessageId ?? item.links.resultMessageId ?? item.sourceMessageId}`}>
             <span class:badge-warning={item.requiresHumanAction} class="badge badge-ghost badge-xs">{item.urgency}</span>
             <strong>{item.agentName}</strong> · {item.state.replaceAll('_', ' ')}
             <span class="block truncate">{item.summary}</span>
+            <span class="block truncate text-[0.6rem] text-base-content/35">
+              {item.kind.replaceAll('_', ' ')} · {item.relatedId}
+            </span>
           </a>
         </li>
       {:else}
         <li class="py-2 text-base-content/35">No matching work.</li>
       {/each}
     </ul>
+
+    {#if accountability.evaluation.length > 0}
+      <div class="eyebrow mt-6">Collaboration quality</div>
+      <ul class="mt-2 max-h-52 space-y-2 overflow-y-auto text-xs">
+        {#each accountability.evaluation as report (`${report.agentType}:${report.routingPolicyVersion}:${report.promptVersion}:${report.permissionPolicyVersion}:${report.agentConfigurationVersion}`)}
+          <li class="border border-white/8 p-2">
+            <strong>{report.agentType}</strong>
+            <span class="block text-base-content/45">
+              {report.routingPolicyVersion} · {report.agentConfigurationVersion}
+            </span>
+            <span class="block text-base-content/35">
+              Prompt {report.promptVersion} · policy {report.permissionPolicyVersion}
+            </span>
+            <span class="mt-1 block text-base-content/55">
+              Outcomes {report.completionOutcomes.completed} completed / {report.completionOutcomes.failed} failed / {report.completionOutcomes.cancelled} cancelled / {report.completionOutcomes.expired} expired / {report.completionOutcomes.rejected} rejected
+            </span>
+            <span class="block text-base-content/55">
+              Feedback {report.pilotFeedback.useful} useful / {report.pilotFeedback.incorrect} incorrect / {report.pilotFeedback.incomplete} incomplete / {report.pilotFeedback.unnecessarilyDelegated} unnecessary
+            </span>
+            <span class="block text-base-content/45">
+              Checks: {report.automatedChecks.recursiveHandoffAttempts} recursive · {report.automatedChecks.duplicateInvestigations} duplicate · {report.automatedChecks.unsupportedCertainty} unsupported · {report.automatedChecks.routingDisagreements} routing disagreement
+            </span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
 
     {#if accountability.findings.length > 0}
       <div class="eyebrow mt-6">Findings</div>
@@ -1196,11 +1426,7 @@
                 </li>
               {/each}
             </ul>
-            <div class="mt-1 flex flex-wrap gap-1">
-              {#each ['useful', 'incorrect', 'incomplete', 'unnecessarily_delegated'] as rating}
-                <button class="btn btn-ghost btn-xs" type="button" onclick={() => void submitFeedback('finding', finding.id, rating)}>{rating.replaceAll('_', ' ')}</button>
-              {/each}
-            </div>
+            {@render feedbackControls('Rate Finding', 'finding', finding.id)}
           </li>
         {/each}
       </ul>
@@ -1213,13 +1439,19 @@
           <li class="border border-white/8 p-2">
             <span class="badge badge-ghost badge-xs">{memory.type} · {memory.lifecycle}</span>
             <p class="mt-1">{memory.statement}</p>
+            <p class="mt-1 text-base-content/45">Recorded by {memory.authorName}</p>
             <p class="mt-1 truncate text-base-content/35">Sources: {memory.sourceReferences.join(', ')}</p>
+            {#if memory.supersedesId}
+              <p class="mt-1 truncate text-base-content/35">Supersedes: {memory.supersedesId}</p>
+            {/if}
             {#if memory.lifecycle === 'active'}
               <div class="mt-1 flex gap-1">
                 <button class="btn btn-ghost btn-xs" type="button" onclick={() => void correctMemory(memory)}>Correct / supersede</button>
                 <button class="btn btn-ghost btn-xs" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'archived')}>Archive</button>
-                <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'deleted')}>Delete</button>
               </div>
+            {/if}
+            {#if memory.lifecycle !== 'deleted'}
+              <button class="btn btn-ghost btn-xs mt-1 text-error" type="button" onclick={() => void setMemoryLifecycle(memory.id, 'deleted')}>Delete</button>
             {/if}
           </li>
         {/each}
@@ -1463,7 +1695,7 @@
                         <span>{formatDateDivider(reply.createdAt)}</span>
                       </div>
                     {/if}
-                    <div class="message-row relative flex gap-3 py-1 pr-10">
+                    <div id={`message-${reply.id}`} class="message-row relative flex gap-3 py-1 pr-10">
                       <div class="message-actions" aria-label="Message actions">
                         <button
                           class="message-action"
@@ -1799,6 +2031,12 @@
             <span class="min-w-0 flex-1">
               <strong class="block truncate text-sm">{agent.name}</strong>
               <span class="block truncate text-xs text-base-content/45">{agent.roleLabel} · {agent.participationMode}</span>
+              {#if agent.templateProvenance}
+                <span class="block truncate text-xs text-base-content/45">
+                  Agent template {agent.templateProvenance.key} · v{agent.templateProvenance.version}
+                  {#if data.agentTemplateUpgrades[agent.id]} · v{data.agentTemplateUpgrades[agent.id]?.toVersion} available{/if}
+                </span>
+              {/if}
             </span>
             <span class="text-xs text-primary">Edit</span>
           </button>
@@ -1806,10 +2044,34 @@
       </div>
       {#if data.agentConfiguration.canManage}
         <div class="mt-5 space-y-3 border-t border-white/10 pt-5">
+          <div class="space-y-2">
+            <label class="text-xs text-base-content/60" for="agent-project">Project for new Agent</label>
+            <select
+              id="agent-project"
+              class="select select-sm w-full border-white/18 bg-transparent"
+              value={selectedAgentProjectId}
+              onchange={(event) => {
+                agentProjectId = event.currentTarget.value;
+                void refreshAgentTemplatePreview();
+              }}
+            >
+              {#each data.agentProjects as project (project.id)}
+                <option value={project.id}>{project.name}</option>
+              {/each}
+            </select>
+          </div>
           <div class="space-y-2 border border-white/10 p-3">
-            <label class="text-xs text-base-content/60" for="agent-template">Optional bounded template</label>
-            <select id="agent-template" class="select select-sm w-full border-white/18 bg-transparent" bind:value={agentTemplateKey}>
-              <option value="">Choose a specialist template</option>
+            <label class="text-xs text-base-content/60" for="agent-template">Optional bounded Agent template</label>
+            <select
+              id="agent-template"
+              class="select select-sm w-full border-white/18 bg-transparent"
+              value={agentTemplateKey}
+              onchange={(event) => {
+                agentTemplateKey = event.currentTarget.value;
+                void refreshAgentTemplatePreview();
+              }}
+            >
+              <option value="">Choose a specialist Agent template</option>
               {#each data.agentTemplates as template (template.key)}
                 <option value={template.key}>{template.name} · v{template.version}</option>
               {/each}
@@ -1818,12 +2080,25 @@
               <div class="text-xs leading-5 text-base-content/55">
                 <strong class="text-[#f1efe8]">{selectedAgentTemplate.roleLabel}</strong>
                 <p>{selectedAgentTemplate.instructions}</p>
+                <p>Type: {selectedAgentTemplate.agentType}.</p>
+                <p>Ambient topics: {selectedAgentTemplate.ambientTriggers.join(', ')}.</p>
+                <p>Participation: {selectedAgentTemplate.participationMode}; replies: {selectedAgentTemplate.replyMode}.</p>
+                <p>Required capabilities: {selectedAgentTemplate.requiredCapabilities.join(', ')}.</p>
                 <p>Permission ceiling: {selectedAgentTemplate.permissionCeiling.replaceAll('_', ' ')}.</p>
+                <p>Expected outputs: {selectedAgentTemplate.expectedResultShapes.join(', ').replaceAll('_', ' ')}.</p>
                 <p>Does not own: {selectedAgentTemplate.nonResponsibilities.join(', ')}.</p>
-                {#if selectedTemplateOverlap}<p class="text-warning">Ambient topic “{selectedTemplateOverlap}” overlaps an existing Agent.</p>{/if}
+                <p>Stays silent when: {selectedAgentTemplate.staySilentWhen.join('; ')}.</p>
+                {#if selectedTemplatePreview?.disabledCapabilities.length}
+                  <p class="text-warning">Unavailable capabilities will be disabled: {selectedTemplatePreview.disabledCapabilities.join(', ')}.</p>
+                {/if}
+                {#each selectedTemplatePreview?.warnings ?? [] as warning}
+                  <p class="text-warning">{warning}</p>
+                {/each}
               </div>
-              <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy} onclick={() => void instantiateTemplate()}>
-                Add from template
+              <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy || agentPreviewBusy || !selectedTemplatePreview} onclick={() => void instantiateTemplate()}>
+                {selectedTemplatePreview?.warnings.length
+                  ? 'Acknowledge warnings and add Agent'
+                  : 'Add from Agent template'}
               </button>
             {/if}
           </div>

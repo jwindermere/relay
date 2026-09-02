@@ -2,17 +2,13 @@ import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
-import type { GitHubRepositoryGateway } from '../github/connection.js';
 import { hasActivePilotChannelAccess } from './channel-access.js';
-import { handleApprovalReply } from './approvals.js';
-import { handleAgentRunCommand } from './agent-run-commands.js';
-import { handleWaitingAgentRunReply } from './clarifications.js';
-import { acceptEligibleAgentMention, type AgentMentionResult } from './delegation.js';
+import type { AgentMentionResult } from './delegation.js';
 import { acceptAgentConversation } from './conversation.js';
-import { answerAgentProgressRequest } from './progress.js';
-import { acceptAgentRunSteering } from './steering.js';
+import { handleConfirmedMessageControl } from './message-control.js';
 import {
   classifyMessageIntent,
+  requiresPilotMemberConfirmation,
   type MessageRoutingDecision
 } from './message-intent.js';
 
@@ -133,6 +129,12 @@ function toChannelMessage(row: MessageRow): ChannelMessage {
       confidence: Number(row.routing_confidence),
       policyVersion: row.routing_policy_version!,
       rationale: row.routing_rationale!,
+      requiresConfirmation: row.routing_corrected_at === null
+        && requiresPilotMemberConfirmation(
+          row.corrected_intent ?? row.selected_intent,
+          Number(row.routing_confidence),
+          row.body
+        ),
       correctedAt: row.routing_corrected_at?.toISOString() ?? null
     } : null,
     agentMention: row.agent_mention_status === 'accepted'
@@ -268,8 +270,7 @@ export async function loadAuthorizedChannelMessages(
 export async function postChannelMessage(
   pool: Pool,
   access: WorkspaceAccess,
-  input: { channelId: string; body: string; parentMessageId?: string; submissionId?: string },
-  dependencies: { getRepositoryGateway?: () => GitHubRepositoryGateway } = {}
+  input: { channelId: string; body: string; parentMessageId?: string; submissionId?: string }
 ): Promise<ChannelMessage> {
   const body = input.body.trim();
   if (!body || body.length > 4000) {
@@ -349,66 +350,19 @@ export async function postChannelMessage(
         parentMessageId,
         body
       });
-      const steeringAccepted = await acceptAgentRunSteering(client, {
+      const messageContext = {
         messageId,
         workspaceId: access.workspace.id,
         channelId: input.channelId,
         parentMessageId,
         body
-      });
-      const agentProgressAnswered = !steeringAccepted && await answerAgentProgressRequest(client, {
-        messageId,
-        workspaceId: access.workspace.id,
-        channelId: input.channelId,
-        parentMessageId,
-        body
-      });
-      const agentRunCommandHandled = !steeringAccepted && !agentProgressAnswered && parentMessageId
-        ? await handleAgentRunCommand(client, {
-            messageId,
-            workspaceId: access.workspace.id,
-            channelId: input.channelId,
-            parentMessageId,
-            body
-          })
-        : false;
-      const approvalAnswered = !steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled && parentMessageId
-        ? await handleApprovalReply(client, {
-            messageId,
-            workspaceId: access.workspace.id,
-            channelId: input.channelId,
-            parentMessageId,
-            body
-          })
-        : false;
-      const waitingAgentRunReply = !steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
-        && !approvalAnswered && parentMessageId
-        ? await handleWaitingAgentRunReply(client, {
-            messageId,
-            workspaceId: access.workspace.id,
-            channelId: input.channelId,
-            parentMessageId,
-            body
-          })
-        : false;
-      if (!steeringAccepted && !agentProgressAnswered && !agentRunCommandHandled
-        && !approvalAnswered && !waitingAgentRunReply) {
-        const conversation = routingDecision?.intent === 'engineering_delegation'
-          ? null
-          : await acceptAgentConversation(client, {
-              messageId,
-              workspaceId: access.workspace.id,
-              channelId: input.channelId,
-              parentMessageId,
-              body
-            });
-        if (!conversation && routingDecision?.intent !== 'engineering_delegation') {
-          await acceptEligibleAgentMention(client, {
-            messageId,
-            workspaceId: access.workspace.id,
-            channelId: input.channelId,
-            body,
-            getRepositoryGateway: dependencies.getRepositoryGateway
+      };
+      if (!routingDecision?.requiresConfirmation) {
+        const controlHandled = await handleConfirmedMessageControl(client, messageContext);
+        if (!controlHandled && routingDecision?.intent === 'conversation') {
+          await acceptAgentConversation(client, {
+            ...messageContext,
+            targetAgentId: routingDecision.targetAgentId
           });
         }
       }

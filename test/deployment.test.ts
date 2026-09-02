@@ -18,9 +18,21 @@ test('only the TLS proxy is published and it cannot reach the backend network', 
   assert.deepEqual(deployment.services.proxy?.networks, ['edge']);
   assert.deepEqual(deployment.services.postgres?.networks, ['backend']);
   assert.deepEqual(deployment.services.worker?.networks, ['backend']);
+  assert.deepEqual(deployment.services['evaluation-retention']?.networks, ['backend']);
   assert.match(JSON.stringify(deployment.services.postgres?.volumes), /postgres-data/);
   assert.match(JSON.stringify(deployment.services.worker?.volumes), /codex-state/);
   assert.match(JSON.stringify(deployment.services.worker?.volumes), /agent-run-workspaces/);
+});
+
+test('expired collaboration evaluation is purged independently of project activity', async () => {
+  const script = await readFile(resolve('ops/postgres/run-evaluation-retention.sh'), 'utf8');
+  assert.match(script, /SELECT public\.purge_expired_collaboration_evaluation\(\)/);
+  assert.match(script, /EVALUATION_RETENTION_INTERVAL_SECONDS/);
+  const operations = await readFile(resolve('ops/README.md'), 'utf8');
+  assert.match(
+    operations,
+    /restart `web`, `worker`, `migrate`, `backup`, and `evaluation-retention`/
+  );
 });
 
 test('web replacement leaves the independently supervised worker running', async () => {
@@ -29,7 +41,7 @@ test('web replacement leaves the independently supervised worker running', async
     'compose build migrate web',
     "compose run --rm --no-deps --entrypoint /bin/sh backup -ec export DATABASE_URL=\"$(cat /run/secrets/database_url)\"; exec /ops/postgres/backup.sh",
     'compose run --rm --env RELAY_REQUIRE_EXPAND_ONLY=true migrate',
-    'compose up --detach --no-deps web'
+    'compose up --detach --no-deps web evaluation-retention'
   ]);
   assert.doesNotMatch(commands.join('\n'), /worker/);
 });
@@ -41,7 +53,7 @@ test('worker replacement drains before starting the compatible release', async (
     'compose stop --timeout 1800 worker',
     "compose run --rm --no-deps --entrypoint /bin/sh backup -ec export DATABASE_URL=\"$(cat /run/secrets/database_url)\"; exec /ops/postgres/backup.sh",
     'compose run --rm --env RELAY_REQUIRE_EXPAND_ONLY=true migrate',
-    'compose up --detach --no-deps worker'
+    'compose up --detach --no-deps worker evaluation-retention'
   ]);
 });
 
@@ -53,7 +65,7 @@ test('contract migrations run only after both old runtime types have stopped', a
     'compose stop web',
     "compose run --rm --no-deps --entrypoint /bin/sh backup -ec export DATABASE_URL=\"$(cat /run/secrets/database_url)\"; exec /ops/postgres/backup.sh",
     'compose run --rm migrate',
-    'compose up --detach --no-deps web worker'
+    'compose up --detach --no-deps web worker evaluation-retention'
   ]);
 });
 

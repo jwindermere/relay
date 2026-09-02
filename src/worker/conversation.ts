@@ -9,7 +9,9 @@ import {
   type ProviderNotification
 } from '../lib/server/provider/agent-run.js';
 import { acceptAgentConversation } from '../lib/server/collaboration/conversation.js';
+import { loadChannelContextBeforeMessage } from '../lib/server/collaboration/channel-context.js';
 import { enqueueAgentHandoffStatus } from '../lib/server/collaboration/handoffs.js';
+import { recordCollaborationEvaluationEvent } from '../lib/server/collaboration/evaluation.js';
 import {
   activateNextCoordinationStep,
   completeCoordinationStep,
@@ -17,9 +19,17 @@ import {
   proposeCoordinationPlan
 } from '../lib/server/collaboration/coordination.js';
 import {
-  createFindingFromAgentResult,
-  parseFindingResult
+  loadAgentProjectMemoryContext,
+  parseFindingResult,
+  persistFindingFromAgentResult,
+  renderProjectMemoryContext
 } from '../lib/server/collaboration/findings.js';
+import {
+  renderAgentTemplateExecutionBounds,
+  type AgentCapability,
+  type AgentExpectedResultShape
+} from '../lib/server/collaboration/agent-templates.js';
+import type { AgentPermissionCeiling } from '../lib/server/collaboration/agents.js';
 
 interface ClaimedConversationTurn {
   id: string;
@@ -27,6 +37,7 @@ interface ClaimedConversationTurn {
   project_id: string;
   conversation_id: string;
   request_body: string;
+  request_message_id: string;
   root_message_id: string;
   channel_id: string;
   agent_id: string;
@@ -35,20 +46,41 @@ interface ClaimedConversationTurn {
   agent_type: string;
   agent_role_label: string;
   agent_instructions: string;
+  template_expected_result_shapes: AgentExpectedResultShape[];
+  template_non_responsibilities: string[];
+  template_stay_silent_when: string[];
+  disabled_capabilities: AgentCapability[];
+  permission_ceiling: AgentPermissionCeiling;
   collaborator_roster: string;
   response_parent_message_id: string | null;
   ambient: boolean;
   handoff_depth: number;
+  handoff_context_snapshot: {
+    suppliedChannelContext?: Array<{ author_name: string; body: string }>;
+  } | null;
   provider_thread_id: string | null;
   credential_store_reference: string;
   lease_token: string;
   recovering: boolean;
   routing_intent: string | null;
+  routing_policy_version: string | null;
+  coordination_expected_output: 'concise_text' | 'structured_finding' | 'artifact' | null;
+  agent_configuration_version: number;
+  agent_type_snapshot: string;
+  eligible: boolean;
 }
 
 export type ConversationWorkerResult =
   | { kind: 'idle' }
   | { kind: 'conversation'; conversationTurnId: string; status: 'completed' | 'failed' };
+
+function requiresStructuredFinding(claim: ClaimedConversationTurn): boolean {
+  if (claim.coordination_expected_output !== null) {
+    return claim.coordination_expected_output === 'structured_finding';
+  }
+  return claim.agent_type_snapshot === 'research'
+    || claim.template_expected_result_shapes.includes('structured_finding');
+}
 
 export async function processNextConversationTurn(
   pool: Pool,
@@ -64,6 +96,17 @@ export async function processNextConversationTurn(
     new Date()
   );
   if (!claim) return { kind: 'idle' };
+
+  if (!claim.eligible) {
+    await finishConversationTurn(
+      pool,
+      claim,
+      'I could not continue because this Agent is disabled or is no longer a member of this Project.',
+      'failed',
+      'agent_unavailable'
+    );
+    return { kind: 'conversation', conversationTurnId: claim.id, status: 'failed' };
+  }
 
   if (claim.recovering) {
     await finishConversationTurn(
@@ -90,6 +133,16 @@ export async function processNextConversationTurn(
 
   try {
     const channelMemory = await loadConversationMemory(pool, claim);
+    const structuredFindingRequired = requiresStructuredFinding(claim);
+    const templateBounds = renderAgentTemplateExecutionBounds({
+      expectedResultShapes: claim.coordination_expected_output === null
+        ? claim.template_expected_result_shapes
+        : [],
+      nonResponsibilities: claim.template_non_responsibilities,
+      staySilentWhen: claim.template_stay_silent_when,
+      disabledCapabilities: claim.disabled_capabilities,
+      permissionCeiling: claim.permission_ceiling
+    });
     await provider.execute({
       signal: executionAbort.signal,
       credentialStoreReference: claim.credential_store_reference,
@@ -98,6 +151,7 @@ export async function processNextConversationTurn(
         `You are ${claim.agent_name}, a ${claim.agent_role_label} (${claim.agent_type} Agent).`,
         'You are participating as a thoughtful, human-like teammate in a Relay Channel.',
         claim.agent_instructions ? `Your standing instructions: ${claim.agent_instructions}` : '',
+        templateBounds,
         claim.ambient
           ? 'You were not tagged. Reply only if your contribution is relevant, useful, and timely. If staying silent is better, return exactly [RELAY_SILENT].'
           : 'Reply directly and naturally to the latest message.',
@@ -108,11 +162,16 @@ export async function processNextConversationTurn(
           ? 'This is a bounded Agent handoff. Answer the requested input directly and do not @mention another Agent.'
           : 'Do not start social or open-ended agent-to-agent chatter.',
         claim.routing_intent === 'coordination_candidate' && claim.handoff_depth === 0
-          ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Do not start plan work; a Pilot member must approve it.'
+          ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Set budget.maxAgentRuns to 0 because Coordination is conversational and Engineering delegation is independent. Do not start plan work; a Pilot member must approve it.'
           : '',
-        claim.agent_type === 'research'
+        structuredFindingRequired && claim.coordination_expected_output === null
           ? 'Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'
           : '',
+        claim.coordination_expected_output === 'structured_finding'
+          ? 'This approved Coordination step requires a structured Finding. Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'
+          : claim.coordination_expected_output === 'concise_text'
+            ? 'This approved Coordination step requires a concise text result.'
+            : '',
         'Do not repeat an answer already present in the recent context.',
         'Do not inspect files, run commands, modify a repository, or use tools.',
         'If the request is ambiguous, ask a concise conversational follow-up question.',
@@ -132,9 +191,19 @@ export async function processNextConversationTurn(
       },
       async turnStarted(turnId) {
         await pool.query(
-          `UPDATE public.agent_conversation_turn
-           SET provider_turn_id = $4, updated_at = now()
-           WHERE id = $1 AND workspace_id = $2 AND lease_token = $3`,
+          `WITH started_turn AS (
+             UPDATE public.agent_conversation_turn
+             SET provider_turn_id = $4, updated_at = now()
+             WHERE id = $1 AND workspace_id = $2 AND lease_token = $3
+             RETURNING id
+           )
+           UPDATE public.coordination_budget_reservation reservation
+           SET outcome = 'started', updated_at = now()
+           FROM public.coordination_plan_step step, started_turn
+           WHERE step.conversation_turn_id = started_turn.id
+             AND reservation.step_id = step.id
+             AND reservation.reservation_kind = 'handoff'
+             AND reservation.outcome = 'reserved'`,
           [claim.id, claim.workspace_id, claim.lease_token, turnId]
         );
       },
@@ -196,11 +265,18 @@ async function claimNextConversationTurn(
       provider_connection_id: string;
     }>(
       `SELECT turn.id, turn.workspace_id, channel.project_id, turn.conversation_id,
-              request.body AS request_body, conversation.root_message_id,
+              turn.request_message_id, request.body AS request_body, conversation.root_message_id,
               conversation.channel_id, conversation.agent_id,
               agent_member.id AS agent_member_id, agent.name AS agent_name,
               agent.agent_type, agent.role_label AS agent_role_label,
               agent.instructions AS agent_instructions,
+              COALESCE(agent.template_snapshot -> 'expectedResultShapes', '[]'::jsonb)
+                AS template_expected_result_shapes,
+              COALESCE(agent.template_snapshot -> 'nonResponsibilities', '[]'::jsonb)
+                AS template_non_responsibilities,
+              COALESCE(agent.template_snapshot -> 'staySilentWhen', '[]'::jsonb)
+                AS template_stay_silent_when,
+              agent.disabled_capabilities, agent.permission_ceiling,
               COALESCE((
                 SELECT string_agg('@' || collaborator.name || ' (' || collaborator.role_label || ')', ', '
                                   ORDER BY collaborator.name, collaborator.id)
@@ -218,9 +294,18 @@ async function claimNextConversationTurn(
                   AND collaborator.enabled = true AND collaborator.status <> 'disabled'
               ), '') AS collaborator_roster,
               turn.response_parent_message_id, turn.ambient, turn.handoff_depth,
+              handoff.context_snapshot AS handoff_context_snapshot,
+              turn.agent_configuration_version, turn.agent_type_snapshot,
               COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
+              decision.policy_version AS routing_policy_version,
+              coordination_step.expected_output AS coordination_expected_output,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
               connection.credential_store_reference,
+              agent.enabled AND agent.status <> 'disabled' AND EXISTS (
+                SELECT 1 FROM public.project_membership agent_project
+                WHERE agent_project.workspace_member_id = agent_member.id
+                  AND agent_project.project_id = channel.project_id
+              ) AS eligible,
               (turn.lease_expires_at IS NOT NULL AND turn.lease_expires_at <= $1) AS recovering
        FROM public.agent_conversation_turn turn
        JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
@@ -233,6 +318,12 @@ async function claimNextConversationTurn(
          ON agent_member.agent_id = conversation.agent_id
         AND agent_member.workspace_id = conversation.workspace_id
        JOIN public.agent agent ON agent.id = conversation.agent_id
+       LEFT JOIN public.agent_handoff handoff
+         ON handoff.receiving_turn_id = turn.id
+        AND handoff.workspace_id = turn.workspace_id
+       LEFT JOIN public.coordination_plan_step coordination_step
+         ON coordination_step.conversation_turn_id = turn.id
+        AND coordination_step.workspace_id = turn.workspace_id
        WHERE (
            (turn.status = 'queued' AND turn.available_at <= $1 AND turn.lease_expires_at IS NULL)
            OR (turn.status = 'working' AND turn.lease_expires_at <= $1)
@@ -320,6 +411,8 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
   const expired = await client.query<{
     id: string;
     workspace_id: string;
+    project_id: string;
+    target_agent_id: string;
     receiving_turn_id: string;
   }>(
     `UPDATE public.agent_handoff
@@ -329,10 +422,23 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
            'kind', 'expired', 'errorCode', 'handoff_expired'
          )
      WHERE status = 'queued' AND expires_at <= $1
-     RETURNING id, workspace_id, receiving_turn_id`,
+     RETURNING id, workspace_id, project_id, target_agent_id, receiving_turn_id`,
     [now]
   );
   if (expired.rows.length === 0) return;
+  const attributions = await client.query<{
+    id: string; routing_policy_version: string | null; agent_configuration_version: number;
+    agent_type_snapshot: string;
+  }>(
+    `SELECT turn.id, decision.policy_version AS routing_policy_version,
+            turn.agent_configuration_version, turn.agent_type_snapshot
+     FROM public.agent_conversation_turn turn
+     JOIN public.message request ON request.id = turn.request_message_id
+     LEFT JOIN public.message_intent_decision decision ON decision.message_id = request.id
+     WHERE turn.id = ANY($1::text[])`,
+    [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id)]
+  );
+  const attributionByTurn = new Map(attributions.rows.map((row) => [row.id, row]));
   await client.query(
     `UPDATE public.agent_conversation_turn
      SET status = 'failed', error_code = 'handoff_expired',
@@ -341,7 +447,19 @@ async function expireQueuedAgentHandoffs(client: PoolClient, now: Date): Promise
     [expired.rows.map(({ receiving_turn_id }) => receiving_turn_id), now]
   );
   for (const handoff of expired.rows) {
+    const attribution = attributionByTurn.get(handoff.receiving_turn_id);
+    if (!attribution) throw new Error('Expired Agent handoff attribution was not found');
     await enqueueAgentHandoffStatus(client, handoff.workspace_id, handoff.id, 'expired');
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: handoff.workspace_id, projectId: handoff.project_id,
+      eventType: 'outcome.expired', agentId: handoff.target_agent_id,
+      routingPolicyVersion: attribution.routing_policy_version,
+      agentConfigurationVersion: `agent-config-${attribution.agent_configuration_version}`,
+      agentType: attribution.agent_type_snapshot,
+      promptVersion: 'conversation-v1', permissionPolicyVersion: 'handoff-depth-v1',
+      outcomeType: 'handoff', outcomeId: handoff.id,
+      evidence: { status: 'expired', errorCode: 'handoff_expired' }
+    });
   }
 }
 
@@ -391,25 +509,47 @@ async function finishConversationTurn(
     && claim.handoff_depth === 0) {
     try { proposal = parseCoordinationPlanProposal(body); } catch { proposal = null; }
   }
-  if (body !== null && status === 'completed' && claim.agent_type === 'research') {
+  if (body !== null && status === 'completed' && requiresStructuredFinding(claim)) {
     try { findingResult = parseFindingResult(body); } catch { findingResult = null; }
   }
   const visibleBody = proposal?.message || findingResult?.message || body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const coordinationPlan = await client.query<{ plan_id: string }>(
+      `SELECT plan_id FROM public.coordination_plan_step
+       WHERE conversation_turn_id = $1 AND workspace_id = $2`,
+      [claim.id, claim.workspace_id]
+    );
+    if (coordinationPlan.rows[0]) {
+      await client.query(
+        `SELECT id FROM public.coordination_plan WHERE id = $1 FOR UPDATE`,
+        [coordinationPlan.rows[0].plan_id]
+      );
+    }
+    const ownedTurn = await client.query<{ status: string; lease_token: string | null }>(
+      `SELECT status, lease_token FROM public.agent_conversation_turn
+       WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+      [claim.id, claim.workspace_id]
+    );
+    if (ownedTurn.rows[0]?.status !== 'working'
+      || ownedTurn.rows[0].lease_token !== claim.lease_token) {
+      await restoreAgentStatus(client, claim.agent_id);
+      await client.query('COMMIT');
+      return;
+    }
     if (body !== null && status === 'completed' && claim.handoff_depth >= 1
       && /```relay-handoff\b/iu.test(body)) {
-      await client.query(
-        `INSERT INTO public.collaboration_evaluation_event (
-           id, workspace_id, project_id, event_type, agent_id,
-           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
-         ) VALUES ($1, $2, $3, 'recursive.handoff_attempt', $4,
-           'conversation-v1', 'handoff-depth-v1', 'message', $5,
-           jsonb_build_object('handoffDepth', $6::integer))`,
-        [randomUUID(), claim.workspace_id, claim.project_id, claim.agent_id,
-          `conversation-result:${claim.id}`, claim.handoff_depth]
-      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: claim.workspace_id, projectId: claim.project_id,
+        eventType: 'recursive.handoff_attempt', agentId: claim.agent_id,
+        routingPolicyVersion: claim.routing_policy_version, promptVersion: 'conversation-v1',
+        agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+        agentType: claim.agent_type_snapshot,
+        permissionPolicyVersion: 'handoff-depth-v1', outcomeType: 'message',
+        outcomeId: `conversation-result:${claim.id}`,
+        evidence: { handoffDepth: claim.handoff_depth }
+      });
     }
     const messageId = visibleBody === null ? null : `conversation-result:${claim.id}`;
     if (visibleBody !== null && messageId) {
@@ -478,6 +618,30 @@ async function finishConversationTurn(
         status
       );
     }
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: claim.workspace_id, projectId: claim.project_id,
+      eventType: `outcome.${status}`, agentId: claim.agent_id,
+      routingPolicyVersion: claim.routing_policy_version, promptVersion: 'conversation-v1',
+      agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+      agentType: claim.agent_type_snapshot,
+      permissionPolicyVersion: finishedHandoff.rows[0] ? 'handoff-depth-v1' : 'read-only-v1',
+      outcomeType: finishedHandoff.rows[0] ? 'handoff' : messageId ? 'message' : 'conversation_turn',
+      outcomeId: finishedHandoff.rows[0]?.id ?? messageId ?? claim.id,
+      evidence: { status, errorCode }
+    });
+    if (findingResult && messageId) {
+      await persistFindingFromAgentResult(client, {
+        ...findingResult.finding,
+        workspaceId: claim.workspace_id,
+        projectId: claim.project_id,
+        authorAgentId: claim.agent_id,
+        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
+        agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+        agentType: claim.agent_type_snapshot,
+        resultMessageId: messageId,
+        ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
+      });
+    }
     await completeCoordinationStep(client, {
       workspaceId: claim.workspace_id,
       conversationTurnId: claim.id,
@@ -501,17 +665,10 @@ async function finishConversationTurn(
         workspaceId: claim.workspace_id,
         projectId: claim.project_id,
         coordinatingAgentId: claim.agent_id,
-        sourceMessageId: messageId
-      }).catch(() => undefined);
-    }
-    if (findingResult && messageId) {
-      await createFindingFromAgentResult(pool, {
-        ...findingResult.finding,
-        workspaceId: claim.workspace_id,
-        projectId: claim.project_id,
-        authorAgentId: claim.agent_id,
-        resultMessageId: messageId,
-        ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
+        sourceMessageId: messageId,
+        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
+        agentConfigurationVersion: claim.agent_configuration_version,
+        agentType: claim.agent_type_snapshot
       }).catch(() => undefined);
     }
   } catch (error) {
@@ -524,38 +681,24 @@ async function finishConversationTurn(
 
 async function loadConversationMemory(
   pool: Pool,
-  claim: Pick<ClaimedConversationTurn, 'workspace_id' | 'channel_id' | 'id'>
+  claim: Pick<
+    ClaimedConversationTurn,
+    'workspace_id' | 'project_id' | 'channel_id' | 'agent_id' | 'id'
+      | 'request_message_id' | 'handoff_context_snapshot'
+  >
 ): Promise<string> {
+  const suppliedChannelContext = claim.handoff_context_snapshot?.suppliedChannelContext;
+  const messageContext = suppliedChannelContext
+    ? Promise.resolve({ rows: suppliedChannelContext })
+    : loadChannelContextBeforeMessage(pool, claim.request_message_id, claim.workspace_id)
+      .then((rows) => ({ rows }));
   const [messages, projectMemory, findings] = await Promise.all([
-    pool.query<{ author_name: string; body: string }>(
-    `SELECT memory.author_name, memory.body
-     FROM (
-       SELECT COALESCE(pilot_user.name, agent.name) AS author_name, message.body,
-              message.created_at, message.id
-       FROM public.agent_conversation_turn turn
-       JOIN public.message request ON request.id = turn.request_message_id
-       JOIN public.message message ON message.channel_id = request.channel_id
-         AND message.workspace_id = request.workspace_id
-         AND (message.created_at, message.id) < (request.created_at, request.id)
-       JOIN public.workspace_member author ON author.id = message.author_workspace_member_id
-       LEFT JOIN public.workspace_membership pilot ON pilot.id = author.pilot_membership_id
-       LEFT JOIN auth."user" pilot_user ON pilot_user.id = pilot.user_id
-       LEFT JOIN public.agent agent ON agent.id = author.agent_id
-       WHERE turn.id = $1 AND request.workspace_id = $2 AND request.channel_id = $3
-       ORDER BY message.created_at DESC, message.id DESC
-       LIMIT 30
-     ) memory
-     ORDER BY memory.created_at, memory.id`,
-      [claim.id, claim.workspace_id, claim.channel_id]
-    ),
-    pool.query<{ memory_type: string; statement: string }>(
-      `SELECT memory.memory_type, memory.statement
-       FROM public.project_memory memory
-       JOIN public.channel channel ON channel.project_id = memory.project_id
-       WHERE channel.id = $1 AND memory.workspace_id = $2 AND memory.lifecycle = 'active'
-       ORDER BY memory.created_at DESC, memory.id DESC LIMIT 20`,
-      [claim.channel_id, claim.workspace_id]
-    ),
+    messageContext,
+    loadAgentProjectMemoryContext(pool, {
+      workspaceId: claim.workspace_id,
+      projectId: claim.project_id,
+      agentId: claim.agent_id
+    }),
     pool.query<{
       summary: string; confidence: string; observed_evidence: string[];
       inferences: string[]; assumptions: string[]; open_questions: string[];
@@ -579,9 +722,7 @@ async function loadConversationMemory(
   const rendered = messages.rows
     .map(({ author_name, body }) => `${author_name}: ${body.slice(0, 1200)}`)
     .join('\n');
-  const durable = projectMemory.rows.reverse()
-    .map(({ memory_type, statement }) => `[${memory_type}] ${statement.slice(0, 1000)}`)
-    .join('\n');
+  const durable = renderProjectMemoryContext(projectMemory);
   const structuredFindings = findings.rows.reverse().map((finding) => JSON.stringify({
     summary: finding.summary, confidence: Number(finding.confidence),
     observedEvidence: finding.observed_evidence, inferences: finding.inferences,

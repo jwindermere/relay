@@ -18,6 +18,17 @@ import {
   postChannelMessage
 } from '../src/lib/server/collaboration/channel.js';
 import {
+  createWorkspaceAgent,
+  loadWorkspaceAgents,
+  updateWorkspaceAgent
+} from '../src/lib/server/collaboration/agents.js';
+import {
+  instantiateAgentTemplate,
+  loadAgentTemplateContext,
+  loadAvailableAgentTemplateCapabilities
+} from '../src/lib/server/collaboration/agent-templates.js';
+import { loadActivePilotProjects } from '../src/lib/server/collaboration/project-access.js';
+import {
   endChannelCall,
   joinChannelCall,
   loadActiveChannelCall,
@@ -177,7 +188,9 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'collaboration_evaluation_event' },
       { table_schema: 'public', table_name: 'collaboration_feedback' },
       { table_schema: 'public', table_name: 'coordination_budget_reservation' },
+      { table_schema: 'public', table_name: 'coordination_provider_usage_record' },
       { table_schema: 'public', table_name: 'coordination_plan' },
+      { table_schema: 'public', table_name: 'coordination_plan_constraint' },
       { table_schema: 'public', table_name: 'coordination_plan_step' },
       { table_schema: 'public', table_name: 'finding_evidence' },
       { table_schema: 'public', table_name: 'github_broker_decision' },
@@ -195,12 +208,110 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'schema_migrations' },
       { table_schema: 'public', table_name: 'task' },
       { table_schema: 'public', table_name: 'workspace' },
+      { table_schema: 'public', table_name: 'workspace_collaboration_evaluation_policy' },
       { table_schema: 'public', table_name: 'workspace_coordination_policy' },
       { table_schema: 'public', table_name: 'workspace_invitation' },
       { table_schema: 'public', table_name: 'workspace_member' },
       { table_schema: 'public', table_name: 'workspace_membership' }
     ]);
+    const evaluationColumns = await pool.query<{ column_name: string; is_nullable: string }>(`
+      SELECT column_name, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'collaboration_evaluation_event'
+        AND column_name IN (
+          'agent_type', 'routing_policy_version', 'prompt_version',
+          'permission_policy_version', 'agent_configuration_version',
+          'outcome_type', 'outcome_id', 'expires_at'
+        )
+      ORDER BY column_name
+    `);
+    assert.deepEqual(evaluationColumns.rows, [
+      { column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { column_name: 'agent_type', is_nullable: 'NO' },
+      { column_name: 'expires_at', is_nullable: 'NO' },
+      { column_name: 'outcome_id', is_nullable: 'NO' },
+      { column_name: 'outcome_type', is_nullable: 'NO' },
+      { column_name: 'permission_policy_version', is_nullable: 'NO' },
+      { column_name: 'prompt_version', is_nullable: 'NO' },
+      { column_name: 'routing_policy_version', is_nullable: 'NO' }
+    ]);
+    const evaluationSourceColumns = await pool.query<{
+      table_name: string; column_name: string; is_nullable: string;
+    }>(`
+      SELECT table_name, column_name, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name IN (
+          'agent_run', 'agent_conversation_turn', 'coordination_plan'
+        )
+        AND column_name IN ('agent_configuration_version', 'agent_type_snapshot')
+      ORDER BY table_name, column_name
+    `);
+    assert.deepEqual(evaluationSourceColumns.rows, [
+      { table_name: 'agent_conversation_turn', column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { table_name: 'agent_conversation_turn', column_name: 'agent_type_snapshot', is_nullable: 'NO' },
+      { table_name: 'agent_run', column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { table_name: 'agent_run', column_name: 'agent_type_snapshot', is_nullable: 'NO' },
+      { table_name: 'coordination_plan', column_name: 'agent_configuration_version', is_nullable: 'NO' },
+      { table_name: 'coordination_plan', column_name: 'agent_type_snapshot', is_nullable: 'NO' }
+    ]);
+    const coordinationAgentRunConstraints = await pool.query<{
+      table_name: string; definition: string;
+    }>(`
+      SELECT table_row.relname AS table_name,
+             pg_get_constraintdef(constraint_row.oid) AS definition
+      FROM pg_constraint constraint_row
+      JOIN pg_class table_row ON table_row.oid = constraint_row.conrelid
+      JOIN pg_namespace schema_row ON schema_row.oid = table_row.relnamespace
+      WHERE schema_row.nspname = 'public'
+        AND constraint_row.conname IN (
+          'coordination_plan_max_agent_runs_check',
+          'workspace_coordination_policy_default_max_agent_runs_check',
+          'coordination_budget_reservation_reservation_kind_check'
+        )
+      ORDER BY table_row.relname
+    `);
+    assert.deepEqual(coordinationAgentRunConstraints.rows.map((row) => ({
+      tableName: row.table_name,
+      definition: row.definition.replaceAll(' ', '')
+    })), [
+      {
+        tableName: 'coordination_budget_reservation',
+        definition: "CHECK((reservation_kind='handoff'::text))"
+      },
+      {
+        tableName: 'coordination_plan',
+        definition: 'CHECK((max_agent_runs=0))'
+      },
+      {
+        tableName: 'workspace_coordination_policy',
+        definition: 'CHECK((default_max_agent_runs=0))'
+      }
+    ]);
     await assert.doesNotReject(assertCompatibleSchema(pool));
+  });
+
+  test('Agent handoff schema enforces lifecycle, retry, provenance, and loop boundaries', async () => {
+    const constraints = await pool.query<{ definition: string }>(
+      `SELECT pg_get_constraintdef(constraint_row.oid) AS definition
+       FROM pg_constraint constraint_row
+       JOIN pg_class table_row ON table_row.oid = constraint_row.conrelid
+       JOIN pg_namespace schema_row ON schema_row.oid = table_row.relnamespace
+       WHERE schema_row.nspname = 'public' AND table_row.relname = 'agent_handoff'
+       ORDER BY constraint_row.conname`
+    );
+    const contract = constraints.rows.map(({ definition }) => definition).join('\n');
+    assert.match(
+      contract,
+      /status.*queued.*working.*completed.*failed.*cancelled.*expired/is
+    );
+    assert.match(contract, /UNIQUE \(source_message_id\)/i);
+    assert.match(contract, /UNIQUE \(receiving_turn_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(project_id, workspace_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(originating_pilot_member_id, workspace_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(source_agent_id, workspace_id\)/i);
+    assert.match(contract, /FOREIGN KEY \(target_agent_id, workspace_id\)/i);
+    assert.match(contract, /source_agent_id <> target_agent_id/i);
+    assert.match(contract, /status = 'completed'.*result_message_id IS NOT NULL/is);
+    assert.match(contract, /status = 'working'.*started_at IS NOT NULL/is);
   });
 
   test('a runtime accepts additive mixed-version schemas and rejects unsafe contracts', async () => {
@@ -549,6 +660,190 @@ if (connectionString) {
     );
   });
 
+  test('Agent template instantiation preserves bounded provenance through owner customization', async () => {
+    const auth = createTestAuth();
+    const signIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({ email: 'owner@example.com', password: 'correct horse battery staple' })
+    }));
+    const ownerCookie = signIn.headers.get('set-cookie');
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const projectId = (await loadSharedAgentChannel(pool, ownerAccess)).project.id;
+    const existingAgents = (await loadWorkspaceAgents(pool, ownerAccess)).agents;
+    const availableCapabilities = await loadAvailableAgentTemplateCapabilities(
+      pool, ownerAccess, projectId
+    );
+    const created = await instantiateAgentTemplate(pool, ownerAccess, projectId, 'designer', {
+      availableCapabilities,
+      existingAgents,
+      name: 'Journey Designer',
+      roleLabel: 'Onboarding designer',
+      instructions: 'Review authorised onboarding evidence.',
+      ambientTriggers: ['onboarding', 'journey']
+    });
+
+    assert.deepEqual(created.agent.templateProvenance, { key: 'designer', version: 2 });
+    assert.deepEqual(created.disabledCapabilities, ['design_assets']);
+    const createdMembership = await pool.query<{ project_id: string }>(
+      `SELECT membership.project_id
+       FROM public.project_membership membership
+       JOIN public.workspace_member member
+         ON member.id = membership.workspace_member_id
+        AND member.workspace_id = membership.workspace_id
+       WHERE member.agent_id = $1`,
+      [created.agent.id]
+    );
+    assert.deepEqual(createdMembership.rows, [{ project_id: projectId }]);
+    await updateWorkspaceAgent(pool, ownerAccess, created.agent.id, {
+      ...created.agent,
+      roleLabel: 'Activation designer',
+      instructions: 'Review authorised activation evidence.'
+    });
+
+    const customized = (await loadWorkspaceAgents(pool, ownerAccess)).agents.find(
+      ({ id }) => id === created.agent.id
+    );
+    assert.equal(customized?.roleLabel, 'Activation designer');
+    assert.deepEqual(customized?.templateProvenance, { key: 'designer', version: 2 });
+    assert.equal(customized?.permissionCeiling, 'read_only');
+    assert.deepEqual(customized?.disabledCapabilities, ['design_assets']);
+    await assert.rejects(
+      updateWorkspaceAgent(pool, ownerAccess, created.agent.id, {
+        ...created.agent,
+        agentType: 'engineering',
+        roleLabel: 'Engineering designer'
+      }),
+      /permission ceiling/i
+    );
+  });
+
+  test('Agent template preview and instantiation stay in the explicitly selected Project', async () => {
+    const auth = createTestAuth();
+    const signIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({ email: 'owner@example.com', password: 'correct horse battery staple' })
+    }));
+    const ownerCookie = signIn.headers.get('set-cookie');
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const ownerMember = await pool.query<{ id: string }>(
+      `SELECT id FROM public.workspace_member
+       WHERE workspace_id = $1 AND pilot_membership_id = $2`,
+      [ownerAccess.workspace.id, ownerAccess.membership.id]
+    );
+    assert.ok(ownerMember.rows[0]);
+    const selectedProjectId = randomUUID();
+    const inaccessibleProjectId = randomUUID();
+    const foreignWorkspaceId = randomUUID();
+    const foreignProjectId = randomUUID();
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name) VALUES
+         ($1, $3, 'Selected Project'),
+         ($2, $3, 'Inaccessible Project')`,
+      [selectedProjectId, inaccessibleProjectId, ownerAccess.workspace.id]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, $3)`,
+      [ownerAccess.workspace.id, selectedProjectId, ownerMember.rows[0].id]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace (id, name) VALUES ($1, 'Foreign Workspace')`,
+      [foreignWorkspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ($1, $2, 'Foreign Project')`,
+      [foreignProjectId, foreignWorkspaceId]
+    );
+
+    assert.ok(
+      (await loadActivePilotProjects(pool, ownerAccess)).some(
+        ({ id }) => id === selectedProjectId
+      )
+    );
+    assert.ok(
+      !(await loadActivePilotProjects(pool, ownerAccess)).some(
+        ({ id }) => id === inaccessibleProjectId || id === foreignProjectId
+      )
+    );
+    const selectedContext = await loadAgentTemplateContext(
+      pool, ownerAccess, selectedProjectId
+    );
+    assert.deepEqual(selectedContext.availableCapabilities, ['project_data']);
+    assert.deepEqual(selectedContext.projectAgents, []);
+    await assert.rejects(
+      loadAvailableAgentTemplateCapabilities(pool, ownerAccess, inaccessibleProjectId),
+      /active Project membership is required/
+    );
+    await assert.rejects(
+      loadAvailableAgentTemplateCapabilities(pool, ownerAccess, foreignProjectId),
+      /active Project membership is required/
+    );
+
+    await createWorkspaceAgent(pool, ownerAccess, selectedProjectId, {
+      name: 'Metrics Analyst',
+      agentType: 'general',
+      roleLabel: 'Data analyst',
+      ambientTriggers: ['analysis']
+    });
+    await assert.rejects(
+      instantiateAgentTemplate(pool, ownerAccess, selectedProjectId, 'data-analyst', {
+        availableCapabilities: selectedContext.availableCapabilities,
+        existingAgents: selectedContext.agentConfiguration.agents,
+        existingProjectAgents: selectedContext.projectAgents,
+        warningAcknowledgement: null
+      }),
+      /warnings changed/i
+    );
+
+    const created = await instantiateAgentTemplate(
+      pool,
+      ownerAccess,
+      selectedProjectId,
+      'support',
+      {
+        availableCapabilities: selectedContext.availableCapabilities,
+        existingAgents: selectedContext.agentConfiguration.agents,
+        existingProjectAgents: selectedContext.projectAgents,
+        name: 'Selected Project Support'
+      }
+    );
+    const membership = await pool.query<{ project_id: string }>(
+      `SELECT project_membership.project_id
+       FROM public.project_membership project_membership
+       JOIN public.workspace_member member
+         ON member.id = project_membership.workspace_member_id
+        AND member.workspace_id = project_membership.workspace_id
+       WHERE member.agent_id = $1`,
+      [created.agent.id]
+    );
+    assert.deepEqual(membership.rows, [{ project_id: selectedProjectId }]);
+    await assert.rejects(
+      instantiateAgentTemplate(pool, ownerAccess, inaccessibleProjectId, 'support', {
+        availableCapabilities: [], existingAgents: [], name: 'Inaccessible Project Support'
+      }),
+      /active Project membership is required/
+    );
+    await assert.rejects(
+      instantiateAgentTemplate(pool, ownerAccess, foreignProjectId, 'support', {
+        availableCapabilities: [], existingAgents: [], name: 'Foreign Project Support'
+      }),
+      /active Project membership is required/
+    );
+  });
+
   test('both Pilot members share attributable roots and direct replies with Alex', async () => {
     assert.ok(pilotMemberHeaders);
     const auth = createTestAuth();
@@ -652,6 +947,7 @@ if (connectionString) {
       confidence: 1,
       policyVersion: 'rules-v1',
       rationale: 'No eligible Agent mention or active Agent conversation was found.',
+      requiresConfirmation: false,
       correctedAt: null
     });
 
@@ -685,6 +981,111 @@ if (connectionString) {
          WHERE task.source_message_id = $1) AS runs
     `, [message.id]);
     assert.deepEqual(work.rows[0], { tasks: 0, runs: 0 });
+  });
+
+  test('the Message intent decision selects the only Agent considered for a Message', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+
+    const message = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex could you discuss the rollout with @Riley?'
+    });
+
+    assert.equal(message.routingDecision?.intent, 'conversation');
+    assert.equal(message.routingDecision?.targetAgentId, `${memberAccess.workspace.id}:alex`);
+    assert.equal(message.agentMention?.status, 'rejected');
+    assert.equal(message.agentMention?.agentId, message.routingDecision?.targetAgentId);
+  });
+
+  test('research and repository-affecting Message intent decisions wait for Pilot member confirmation', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+
+    const research = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Riley research the rollout evidence.'
+    });
+    assert.equal(research.routingDecision?.intent, 'research_request');
+    assert.equal(research.agentMention, null);
+    await assert.rejects(
+      correctMessageIntent(pool, memberAccess, research.id, {
+        intent: 'engineering_delegation',
+        targetAgentId: `${memberAccess.workspace.id}:riley`
+      }),
+      /Corrected engineering Agent is unavailable/
+    );
+    await correctMessageIntent(pool, memberAccess, research.id, { intent: 'research_request' });
+    const confirmedResearch = (await loadSharedAgentChannel(pool, memberAccess)).messages
+      .find(({ id }) => id === research.id);
+    assert.equal(confirmedResearch?.agentMention?.status, 'rejected');
+
+    const engineering = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex fix the progress view.'
+    });
+    assert.equal(engineering.routingDecision?.intent, 'engineering_delegation');
+    assert.equal(engineering.agentMention, null);
+  });
+
+  test('a Pilot member correction retargets a queued Agent conversation without editing the Message', async () => {
+    assert.ok(pilotMemberHeaders);
+    const auth = createTestAuth();
+    const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const channel = await loadSharedAgentChannel(pool, memberAccess);
+    await pool.query(
+      `INSERT INTO public.provider_connection (
+         id, workspace_id, owner_membership_id, status,
+         credential_store_reference, connected_at
+       )
+       SELECT $2, $1, membership.id, 'ready', $3, now()
+       FROM public.workspace_membership membership
+       WHERE membership.workspace_id = $1 AND membership.role = 'owner'
+       ON CONFLICT (workspace_id) DO UPDATE
+       SET status = 'ready', connected_at = COALESCE(provider_connection.connected_at, now())`,
+      [memberAccess.workspace.id, `${memberAccess.workspace.id}:intent-provider`,
+        `codex:${memberAccess.workspace.id}:intent-retarget`]
+    );
+
+    const message = await postChannelMessage(pool, memberAccess, {
+      channelId: channel.channel.id,
+      body: '@Alex hello.'
+    });
+    assert.equal(message.agentMention?.status, 'conversation');
+    await correctMessageIntent(pool, memberAccess, message.id, {
+      intent: 'conversation',
+      targetAgentId: `${memberAccess.workspace.id}:riley`
+    });
+
+    const retargeted = await pool.query<{ agent_id: string; status: string }>(
+      `SELECT conversation.agent_id, turn.status
+       FROM public.agent_conversation_turn turn
+       JOIN public.agent_conversation conversation ON conversation.id = turn.conversation_id
+       WHERE turn.request_message_id = $1`,
+      [message.id]
+    );
+    assert.deepEqual(retargeted.rows, [{
+      agent_id: `${memberAccess.workspace.id}:riley`, status: 'queued'
+    }]);
+    const corrected = (await loadSharedAgentChannel(pool, memberAccess)).messages
+      .find(({ id }) => id === message.id);
+    assert.equal(corrected?.body, '@Alex hello.');
+    assert.equal(corrected?.routingDecision?.targetAgentId, `${memberAccess.workspace.id}:riley`);
+
+    await pool.query(
+      `UPDATE public.agent_conversation_turn
+       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
+       WHERE request_message_id = $1`,
+      [message.id]
+    );
+    await pool.query(
+      `UPDATE public.provider_connection SET status = 'disconnected' WHERE workspace_id = $1`,
+      [memberAccess.workspace.id]
+    );
   });
 
   test('an ineligible Agent mention retains its Message without partial work', async () => {
@@ -894,6 +1295,112 @@ if (connectionString) {
     );
   });
 
+  test('Agent handoff persistence rejects retries, invalid lifecycle changes, and broken provenance', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const fixture = await client.query<{
+        workspace_id: string; project_id: string; channel_id: string;
+        pilot_member_id: string; source_agent_id: string; source_member_id: string;
+        target_agent_id: string; provider_connection_id: string;
+      }>(
+        `SELECT workspace.id AS workspace_id, project.id AS project_id,
+                channel.id AS channel_id, pilot_member.id AS pilot_member_id,
+                source_agent.id AS source_agent_id, source_member.id AS source_member_id,
+                target_agent.id AS target_agent_id, provider.id AS provider_connection_id
+         FROM public.workspace workspace
+         JOIN public.project project ON project.workspace_id = workspace.id
+         JOIN public.channel channel ON channel.project_id = project.id
+         JOIN public.workspace_member pilot_member
+           ON pilot_member.workspace_id = workspace.id AND pilot_member.kind = 'pilot'
+         JOIN public.agent source_agent
+           ON source_agent.workspace_id = workspace.id AND source_agent.name = 'Alex'
+         JOIN public.workspace_member source_member ON source_member.agent_id = source_agent.id
+         JOIN public.agent target_agent
+           ON target_agent.workspace_id = workspace.id AND target_agent.name = 'Maya'
+         JOIN public.provider_connection provider ON provider.workspace_id = workspace.id
+         ORDER BY project.created_at, pilot_member.created_at
+         LIMIT 1`
+      );
+      const context = fixture.rows[0]!;
+      await client.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, body
+         ) VALUES ('database-handoff-source', $1, $2, $3, '@Maya Which outcome matters?')`,
+        [context.workspace_id, context.channel_id, context.source_member_id]
+      );
+      await client.query(
+        `INSERT INTO public.agent_conversation (
+           id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+         ) VALUES ('database-handoff-conversation', $1, $2, 'database-handoff-source', $3, $4)`,
+        [context.workspace_id, context.channel_id, context.target_agent_id,
+          context.provider_connection_id]
+      );
+      await client.query(
+        `INSERT INTO public.agent_conversation_turn (
+           id, workspace_id, conversation_id, request_message_id,
+           requested_by_workspace_member_id, status, handoff_depth
+         ) VALUES (
+           'database-handoff-turn', $1, 'database-handoff-conversation',
+           'database-handoff-source', $2, 'queued', 1
+         )`,
+        [context.workspace_id, context.source_member_id]
+      );
+      const handoffValues = [context.workspace_id, context.project_id,
+        context.pilot_member_id, context.source_agent_id, context.target_agent_id];
+      const insertHandoff = (id: string) => client.query(
+        `INSERT INTO public.agent_handoff (
+           id, workspace_id, project_id, originating_pilot_member_id,
+           source_agent_id, target_agent_id, source_message_id, receiving_turn_id, question
+         ) VALUES ($6, $1, $2, $3, $4, $5,
+           'database-handoff-source', 'database-handoff-turn', 'Which outcome matters?')`,
+        [...handoffValues, id]
+      );
+      await insertHandoff('database-handoff');
+
+      const rejected = async (name: string, operation: () => Promise<unknown>) => {
+        await client.query(`SAVEPOINT ${name}`);
+        await assert.rejects(operation());
+        await client.query(`ROLLBACK TO SAVEPOINT ${name}`);
+      };
+      await rejected('duplicate_retry', () => insertHandoff('database-handoff-retry'));
+      await rejected('self_handoff', () => client.query(
+        `UPDATE public.agent_handoff SET target_agent_id = source_agent_id
+         WHERE id = 'database-handoff'`
+      ));
+      await rejected('cross_project', () => client.query(
+        `UPDATE public.agent_handoff SET project_id = 'missing-project'
+         WHERE id = 'database-handoff'`
+      ));
+      await rejected('invalid_lifecycle', () => client.query(
+        `UPDATE public.agent_handoff SET status = 'completed'
+         WHERE id = 'database-handoff'`
+      ));
+
+      await client.query(
+        `UPDATE public.agent_handoff SET status = 'working', started_at = now()
+         WHERE id = 'database-handoff'`
+      );
+      await client.query(
+        `UPDATE public.agent_handoff
+         SET status = 'failed', completed_at = now(), error_code = 'provider_failed'
+         WHERE id = 'database-handoff'`
+      );
+      const completed = await client.query<{ status: string; error_code: string }>(
+        `SELECT status, error_code FROM public.agent_handoff WHERE id = 'database-handoff'`
+      );
+      assert.deepEqual(completed.rows[0], {
+        status: 'failed', error_code: 'provider_failed'
+      });
+      await client.query('ROLLBACK');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
   test('only the active owner links and verifies one stable GitHub repository identity', async () => {
     assert.ok(pilotMemberHeaders);
     const auth = createTestAuth();
@@ -914,6 +1421,7 @@ if (connectionString) {
       new Headers({ cookie: ownerCookie.split(';', 1)[0] })
     );
     const memberAccess = await authorizeWorkspaceRequest(pool, auth, pilotMemberHeaders);
+    const projectId = (await loadSharedAgentChannel(pool, ownerAccess)).project.id;
     const inspected: GitHubRepositoryEvidence[] = [];
     let inspectionFails = false;
     let evidence = protectedRepositoryEvidence();
@@ -926,6 +1434,11 @@ if (connectionString) {
         return evidence;
       }
     };
+
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, projectId),
+      ['project_data']
+    );
 
     await assert.rejects(
       linkGitHubRepository(pool, memberAccess, {
@@ -952,6 +1465,33 @@ if (connectionString) {
       defaultBranch: 'main',
       releaseBranches: ['release']
     });
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, memberAccess, projectId),
+      ['project_data', 'repository_read']
+    );
+    const linkedProject = await pool.query<{ project_id: string }>(
+      'SELECT project_id FROM public.linked_repository WHERE workspace_id = $1',
+      [ownerAccess.workspace.id]
+    );
+    const otherProjectId = randomUUID();
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ($1, $2, 'Other Project')`,
+      [otherProjectId, ownerAccess.workspace.id]
+    );
+    await pool.query(
+      'UPDATE public.linked_repository SET project_id = $2 WHERE workspace_id = $1',
+      [ownerAccess.workspace.id, otherProjectId]
+    );
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, projectId),
+      ['project_data']
+    );
+    await pool.query(
+      'UPDATE public.linked_repository SET project_id = $2 WHERE workspace_id = $1',
+      [ownerAccess.workspace.id, linkedProject.rows[0]!.project_id]
+    );
+    await pool.query('DELETE FROM public.project WHERE id = $1', [otherProjectId]);
     await assert.rejects(
       requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
       /verified Linked pilot repository is required/
@@ -1048,6 +1588,10 @@ if (connectionString) {
     assert.equal(disabled.linkState, 'linked');
     assert.equal(disabled.githubConnectionState, 'disabled');
     assert.equal(disabled.readyForAutonomousWork, false);
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, projectId),
+      ['project_data']
+    );
     const disabledVerification = await verifyLinkedRepository(pool, ownerAccess, gateway);
     assert.equal(disabledVerification.linkState, 'linked');
     assert.equal(disabledVerification.githubConnectionState, 'disabled');
@@ -1103,7 +1647,7 @@ if (connectionString) {
     const unsafeRepository = await postChannelMessage(pool, memberAccess, {
       channelId: channel.channel.id,
       body: '@Alex investigate the reconnect failure.'
-    }, mentionDependencies);
+    });
     await correctMessageIntent(pool, memberAccess, unsafeRepository.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const unsafeRepositoryAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1120,7 +1664,7 @@ if (connectionString) {
     const unsafe = await postChannelMessage(pool, memberAccess, {
       channelId: channel.channel.id,
       body: '@Alex please deploy this directly to production.'
-    }, mentionDependencies);
+    });
     await correctMessageIntent(pool, memberAccess, unsafe.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const unsafeAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1140,7 +1684,7 @@ if (connectionString) {
       const rejected = await postChannelMessage(pool, memberAccess, {
         channelId: channel.channel.id,
         body: forbiddenRequest
-      }, mentionDependencies);
+      });
       await correctMessageIntent(pool, memberAccess, rejected.id,
         { intent: 'engineering_delegation' }, mentionDependencies);
       const rejectedAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1155,7 +1699,7 @@ if (connectionString) {
     const atCapacity = await postChannelMessage(pool, memberAccess, {
       channelId: channel.channel.id,
       body: '@Alex investigate another reconnect failure.'
-    }, mentionDependencies);
+    });
     await correctMessageIntent(pool, memberAccess, atCapacity.id,
       { intent: 'engineering_delegation' }, mentionDependencies);
     const atCapacityAfterConfirmation = (await loadSharedAgentChannel(pool, memberAccess))
@@ -1177,12 +1721,12 @@ if (connectionString) {
         channelId: channel.channel.id,
         body: request,
         submissionId
-      }, mentionDependencies),
+      }),
       postChannelMessage(pool, memberAccess, {
         channelId: channel.channel.id,
         body: request,
         submissionId
-      }, mentionDependencies)
+      })
     ]);
     assert.equal(first.id, retry.id);
     assert.equal(first.body, retry.body);
@@ -1193,7 +1737,7 @@ if (connectionString) {
       channelId: channel.channel.id,
       body: '@Alex this retry must not retarget the accepted work.',
       submissionId
-    }, mentionDependencies);
+    });
     assert.equal(conflictingRetry.id, first.id);
     assert.equal(conflictingRetry.body, request);
     await correctMessageIntent(pool, memberAccess, first.id,
@@ -1342,7 +1886,7 @@ if (connectionString) {
           channelId: channel.channel.id,
           body: '@Alex prove the transaction rolls back.',
           submissionId: failedSubmissionId
-        }, mentionDependencies),
+        }),
         /test outbox failure/
       );
     } finally {

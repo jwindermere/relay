@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
-interface SteeringContext {
+export interface SteeringContext {
   messageId: string;
   workspaceId: string;
   channelId: string;
@@ -9,13 +9,17 @@ interface SteeringContext {
   body: string;
 }
 
+export function parseGuidanceInput(context: SteeringContext): string | null {
+  if (!context.parentMessageId) return null;
+  return context.body.match(/^\s*(?:steer|guidance|constraint)\s*:\s*(.+)$/isu)?.[1]?.trim() || null;
+}
+
 export async function acceptAgentRunSteering(
   client: PoolClient,
-  context: SteeringContext
+  context: SteeringContext,
+  suppliedGuidance?: string
 ): Promise<boolean> {
-  if (!context.parentMessageId) return false;
-  const match = context.body.match(/^\s*(?:steer|guidance|constraint)\s*:\s*(.+)$/isu);
-  const guidance = match?.[1]?.trim();
+  const guidance = suppliedGuidance ?? parseGuidanceInput(context);
   if (!guidance) return false;
   const run = await client.query<{
     id: string; workspace_id: string; project_id: string; member_id: string; status: string;
@@ -35,13 +39,13 @@ export async function acceptAgentRunSteering(
      WHERE steering_message.id = $1 AND steering_message.workspace_id = $2
        AND steering_message.channel_id = $3
        AND run.status IN ('queued', 'planning', 'working', 'waiting_for_input', 'waiting_for_approval', 'recovering', 'paused')
-     ORDER BY run.attempt_number DESC LIMIT 1`,
+     ORDER BY run.attempt_number DESC LIMIT 1 FOR UPDATE OF run`,
     [context.messageId, context.workspaceId, context.channelId, context.parentMessageId]
   );
   const active = run.rows[0];
   if (!active) return false;
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [active.id]);
-  await client.query(
+  const inserted = await client.query(
     `INSERT INTO public.agent_run_steering (
        id, workspace_id, project_id, agent_run_id, source_message_id,
        supplied_by_workspace_member_id, guidance, ordinal
@@ -51,5 +55,5 @@ export async function acceptAgentRunSteering(
     [randomUUID(), context.workspaceId, active.project_id, active.id,
       context.messageId, active.member_id, guidance]
   );
-  return true;
+  return inserted.rowCount === 1;
 }

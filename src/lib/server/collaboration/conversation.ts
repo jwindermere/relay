@@ -2,9 +2,13 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import type { AgentMentionResult } from './delegation.js';
+import type { AgentExpectedResultShape } from './agent-templates.js';
+import { selectAmbientTarget } from './ambient-target.js';
+import { loadChannelContextBeforeMessage } from './channel-context.js';
 import {
   explicitAgentMentionPattern,
-  isConcreteEngineeringRequest
+  isConcreteEngineeringRequest,
+  resolveMessageAgentTarget
 } from './delegation.js';
 
 export { isConcreteEngineeringRequest } from './delegation.js';
@@ -15,6 +19,7 @@ interface ConversationContext {
   channelId: string;
   parentMessageId: string | null;
   body: string;
+  targetAgentId?: string | null;
 }
 
 interface AgentCandidate {
@@ -28,17 +33,8 @@ interface AgentCandidate {
   reply_mode: 'adaptive' | 'channel' | 'thread';
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
-}
-
-function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean {
-  const normalized = trigger.trim().toLocaleLowerCase();
-  if (!normalized) return false;
-  if (/^[\p{L}\p{N}_-]+$/u.test(normalized)) {
-    const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}($|[^\\p{L}\\p{N}_-])`, 'u')
-      .test(normalizedBody);
-  }
-  return normalizedBody.includes(normalized);
+  configuration_version: number;
+  template_expected_result_shapes: AgentExpectedResultShape[];
 }
 
 function handoffQuestion(body: string, agentName: string): string {
@@ -49,10 +45,17 @@ function handoffQuestion(body: string, agentName: string): string {
     .trim();
 }
 
-export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
-  const normalizedBody = body.toLocaleLowerCase();
-  return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
+function requestsBoundedSpecialistInput(body: string, agentName: string): boolean {
+  const request = handoffQuestion(body, agentName);
+  const asksForInput = /^(?:what|which|who|whose|when|where|why|how|whether)\b/iu.test(request)
+    || /^(?:is|are|do|does|did|has|have|should|would|can|could)\s+(?!you\b)/iu.test(request)
+    || /^(?:(?:please|could\s+you|would\s+you|can\s+you)\s+)?(?:explain|identify|clarify|assess|advise|recommend|compare|summarize|describe|outline|tell\s+me)\b/iu.test(request);
+  const addsAnotherClause = /[.,;:!?]\s+\S|\b(?:and|then|also|afterwards)\b/iu.test(request);
+  const directsSecondPersonAction = /\byou\s+(?!(?:think|recommend|advise|suggest|know|believe|expect|consider|explain|identify|clarify|assess|compare|summarize|describe|outline|tell)\b)/iu.test(request);
+  return asksForInput && !addsAnotherClause && !directsSecondPersonAction;
 }
+
+export { matchesAmbientTriggers } from './ambient-target.js';
 
 export async function acceptAgentConversation(
   client: PoolClient,
@@ -60,14 +63,14 @@ export async function acceptAgentConversation(
 ): Promise<AgentMentionResult> {
   const agents = await client.query<AgentCandidate>(
     `SELECT id, name, agent_type, role_label, instructions, participation_mode,
-            ambient_triggers, reply_mode, enabled, status
+            ambient_triggers, reply_mode, enabled, status, configuration_version,
+            COALESCE(template_snapshot -> 'expectedResultShapes', '[]'::jsonb)
+              AS template_expected_result_shapes
      FROM public.agent WHERE workspace_id = $1
      ORDER BY length(name) DESC, id`,
     [context.workspaceId]
   );
-  const mentioned = agents.rows.find(({ name }) =>
-    explicitAgentMentionPattern(name).test(context.body)
-  );
+  const targetAgent = resolveMessageAgentTarget(agents.rows, context.body, context.targetAgentId);
   const requestAuthor = await client.query<{
     kind: 'pilot' | 'agent';
     agent_id: string | null;
@@ -83,7 +86,7 @@ export async function acceptAgentConversation(
   const agentAuthored = requestAuthor.rows[0]?.kind === 'agent';
   // Agent output is only routable as an explicit, bounded handoff. In particular,
   // a reply in an existing Thread must not implicitly wake the same Agent again.
-  if (agentAuthored && !mentioned) return null;
+  if (agentAuthored && !targetAgent) return null;
   const rootMessageId = context.parentMessageId ?? context.messageId;
   const existing = context.parentMessageId
     ? await client.query<{ id: string; agent_id: string }>(
@@ -107,7 +110,7 @@ export async function acceptAgentConversation(
     ? agents.rows.find(({ id }) => id === existing.rows[0]!.agent_id)
     : undefined;
   let ambient = false;
-  let agent = mentioned ?? inherited;
+  let agent = targetAgent ?? inherited;
   if (!agent) {
     const taskOwner = context.parentMessageId
       ? await client.query<{ assigned_agent_id: string }>(
@@ -128,24 +131,18 @@ export async function acceptAgentConversation(
     );
     agent = ambientCandidates.find((candidate) =>
       candidate.id === taskOwner.rows[0]?.assigned_agent_id
-    ) ?? ambientCandidates
-      .map((candidate) => ({
-        candidate,
-        score: candidate.ambient_triggers.reduce(
-          (score, trigger) => score + (ambientTriggerMatches(context.body.toLocaleLowerCase(), trigger)
-            ? trigger.trim().length
-            : 0),
-          0
-        )
-      }))
-      .filter(({ score }) => score > 0)
-      .sort((left, right) => right.score - left.score || left.candidate.id.localeCompare(right.candidate.id))[0]
-      ?.candidate;
+    ) ?? selectAmbientTarget(context.body, ambientCandidates.map((candidate) => ({
+      candidate,
+      id: candidate.id,
+      triggers: candidate.ambient_triggers
+    })));
     ambient = Boolean(agent);
   }
   if (!agent) return null;
-  if (mentioned && agent.agent_type === 'engineering'
-    && isConcreteEngineeringRequest(context.body, agent.name)) return null;
+  if (agentAuthored && !requestsBoundedSpecialistInput(context.body, agent.name)) return null;
+  if (targetAgent && (
+    (agent.agent_type === 'engineering' && isConcreteEngineeringRequest(context.body, agent.name))
+  )) return null;
 
   const readiness = await client.query<{
     author_is_active_pilot: boolean;
@@ -206,17 +203,17 @@ export async function acceptAgentConversation(
      WHERE message.id = $1 AND message.workspace_id = $2 AND channel.id = $3`,
     [context.messageId, context.workspaceId, context.channelId, agent.id]
   );
-  const ready = readiness.rows[0];
-  if (agentAuthored && !ready?.valid_agent_handoff) return null;
-  const rejection = !ready?.author_is_active_pilot && !ready?.valid_agent_handoff
+  const routingContext = readiness.rows[0];
+  if (agentAuthored && !routingContext?.valid_agent_handoff) return null;
+  const rejection = !routingContext?.author_is_active_pilot && !routingContext?.valid_agent_handoff
     ? 'Active Pilot member access is required.'
-    : !ready.author_is_project_member
+    : !routingContext.author_is_project_member
       ? 'This Channel is not eligible for Agent conversation.'
-      : !ready.agent_is_project_member
+      : !routingContext.agent_is_project_member
         ? `${agent.name} is not a member of this Project.`
         : !agent.enabled || agent.status === 'disabled'
           ? `${agent.name} is disabled and cannot respond.`
-          : ready.provider_status !== 'ready' || !ready.provider_connection_id
+          : routingContext.provider_status !== 'ready' || !routingContext.provider_connection_id
             ? 'A ready Codex Provider connection is required before Agent conversation.'
             : undefined;
   if (rejection) {
@@ -231,8 +228,11 @@ export async function acceptAgentConversation(
     return { status: 'rejected', agentId: agent.id, reason: rejection };
   }
 
-  const conversationId = existing.rows[0]?.id ?? randomUUID();
-  if (!existing.rows[0]) {
+  const selectedConversation = existing.rows[0]?.agent_id === agent.id
+    ? existing.rows[0]
+    : undefined;
+  const conversationId = selectedConversation?.id ?? randomUUID();
+  if (!selectedConversation) {
     await client.query(
       `INSERT INTO public.agent_conversation (
          id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
@@ -244,11 +244,11 @@ export async function acceptAgentConversation(
         context.channelId,
         rootMessageId,
         agent.id,
-        ready.provider_connection_id
+        routingContext.provider_connection_id
       ]
     );
   }
-  const storedConversationId = existing.rows[0]?.id ?? (await client.query<{ id: string }>(
+  const storedConversationId = selectedConversation?.id ?? (await client.query<{ id: string }>(
     `SELECT id FROM public.agent_conversation
      WHERE workspace_id = $1 AND root_message_id = $2 AND agent_id = $3`,
     [context.workspaceId, rootMessageId, agent.id]
@@ -276,7 +276,7 @@ export async function acceptAgentConversation(
      RETURNING id`,
     [
       turnId, context.workspaceId, storedConversationId, context.messageId,
-      responsePlacement, responseParentMessageId, ambient, ready.handoff_depth
+      responsePlacement, responseParentMessageId, ambient, routingContext.handoff_depth
     ]
   );
   const storedTurnId = turn.rows[0]?.id ?? (await client.query<{ id: string }>(
@@ -284,9 +284,24 @@ export async function acceptAgentConversation(
     [context.messageId]
   )).rows[0]?.id;
   if (!storedTurnId) throw new Error('Agent conversation turn could not be created');
+  if (!turn.rows[0]) {
+    const retargeted = await client.query(
+      `UPDATE public.agent_conversation_turn
+       SET conversation_id = $2, response_placement = $3,
+           response_parent_message_id = $4, ambient = $5,
+           agent_configuration_version = $6, agent_type_snapshot = $7,
+           updated_at = now()
+       WHERE id = $1 AND status = 'queued'`,
+      [storedTurnId, storedConversationId, responsePlacement, responseParentMessageId,
+        ambient, agent.configuration_version, agent.agent_type]
+    );
+    if (retargeted.rowCount !== 1) {
+      throw new Error('Agent conversation cannot be retargeted after execution starts');
+    }
+  }
   if (agentAuthored) {
-    if (!ready.project_id || !ready.source_agent_id
-      || !ready.originating_pilot_member_id || !ready.source_turn_id) {
+    if (!routingContext.project_id || !routingContext.source_agent_id
+      || !routingContext.originating_pilot_member_id || !routingContext.source_turn_id) {
       throw new Error('Agent handoff provenance could not be established');
     }
     const question = handoffQuestion(context.body, agent.name);
@@ -311,9 +326,9 @@ export async function acceptAgentConversation(
        ORDER BY artifact.created_at, artifact.id`,
       [
         context.workspaceId,
-        ready.project_id,
+        routingContext.project_id,
         context.body,
-        ready.source_request_body
+        routingContext.source_request_body
       ]
     );
     const artifactReferences = suppliedArtifacts.rows.map((artifact) => ({
@@ -323,8 +338,14 @@ export async function acceptAgentConversation(
       url: artifact.url
     }));
     const expectedResponseShape = agent.agent_type === 'research'
+      || agent.template_expected_result_shapes.includes('structured_finding')
       ? 'structured_finding'
       : 'concise_text';
+    const suppliedContext = await loadChannelContextBeforeMessage(
+      client,
+      context.messageId,
+      context.workspaceId
+    );
     await client.query(
       `INSERT INTO public.agent_handoff (
          id, workspace_id, project_id, originating_pilot_member_id,
@@ -333,17 +354,18 @@ export async function acceptAgentConversation(
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (source_message_id) DO NOTHING`,
       [
-        randomUUID(), context.workspaceId, ready.project_id,
-        ready.originating_pilot_member_id, ready.source_agent_id, agent.id,
+        randomUUID(), context.workspaceId, routingContext.project_id,
+        routingContext.originating_pilot_member_id, routingContext.source_agent_id, agent.id,
         context.messageId, storedTurnId, question,
         {
           channelId: context.channelId,
-          projectId: ready.project_id,
-          sourceConversationTurnId: ready.source_turn_id,
+          projectId: routingContext.project_id,
+          sourceConversationTurnId: routingContext.source_turn_id,
           sourceMessageId: context.messageId,
+          suppliedChannelContext: suppliedContext,
           originatingRequest: {
-            messageId: ready.source_request_message_id,
-            body: ready.source_request_body
+            messageId: routingContext.source_request_message_id,
+            body: routingContext.source_request_body
           }
         },
         JSON.stringify(artifactReferences),

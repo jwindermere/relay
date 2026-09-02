@@ -10,7 +10,11 @@ export async function POST({ request }) {
     const input = await request.json();
     const pool = getDatabasePool();
     const access = await authorizeWorkspaceRequest(pool, getRelayAuth(), request.headers);
-    return json({ agent: await createWorkspaceAgent(pool, access, input) }, { status: 201 });
+    const projectId = typeof input?.projectId === 'string' ? input.projectId.trim() : '';
+    return json(
+      { agent: await createWorkspaceAgent(pool, access, projectId, input) },
+      { status: 201 }
+    );
   } catch (error) {
     if (error instanceof WorkspaceAccessError) return json({ message: error.message }, { status: 403 });
     if (error instanceof AgentConfigurationError || error instanceof SyntaxError) {
