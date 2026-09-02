@@ -191,10 +191,10 @@ if (connectionString) {
       { table_schema: 'public', table_name: 'collaboration_evaluation_event' },
       { table_schema: 'public', table_name: 'collaboration_feedback' },
       { table_schema: 'public', table_name: 'coordination_budget_reservation' },
-      { table_schema: 'public', table_name: 'coordination_provider_usage_record' },
       { table_schema: 'public', table_name: 'coordination_plan' },
       { table_schema: 'public', table_name: 'coordination_plan_constraint' },
       { table_schema: 'public', table_name: 'coordination_plan_step' },
+      { table_schema: 'public', table_name: 'coordination_provider_usage_record' },
       { table_schema: 'public', table_name: 'finding_evidence' },
       { table_schema: 'public', table_name: 'github_broker_decision' },
       { table_schema: 'public', table_name: 'github_connection' },
@@ -313,7 +313,7 @@ if (connectionString) {
     assert.match(contract, /FOREIGN KEY \(source_agent_id, workspace_id\)/i);
     assert.match(contract, /FOREIGN KEY \(target_agent_id, workspace_id\)/i);
     assert.match(contract, /source_agent_id <> target_agent_id/i);
-    assert.match(contract, /status = 'completed'.*result_message_id IS NOT NULL/is);
+    assert.match(contract, /status <> 'completed'(?:::text)?.*result_message_id IS NOT NULL/is);
     assert.match(contract, /status = 'working'.*started_at IS NOT NULL/is);
   });
 
@@ -663,7 +663,7 @@ if (connectionString) {
     );
   });
 
-  test('Agent template instantiation preserves bounded provenance through owner customization', async () => {
+  test('Agent template instantiation preserves bounded provenance through owner customization', async (t) => {
     const auth = createTestAuth();
     const signIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
       method: 'POST',
@@ -682,6 +682,19 @@ if (connectionString) {
     const availableCapabilities = await loadAvailableAgentTemplateCapabilities(
       pool, ownerAccess, projectId
     );
+    let createdAgentId: string | undefined;
+    t.after(async () => {
+      if (!createdAgentId) return;
+      await pool.query(
+        `DELETE FROM public.project_membership
+         WHERE workspace_member_id IN (
+           SELECT id FROM public.workspace_member WHERE agent_id = $1
+         )`,
+        [createdAgentId]
+      );
+      await pool.query(`DELETE FROM public.workspace_member WHERE agent_id = $1`, [createdAgentId]);
+      await pool.query(`DELETE FROM public.agent WHERE id = $1`, [createdAgentId]);
+    });
     const created = await instantiateAgentTemplate(pool, ownerAccess, projectId, 'designer', {
       availableCapabilities,
       existingAgents,
@@ -690,6 +703,7 @@ if (connectionString) {
       instructions: 'Review authorised onboarding evidence.',
       ambientTriggers: ['onboarding', 'journey']
     });
+    createdAgentId = created.agent.id;
 
     assert.deepEqual(created.agent.templateProvenance, { key: 'designer', version: 2 });
     assert.deepEqual(created.disabledCapabilities, ['design_assets']);
@@ -726,7 +740,7 @@ if (connectionString) {
     );
   });
 
-  test('Agent template preview and instantiation stay in the explicitly selected Project', async () => {
+  test('Agent template preview and instantiation stay in the explicitly selected Project', async (t) => {
     const auth = createTestAuth();
     const signIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
       method: 'POST',
@@ -750,6 +764,26 @@ if (connectionString) {
     const inaccessibleProjectId = randomUUID();
     const foreignWorkspaceId = randomUUID();
     const foreignProjectId = randomUUID();
+    const createdAgentIds: string[] = [];
+    t.after(async () => {
+      await pool.query(
+        `DELETE FROM public.project_membership
+         WHERE project_id = ANY($1::uuid[])`,
+        [[selectedProjectId, inaccessibleProjectId, foreignProjectId]]
+      );
+      if (createdAgentIds.length > 0) {
+        await pool.query(
+          `DELETE FROM public.workspace_member WHERE agent_id = ANY($1::uuid[])`,
+          [createdAgentIds]
+        );
+        await pool.query(`DELETE FROM public.agent WHERE id = ANY($1::uuid[])`, [createdAgentIds]);
+      }
+      await pool.query(
+        `DELETE FROM public.project WHERE id = ANY($1::uuid[])`,
+        [[selectedProjectId, inaccessibleProjectId, foreignProjectId]]
+      );
+      await pool.query(`DELETE FROM public.workspace WHERE id = $1`, [foreignWorkspaceId]);
+    });
     await pool.query(
       `INSERT INTO public.project (id, workspace_id, name) VALUES
          ($1, $3, 'Selected Project'),
@@ -795,12 +829,13 @@ if (connectionString) {
       /active Project membership is required/
     );
 
-    await createWorkspaceAgent(pool, ownerAccess, selectedProjectId, {
+    const existingProjectAgent = await createWorkspaceAgent(pool, ownerAccess, selectedProjectId, {
       name: 'Metrics Analyst',
       agentType: 'general',
       roleLabel: 'Data analyst',
       ambientTriggers: ['analysis']
     });
+    createdAgentIds.push(existingProjectAgent.id);
     await assert.rejects(
       instantiateAgentTemplate(pool, ownerAccess, selectedProjectId, 'data-analyst', {
         availableCapabilities: selectedContext.availableCapabilities,
@@ -823,6 +858,7 @@ if (connectionString) {
         name: 'Selected Project Support'
       }
     );
+    createdAgentIds.push(created.agent.id);
     const membership = await pool.query<{ project_id: string }>(
       `SELECT project_membership.project_id
        FROM public.project_membership project_membership
