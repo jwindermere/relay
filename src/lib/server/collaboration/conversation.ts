@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 
 import type { AgentMentionResult } from './delegation.js';
 import type { AgentExpectedResultShape } from './agent-templates.js';
+import { selectAmbientTarget } from './ambient-target.js';
 import { loadChannelContextBeforeMessage } from './channel-context.js';
 import {
   explicitAgentMentionPattern,
@@ -36,17 +37,6 @@ interface AgentCandidate {
   template_expected_result_shapes: AgentExpectedResultShape[];
 }
 
-function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean {
-  const normalized = trigger.trim().toLocaleLowerCase();
-  if (!normalized) return false;
-  if (/^[\p{L}\p{N}_-]+$/u.test(normalized)) {
-    const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}($|[^\\p{L}\\p{N}_-])`, 'u')
-      .test(normalizedBody);
-  }
-  return normalizedBody.includes(normalized);
-}
-
 function handoffQuestion(body: string, agentName: string): string {
   return body
     .replace(explicitAgentMentionPattern(agentName), ' ')
@@ -65,10 +55,7 @@ function requestsBoundedSpecialistInput(body: string, agentName: string): boolea
   return asksForInput && !addsAnotherClause && !directsSecondPersonAction;
 }
 
-export function matchesAmbientTriggers(body: string, triggers: string[]): boolean {
-  const normalizedBody = body.toLocaleLowerCase();
-  return triggers.some((trigger) => ambientTriggerMatches(normalizedBody, trigger));
-}
+export { matchesAmbientTriggers } from './ambient-target.js';
 
 export async function acceptAgentConversation(
   client: PoolClient,
@@ -144,19 +131,11 @@ export async function acceptAgentConversation(
     );
     agent = ambientCandidates.find((candidate) =>
       candidate.id === taskOwner.rows[0]?.assigned_agent_id
-    ) ?? ambientCandidates
-      .map((candidate) => ({
-        candidate,
-        score: candidate.ambient_triggers.reduce(
-          (score, trigger) => score + (ambientTriggerMatches(context.body.toLocaleLowerCase(), trigger)
-            ? trigger.trim().length
-            : 0),
-          0
-        )
-      }))
-      .filter(({ score }) => score > 0)
-      .sort((left, right) => right.score - left.score || left.candidate.id.localeCompare(right.candidate.id))[0]
-      ?.candidate;
+    ) ?? selectAmbientTarget(context.body, ambientCandidates.map((candidate) => ({
+      candidate,
+      id: candidate.id,
+      triggers: candidate.ambient_triggers
+    })));
     ambient = Boolean(agent);
   }
   if (!agent) return null;

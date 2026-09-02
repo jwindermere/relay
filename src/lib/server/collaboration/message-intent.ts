@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import type { GitHubRepositoryGateway } from '../github/connection.js';
+import { selectAmbientTarget } from './ambient-target.js';
 import { handleWaitingAgentRunReply } from './clarifications.js';
 import { acceptAgentConversation } from './conversation.js';
 import { recordCollaborationEvaluationEvent } from './evaluation.js';
@@ -121,21 +122,13 @@ export function decideMessageIntent(input: {
     ?? (mentioned ? undefined : engineeringAgents[0]);
   const researchCandidate = researchTarget
     ?? (mentioned ? undefined : researchAgents[0]);
-  const ambientTarget = mentioned ? undefined : input.agents
+  const ambientTarget = mentioned ? undefined : selectAmbientTarget(input.body, input.agents
     .filter(({ participationMode }) => participationMode === 'ambient')
     .map((agent) => ({
-      agent,
-      score: (agent.ambientTriggers ?? []).reduce((score, trigger) => {
-        const normalizedTrigger = trigger.trim().toLocaleLowerCase();
-        return normalizedTrigger && normalized.includes(normalizedTrigger)
-          ? score + normalizedTrigger.length
-          : score;
-      }, 0)
-    }))
-    .filter(({ score }) => score > 0)
-    .sort((left, right) => right.score - left.score
-      || left.agent.id.localeCompare(right.agent.id))[0]
-    ?.agent;
+      candidate: agent,
+      id: agent.id,
+      triggers: agent.ambientTriggers ?? []
+    })));
   let intent: MessageIntent = 'ordinary_communication';
   let confidence = 1;
   let rationale = 'No eligible Agent mention or active Agent conversation was found.';

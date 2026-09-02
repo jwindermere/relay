@@ -294,6 +294,39 @@ test('explicit Agent mentions select one deterministic target from Message order
   assert.deepEqual(reordered, first);
 });
 
+test('ambient intent targeting ignores substring noise', () => {
+  const decision = decideMessageIntent({
+    body: 'This debugging note is unrelated.',
+    parentMessageId: null,
+    agents: [{
+      id: 'support', name: 'Support', agentType: 'support',
+      participationMode: 'ambient', ambientTriggers: ['bug']
+    }]
+  });
+
+  assert.equal(decision.intent, 'ordinary_communication');
+  assert.equal(decision.targetAgentId, null);
+});
+
+test('equal cross-specialty ambient matches select one deterministic target', () => {
+  const product = {
+    id: 'product', name: 'Product', agentType: 'product' as const,
+    participationMode: 'ambient' as const, ambientTriggers: ['launch']
+  };
+  const research = {
+    id: 'research', name: 'Research', agentType: 'research' as const,
+    participationMode: 'ambient' as const, ambientTriggers: ['launch']
+  };
+  const input = { body: 'Discuss launch readiness.', parentMessageId: null };
+
+  const first = decideMessageIntent({ ...input, agents: [research, product] });
+  const reordered = decideMessageIntent({ ...input, agents: [product, research] });
+
+  assert.equal(first.intent, 'conversation');
+  assert.equal(first.targetAgentId, 'product');
+  assert.deepEqual(reordered, first);
+});
+
 test('intent rules distinguish conversation from research and engineering from progress wording', () => {
   const agents = [
     { id: 'alex', name: 'Alex', agentType: 'engineering' as const },
