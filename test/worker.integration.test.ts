@@ -3015,6 +3015,229 @@ if (skipDatabaseTests) {
       agentId: ids.agentId
     }), []);
   });
+
+  test('Agent inbox ignores stale AgentRun events and links durable waiting clarification state', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-clarification');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'waiting_for_input', provider_thread_id = 'thread-agent-inbox',
+           active_turn_id = 'turn-agent-inbox', updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id,
+         parent_message_id, body
+       ) VALUES (
+         'clarification-request-agent-inbox', $1, $2, $3, $4,
+         'Which deployment target should I use?'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run_clarification (
+         id, workspace_id, agent_run_id, provider_request_id, provider_turn_id,
+         provider_item_id, questions, request_message_id
+       ) VALUES (
+         'clarification-agent-inbox', $1, $2, 'request-agent-inbox',
+         'turn-agent-inbox', 'item-agent-inbox', '["Which target?"]',
+         'clarification-request-agent-inbox'
+       )`,
+      [ids.workspaceId, ids.runId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run_event (
+         workspace_id, agent_run_id, sequence, event_type, status, summary
+       ) VALUES ($1, $2, 2, 'provider.stale-retry', 'queued', 'Stale queued retry')`,
+      [ids.workspaceId, ids.runId]
+    );
+
+    const item = (await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    )).inbox.find(({ id }) => id === ids.runId);
+
+    assert.deepEqual(item, {
+      id: ids.runId,
+      agentId: ids.agentId,
+      agentName: 'Alex',
+      state: 'waiting',
+      kind: 'task',
+      sourceMessageId: ids.messageId,
+      relatedId: ids.taskId,
+      summary: '@Alex inspect the failing test.',
+      requiresHumanAction: true,
+      urgency: 'high',
+      links: {
+        messageId: ids.messageId,
+        taskId: ids.taskId,
+        agentRunId: ids.runId,
+        clarificationId: 'clarification-agent-inbox',
+        clarificationMessageId: 'clarification-request-agent-inbox',
+        approvalId: null,
+        approvalMessageId: null,
+        handoffId: null,
+        coordinationPlanId: null,
+        coordinationStepId: null,
+        resultMessageId: null,
+        artifactId: null,
+        artifactMessageId: null
+      }
+    });
+  });
+
+  test('Agent inbox collapses retries to the latest durable AgentRun', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-retry');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'failed', completed_at = now(), last_error_code = 'provider_failed',
+           updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run (
+         id, workspace_id, task_id, agent_id, provider_connection_id,
+         linked_repository_id, attempt_number, status,
+         requested_by_workspace_member_id, request_message_id
+       )
+       SELECT 'run-agent-inbox-retry-2', workspace_id, task_id, agent_id,
+              provider_connection_id, linked_repository_id, 2, 'queued',
+              requested_by_workspace_member_id, request_message_id
+       FROM public.agent_run WHERE id = $1`,
+      [ids.runId]
+    );
+
+    const taskItems = (await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    )).inbox.filter(({ kind }) => kind === 'task');
+
+    assert.equal(taskItems.length, 1);
+    assert.equal(taskItems[0]?.id, 'run-agent-inbox-retry-2');
+    assert.equal(taskItems[0]?.links.agentRunId, 'run-agent-inbox-retry-2');
+  });
+
+  test('disabled Agents retain review-ready history with Artifact provenance', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-review-ready');
+    await pool.query(
+      `UPDATE public.agent_run SET status = 'completed', completed_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query(
+      `UPDATE public.task SET status = 'completed', updated_at = now() WHERE id = $1`,
+      [ids.taskId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES (
+         'artifact-result-agent-inbox', $1, $2, $3, $4,
+         'Pull request #34 is ready for review.'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.artifact (
+         id, workspace_id, project_id, task_id, agent_run_id, result_message_id,
+         kind, repository_id, branch, commit_sha, pull_request_number, url
+       ) VALUES (
+         'artifact-agent-inbox', $1, $2, $3, $4, 'artifact-result-agent-inbox',
+         'github_pull_request', $5, 'relay/agent-inbox', $6, 34,
+         'https://github.test/relay/pull/34'
+       )`,
+      [
+        ids.workspaceId, ids.projectId, ids.taskId, ids.runId,
+        ids.linkedRepositoryId, 'b'.repeat(40)
+      ]
+    );
+    await pool.query(
+      `UPDATE public.agent SET enabled = false, status = 'disabled' WHERE id = $1`,
+      [ids.agentId]
+    );
+
+    const accountability = await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    );
+    const item = accountability.inbox.find(({ id }) => id === ids.runId);
+
+    assert.equal(item?.state, 'review_ready');
+    assert.equal(item?.links.artifactId, 'artifact-agent-inbox');
+    assert.equal(item?.links.artifactMessageId, 'artifact-result-agent-inbox');
+    assert.equal(item?.requiresHumanAction, true);
+    assert.equal(
+      accountability.capacity.find(({ agentId }) => agentId === ids.agentId)?.reason,
+      'disabled'
+    );
+  });
+
+  test('Agent capacity reflects Provider connection-wide durable work instead of presence status', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-capacity');
+    await pool.query(
+      `INSERT INTO public.agent (id, workspace_id, name, role_label)
+       VALUES ('agent-inbox-capacity-riley', $1, 'Riley', 'Research agent')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ('agent-inbox-capacity-riley-member', $1, 'agent', 'agent-inbox-capacity-riley')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, 'agent-inbox-capacity-riley-member')`,
+      [ids.workspaceId, ids.projectId]
+    );
+
+    const capacity = (await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    )).capacity;
+
+    assert.deepEqual(capacity.find(({ agentId }) => agentId === ids.agentId), {
+      agentId: ids.agentId,
+      activeWork: 1,
+      providerConnectionActiveWork: 1,
+      inboxCounts: {
+        total: 1, queued: 1, active: 0, waiting: 0,
+        blocked: 0, review_ready: 0, completed: 0
+      },
+      available: false,
+      reason: 'occupied'
+    });
+    assert.deepEqual(capacity.find(({ agentId }) => agentId === 'agent-inbox-capacity-riley'), {
+      agentId: 'agent-inbox-capacity-riley',
+      activeWork: 0,
+      providerConnectionActiveWork: 1,
+      inboxCounts: {
+        total: 0, queued: 0, active: 0, waiting: 0,
+        blocked: 0, review_ready: 0, completed: 0
+      },
+      available: false,
+      reason: 'provider_connection_occupied'
+    });
+  });
+
+  test('Agent inbox rejects revoked and nonmember Project access', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-authorization');
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ('agent-inbox-private-project', $1, 'Private Project')`,
+      [ids.workspaceId]
+    );
+    await assert.rejects(
+      loadCollaborationAccountability(pool, ids.memberAccess, 'agent-inbox-private-project'),
+      /active Project membership is required/
+    );
+
+    await pool.query(
+      `UPDATE public.workspace_membership SET revoked_at = now() WHERE id = $1`,
+      [ids.memberAccess.membership.id]
+    );
+    await assert.rejects(
+      loadCollaborationAccountability(pool, ids.memberAccess, ids.projectId),
+      /active Project membership is required/
+    );
+  });
 }
 
 class FixtureProvider implements AgentRunProvider {
@@ -3222,6 +3445,8 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
 
   return {
     runId,
+    taskId,
+    messageId,
     providerConnectionId: effectiveProviderConnectionId,
     workspaceId,
     projectId,

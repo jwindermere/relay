@@ -170,17 +170,45 @@ export function detectCollaborationQualitySignals(input: {
   return signals;
 }
 
+type AgentInboxState = 'queued' | 'active' | 'waiting' | 'blocked' | 'review_ready' | 'completed';
+
+interface AgentInboxLinks {
+  messageId: string;
+  taskId: string | null;
+  agentRunId: string | null;
+  clarificationId: string | null;
+  clarificationMessageId: string | null;
+  approvalId: string | null;
+  approvalMessageId: string | null;
+  handoffId: string | null;
+  coordinationPlanId: string | null;
+  coordinationStepId: string | null;
+  resultMessageId: string | null;
+  artifactId: string | null;
+  artifactMessageId: string | null;
+}
+
+type AgentInboxCounts = Record<AgentInboxState | 'total', number>;
+
+function emptyAgentInboxCounts(): AgentInboxCounts {
+  return {
+    total: 0, queued: 0, active: 0, waiting: 0,
+    blocked: 0, review_ready: 0, completed: 0
+  };
+}
+
 export interface AgentInboxItem {
   id: string;
   agentId: string;
   agentName: string;
-  state: 'queued' | 'active' | 'waiting' | 'blocked' | 'review_ready' | 'completed';
+  state: AgentInboxState;
   kind: 'task' | 'handoff' | 'coordination_step';
   sourceMessageId: string;
   relatedId: string;
   summary: string;
   requiresHumanAction: boolean;
   urgency: 'high' | 'normal' | 'low';
+  links: AgentInboxLinks;
 }
 
 interface VisibleCoordinationStep {
@@ -324,67 +352,131 @@ export async function loadCollaborationAccountability(
       id: string; agent_id: string; agent_name: string; state: AgentInboxItem['state'];
       kind: AgentInboxItem['kind']; source_message_id: string; related_id: string;
       summary: string; requires_human_action: boolean;
+      task_id: string | null; agent_run_id: string | null;
+      clarification_id: string | null; clarification_message_id: string | null;
+      approval_id: string | null; approval_message_id: string | null;
+      handoff_id: string | null; coordination_plan_id: string | null;
+      coordination_step_id: string | null; result_message_id: string | null;
+      artifact_id: string | null;
+      artifact_message_id: string | null;
     }>(
       `SELECT * FROM (
          SELECT run.id, task.assigned_agent_id AS agent_id, agent.name AS agent_name,
            CASE WHEN run.status = 'queued' THEN 'queued'
                 WHEN run.status IN ('planning', 'working', 'recovering') THEN 'active'
-                WHEN run.status IN ('waiting_for_input', 'waiting_for_approval', 'paused') THEN 'waiting'
-                WHEN run.status = 'completed' THEN 'review_ready'
+                WHEN run.status = 'waiting_for_input' THEN 'waiting'
+                WHEN run.status IN ('waiting_for_approval', 'paused') THEN 'blocked'
+                WHEN run.status = 'failed' AND task.status = 'open' THEN 'blocked'
+                WHEN run.status = 'completed' AND artifact.id IS NOT NULL THEN 'review_ready'
                 ELSE 'completed' END AS state,
            'task'::text AS kind, task.source_message_id, task.id AS related_id,
            task.request_snapshot AS summary,
-           run.status IN ('waiting_for_input', 'waiting_for_approval', 'paused') AS requires_human_action,
-           run.created_at
-         FROM public.task task JOIN public.agent_run run ON run.task_id = task.id
+           clarification.id IS NOT NULL OR approval.state = 'pending'
+             OR run.status = 'paused' OR (run.status = 'failed' AND task.status = 'open')
+             OR artifact.id IS NOT NULL AS requires_human_action,
+           run.updated_at AS activity_at,
+           task.id AS task_id, run.id AS agent_run_id,
+           clarification.id AS clarification_id,
+           clarification.request_message_id AS clarification_message_id,
+           approval.id AS approval_id, approval.request_message_id AS approval_message_id,
+           NULL::text AS handoff_id, NULL::text AS coordination_plan_id,
+           NULL::text AS coordination_step_id, NULL::text AS result_message_id,
+           artifact.id AS artifact_id,
+           artifact.result_message_id AS artifact_message_id
+         FROM public.task task
+         JOIN LATERAL (
+           SELECT candidate.* FROM public.agent_run candidate
+           WHERE candidate.task_id = task.id
+           ORDER BY candidate.attempt_number DESC, candidate.created_at DESC, candidate.id DESC
+           LIMIT 1
+         ) run ON true
          JOIN public.agent agent ON agent.id = task.assigned_agent_id
+         LEFT JOIN public.agent_run_clarification clarification
+           ON clarification.agent_run_id = run.id AND clarification.status = 'pending'
+         LEFT JOIN public.approval approval
+           ON approval.agent_run_id = run.id AND approval.state IN ('pending', 'approved')
+         LEFT JOIN public.artifact artifact ON artifact.agent_run_id = run.id
          WHERE task.workspace_id = $1 AND task.project_id = $2
+           AND (run.status NOT IN ('completed', 'failed', 'cancelled')
+             OR COALESCE(run.completed_at, run.updated_at) >= now() - interval '30 days')
          UNION ALL
          SELECT handoff.id, handoff.target_agent_id, agent.name,
            CASE WHEN handoff.status = 'queued' THEN 'queued' WHEN handoff.status = 'working' THEN 'active'
-                WHEN handoff.status = 'completed' THEN 'completed' ELSE 'blocked' END,
+                WHEN handoff.status IN ('failed', 'expired') THEN 'blocked' ELSE 'completed' END,
            'handoff', handoff.source_message_id, handoff.id, handoff.question,
-           handoff.status IN ('failed', 'expired'), handoff.created_at
+           handoff.status IN ('failed', 'expired'), handoff.updated_at,
+           handoff.source_task_id, NULL::text, NULL::text, NULL::text,
+           NULL::text, NULL::text, handoff.id, NULL::text, NULL::text,
+           handoff.result_message_id, NULL::text, NULL::text
          FROM public.agent_handoff handoff JOIN public.agent agent ON agent.id = handoff.target_agent_id
          WHERE handoff.workspace_id = $1 AND handoff.project_id = $2
+           AND (handoff.status NOT IN ('completed', 'failed', 'expired', 'cancelled')
+             OR COALESCE(handoff.completed_at, handoff.expired_at, handoff.cancelled_at, handoff.updated_at)
+                >= now() - interval '30 days')
          UNION ALL
          SELECT step.id, step.target_agent_id, agent.name,
-           CASE WHEN step.status IN ('pending', 'ready') THEN 'queued'
+           CASE WHEN step.status IN ('completed', 'cancelled') THEN 'completed'
+                WHEN step.status = 'failed' OR plan.status IN ('paused', 'failed') THEN 'blocked'
+                WHEN plan.status IN ('rejected', 'cancelled', 'completed') THEN 'completed'
+                WHEN plan.status = 'proposed' OR step.status = 'blocked' THEN 'blocked'
+                WHEN step.status IN ('pending', 'ready') THEN 'queued'
                 WHEN step.status = 'active' THEN 'active'
-                WHEN step.status = 'completed' THEN 'completed' ELSE 'blocked' END,
+                ELSE 'completed' END,
            'coordination_step', plan.source_message_id, step.plan_id, step.instruction,
-           plan.status IN ('proposed', 'paused') OR step.status IN ('blocked', 'failed'), step.created_at
+           plan.status IN ('proposed', 'paused') OR step.status IN ('blocked', 'failed'),
+           COALESCE(step.completed_at, step.started_at, step.created_at),
+           NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+           NULL::text, plan.id, step.id, step.result_message_id, step.artifact_id,
+           artifact.result_message_id
          FROM public.coordination_plan_step step
          JOIN public.coordination_plan plan ON plan.id = step.plan_id
          JOIN public.agent agent ON agent.id = step.target_agent_id
+         LEFT JOIN public.artifact artifact ON artifact.id = step.artifact_id
          WHERE step.workspace_id = $1 AND step.project_id = $2
-       ) items ORDER BY created_at, id`,
+           AND (step.status NOT IN ('completed', 'failed', 'cancelled')
+             OR COALESCE(step.completed_at, step.started_at, step.created_at)
+                >= now() - interval '30 days')
+       ) items ORDER BY activity_at DESC, id`,
       [access.workspace.id, projectId]
     ),
     pool.query<{
-      agent_id: string; active_work: number; enabled: boolean; provider_ready: boolean;
+      agent_id: string; active_work: number; provider_connection_active_work: number;
+      enabled: boolean; provider_ready: boolean;
     }>(
-      `SELECT agent.id AS agent_id,
-              count(*) FILTER (WHERE work.active)::integer AS active_work,
+      `WITH active_work AS (
+         SELECT run.id AS work_id, run.agent_id, run.provider_connection_id, task.project_id
+         FROM public.agent_run run
+         JOIN public.task task ON task.id = run.task_id
+         WHERE run.status NOT IN ('completed', 'failed', 'cancelled')
+         UNION ALL
+         SELECT turn.id, conversation.agent_id, conversation.provider_connection_id,
+                channel.project_id
+         FROM public.agent_conversation conversation
+         JOIN public.agent_conversation_turn turn ON turn.conversation_id = conversation.id
+         JOIN public.channel channel ON channel.id = conversation.channel_id
+         WHERE turn.status IN ('queued', 'working')
+       )
+       SELECT agent.id AS agent_id,
+              COALESCE(work.active_work, 0)::integer AS active_work,
+              COALESCE(provider_work.active_work, 0)::integer AS provider_connection_active_work,
               agent.enabled AND agent.status <> 'disabled' AS enabled,
-              COALESCE(bool_or(provider.status = 'ready'), false) AS provider_ready
+              provider.status = 'ready' AS provider_ready
        FROM public.agent agent
        LEFT JOIN public.provider_connection provider ON provider.workspace_id = agent.workspace_id
        LEFT JOIN LATERAL (
-         SELECT true AS active FROM public.agent_run run
-         WHERE run.agent_id = agent.id AND run.status NOT IN ('completed', 'failed', 'cancelled')
-         UNION ALL
-         SELECT true FROM public.agent_conversation conversation
-         JOIN public.agent_conversation_turn turn ON turn.conversation_id = conversation.id
-         WHERE conversation.agent_id = agent.id AND turn.status IN ('queued', 'working')
+         SELECT count(*)::integer AS active_work FROM active_work
+         WHERE agent_id = agent.id AND project_id = $2
        ) work ON true
+       LEFT JOIN LATERAL (
+         SELECT count(*)::integer AS active_work FROM active_work
+         WHERE provider_connection_id = provider.id
+       ) provider_work ON true
        WHERE agent.workspace_id = $1
          AND EXISTS (
            SELECT 1 FROM public.workspace_member member
            JOIN public.project_membership project_member ON project_member.workspace_member_id = member.id
            WHERE member.agent_id = agent.id AND project_member.project_id = $2
          )
-       GROUP BY agent.id, agent.enabled, agent.status
        ORDER BY agent.id`,
       [access.workspace.id, projectId]
     ),
@@ -467,6 +559,36 @@ export async function loadCollaborationAccountability(
     )
   ]);
 
+  const inboxItems = inbox.rows.map((row): AgentInboxItem => ({
+    id: row.id, agentId: row.agent_id, agentName: row.agent_name, state: row.state,
+    kind: row.kind, sourceMessageId: row.source_message_id, relatedId: row.related_id,
+    summary: row.summary, requiresHumanAction: row.requires_human_action,
+    urgency: row.requires_human_action ? 'high'
+      : ['queued', 'active', 'blocked', 'review_ready'].includes(row.state) ? 'normal' : 'low',
+    links: {
+      messageId: row.source_message_id,
+      taskId: row.task_id,
+      agentRunId: row.agent_run_id,
+      clarificationId: row.clarification_id,
+      clarificationMessageId: row.clarification_message_id,
+      approvalId: row.approval_id,
+      approvalMessageId: row.approval_message_id,
+      handoffId: row.handoff_id,
+      coordinationPlanId: row.coordination_plan_id,
+      coordinationStepId: row.coordination_step_id,
+      resultMessageId: row.result_message_id,
+      artifactId: row.artifact_id,
+      artifactMessageId: row.artifact_message_id
+    }
+  }));
+  const inboxCounts = new Map<string, AgentInboxCounts>();
+  for (const item of inboxItems) {
+    const counts = inboxCounts.get(item.agentId) ?? emptyAgentInboxCounts();
+    counts.total += 1;
+    counts[item.state] += 1;
+    inboxCounts.set(item.agentId, counts);
+  }
+
   return {
     steering: steering.rows.map((row) => ({
       id: row.id, agentRunId: row.agent_run_id, sourceMessageId: row.source_message_id,
@@ -499,19 +621,16 @@ export async function loadCollaborationAccountability(
       supersedesId: row.supersedes_id, authorName: row.author_name,
       createdAt: row.created_at.toISOString()
     })),
-    inbox: inbox.rows.map((row): AgentInboxItem => ({
-      id: row.id, agentId: row.agent_id, agentName: row.agent_name, state: row.state,
-      kind: row.kind, sourceMessageId: row.source_message_id, relatedId: row.related_id,
-      summary: row.summary, requiresHumanAction: row.requires_human_action,
-      urgency: row.requires_human_action ? 'high'
-        : ['queued', 'active', 'blocked', 'review_ready'].includes(row.state) ? 'normal' : 'low'
-    })),
+    inbox: inboxItems,
     capacity: capacity.rows.map((row) => ({
       agentId: row.agent_id,
       activeWork: row.active_work,
-      available: row.enabled && row.provider_ready && row.active_work === 0,
-      reason: !row.enabled ? 'disabled' : !row.provider_ready ? 'provider_unavailable'
-        : row.active_work > 0 ? 'occupied' : 'available'
+      providerConnectionActiveWork: row.provider_connection_active_work,
+      inboxCounts: inboxCounts.get(row.agent_id) ?? emptyAgentInboxCounts(),
+      available: row.enabled && row.provider_ready && row.provider_connection_active_work === 0,
+      reason: !row.enabled ? 'disabled' : !row.provider_ready ? 'provider_connection_unavailable'
+        : row.active_work > 0 ? 'occupied'
+          : row.provider_connection_active_work > 0 ? 'provider_connection_occupied' : 'available'
     })),
     evaluation: evaluation.rows.map((row) => ({
       ...mapCollaborationEvaluationAttribution(row),

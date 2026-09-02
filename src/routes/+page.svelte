@@ -147,6 +147,10 @@
     return accountability.steering.find((steering) => steering.sourceMessageId === sourceMessageId);
   }
 
+  function workloadForAgent(agentId: string) {
+    return accountability.capacity.find((capacity) => capacity.agentId === agentId);
+  }
+
   function initials(name: string) {
     return name.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
   }
@@ -1228,13 +1232,29 @@
       <label class="flex items-center gap-1 text-[0.65rem]"><input type="checkbox" class="checkbox checkbox-xs" bind:checked={inboxHumanOnly} /> Human action</label>
     </div>
     <p class="mt-1 text-[0.6rem] text-base-content/35">Project: {data.sharedChannel.project.name}</p>
+    <ul class="mt-2 grid grid-cols-1 gap-1 text-[0.65rem] text-base-content/55">
+      {#each data.agentConfiguration.agents as agent (agent.id)}
+        {@const workload = workloadForAgent(agent.id)}
+        <li class="flex items-center justify-between gap-2 border-b border-white/6 pb-1">
+          <button class="truncate hover:text-primary" type="button" onclick={() => inboxAgentFilter = agent.id}>
+            {agent.name} · {workload?.inboxCounts.total ?? 0} items
+          </button>
+          <span class:badge-success={workload?.available} class="badge badge-ghost badge-xs">
+            {workload?.reason?.replaceAll('_', ' ') ?? 'unavailable'}
+          </span>
+        </li>
+      {/each}
+    </ul>
     <ul class="mt-1 max-h-40 space-y-1 overflow-y-auto text-xs text-base-content/55">
-      {#each filteredInbox as item (item.id)}
+      {#each filteredInbox as item (`${item.kind}:${item.id}`)}
         <li class="border-b border-white/6 py-1.5">
-          <a class="block hover:text-primary" href={`#message-${item.sourceMessageId}`}>
+          <a class="block hover:text-primary" href={`#message-${item.links.clarificationMessageId ?? item.links.approvalMessageId ?? item.links.artifactMessageId ?? item.links.resultMessageId ?? item.sourceMessageId}`}>
             <span class:badge-warning={item.requiresHumanAction} class="badge badge-ghost badge-xs">{item.urgency}</span>
             <strong>{item.agentName}</strong> · {item.state.replaceAll('_', ' ')}
             <span class="block truncate">{item.summary}</span>
+            <span class="block truncate text-[0.6rem] text-base-content/35">
+              {item.kind.replaceAll('_', ' ')} · {item.relatedId}
+            </span>
           </a>
         </li>
       {:else}
