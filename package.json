@@ -25,6 +25,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --noEmit -p tsconfig.runtime.json && node --check prototype/agent-run.mjs && node --check prototype/realtime-agent-run-model.mjs && node --check prototype/realtime-agent-run.mjs",
     "test": "npm run test:unit && npm run test:prototype && npm run test:integration",
     "test:unit": "node --import tsx --test test/reconciliation.test.ts test/markdown.test.ts test/pilot-journey.test.ts test/approval-policy.test.ts test/accountable-collaboration.test.ts test/agent-templates.test.ts test/codex-environment.test.ts test/runtime-config.test.ts test/realtime-ticket.test.ts test/deployment.test.ts test/github-api.test.ts test/github-protection.test.ts test/github-broker.test.ts test/github-broker-remote.test.ts test/github-webhook.test.ts",
+    "test:evaluation-fixtures": "node --import tsx --test --test-name-pattern='collaboration fixtures' test/accountable-collaboration.test.ts",
     "test:github-contract": "node --import tsx --test test/github-broker.contract.ts",
     "test:github-contract:required": "RELAY_GITHUB_CONTRACT_REQUIRED=true npm run test:github-contract",
     "test:prototype": "node --test prototype/*.test.mjs",

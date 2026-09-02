@@ -5,6 +5,7 @@ import {
   type AgentRunEventType,
   type AgentRunStatus
 } from './agent-run.js';
+import { recordCollaborationEvaluationEvent } from '../collaboration/evaluation.js';
 
 export interface AgentRunEventInput {
   eventType: AgentRunEventType;
@@ -23,6 +24,40 @@ interface AgentRunEventTarget {
   id: string;
   workspaceId: string;
   requiredLeaseToken?: string;
+}
+
+async function recordAgentRunEvaluationEvent(
+  client: PoolClient,
+  target: AgentRunEventTarget,
+  eventType: string,
+  evidence: Record<string, unknown>
+): Promise<void> {
+  const context = await client.query<{
+    workspace_id: string; project_id: string; agent_id: string; routing_policy_version: string | null;
+    agent_configuration_version: number;
+    agent_type_snapshot: string;
+  }>(
+    `SELECT run.workspace_id, task.project_id, run.agent_id,
+            decision.policy_version AS routing_policy_version,
+            run.agent_configuration_version, run.agent_type_snapshot
+     FROM public.agent_run run
+     JOIN public.task task ON task.id = run.task_id AND task.workspace_id = run.workspace_id
+     LEFT JOIN public.message_intent_decision decision
+       ON decision.message_id = task.source_message_id AND decision.workspace_id = run.workspace_id
+     WHERE run.id = $1 AND run.workspace_id = $2`,
+    [target.id, target.workspaceId]
+  );
+  const row = context.rows[0];
+  if (!row) return;
+  await recordCollaborationEvaluationEvent(client, {
+    workspaceId: row.workspace_id, projectId: row.project_id, eventType,
+    agentId: row.agent_id, routingPolicyVersion: row.routing_policy_version,
+    agentType: row.agent_type_snapshot,
+    agentConfigurationVersion: `agent-config-${row.agent_configuration_version}`,
+    promptVersion: 'engineering-run-v1',
+    permissionPolicyVersion: 'mvp-engineering-autonomy-v1',
+    outcomeType: 'agent_run', outcomeId: target.id, evidence
+  });
 }
 
 export async function appendAgentRunEvent(
@@ -97,6 +132,14 @@ export async function appendAgentRunEvent(
        SET state = 'expired'
        WHERE agent_run_id = $1 AND state IN ('pending', 'approved')`,
       [target.id]
+    );
+    await recordAgentRunEvaluationEvent(
+      client, target, `outcome.${event.status}`, { status: event.status }
+    );
+  }
+  if (event.eventType === 'run.action_rejected') {
+    await recordAgentRunEvaluationEvent(
+      client, target, 'policy.rejected', { agentRunEventType: event.eventType }
     );
   }
   await client.query(

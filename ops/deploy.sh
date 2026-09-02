@@ -14,14 +14,14 @@ case "${1:-}" in
     "$compose_bin" compose build migrate web
     backup_database
     "$compose_bin" compose run --rm --env RELAY_REQUIRE_EXPAND_ONLY=true migrate
-    "$compose_bin" compose up --detach --no-deps web
+    "$compose_bin" compose up --detach --no-deps web evaluation-retention
     ;;
   worker)
     "$compose_bin" compose build migrate worker
     "$compose_bin" compose stop --timeout "$drain_seconds" worker
     backup_database
     "$compose_bin" compose run --rm --env RELAY_REQUIRE_EXPAND_ONLY=true migrate
-    "$compose_bin" compose up --detach --no-deps worker
+    "$compose_bin" compose up --detach --no-deps worker evaluation-retention
     ;;
   contract)
     "$compose_bin" compose build migrate web worker
@@ -29,7 +29,7 @@ case "${1:-}" in
     "$compose_bin" compose stop web
     backup_database
     "$compose_bin" compose run --rm migrate
-    "$compose_bin" compose up --detach --no-deps web worker
+    "$compose_bin" compose up --detach --no-deps web worker evaluation-retention
     ;;
   *)
     echo 'usage: ops/deploy.sh web|worker|contract' >&2

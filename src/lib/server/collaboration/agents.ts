@@ -1,15 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 import {
   assertCurrentWorkspaceOwner,
   type WorkspaceAccess,
   WorkspaceAccessError
 } from '../authentication/authorization.js';
+import { requireActivePilotProjectMembership } from './project-access.js';
 
 export type AgentType = 'engineering' | 'research' | 'product' | 'support' | 'general';
 export type AgentParticipationMode = 'reactive' | 'ambient';
 export type AgentReplyMode = 'adaptive' | 'channel' | 'thread';
+export type AgentPermissionCeiling = 'none' | 'read_only' | 'repository_write';
 
 export interface ConfigurableAgent {
   id: string;
@@ -23,7 +25,7 @@ export interface ConfigurableAgent {
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
   templateProvenance: { key: string; version: number } | null;
-  permissionCeiling: 'none' | 'read_only' | 'repository_write';
+  permissionCeiling: AgentPermissionCeiling;
   disabledCapabilities: string[];
 }
 
@@ -31,6 +33,17 @@ export class AgentConfigurationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AgentConfigurationError';
+  }
+}
+
+export function assertAgentTemplatePermissionCeiling(
+  agentType: AgentType,
+  permissionCeiling: AgentPermissionCeiling
+): void {
+  if (agentType === 'engineering' && permissionCeiling !== 'repository_write') {
+    throw new AgentConfigurationError(
+      `Engineering authority exceeds the template permission ceiling (${permissionCeiling})`
+    );
   }
 }
 
@@ -102,7 +115,7 @@ function normalizeInput(input: AgentInput): Required<AgentInput> {
 }
 
 export async function loadWorkspaceAgents(
-  pool: Pool,
+  pool: Pool | PoolClient,
   access: WorkspaceAccess
 ): Promise<{ agents: ConfigurableAgent[]; canManage: boolean }> {
   const result = await pool.query<{
@@ -152,12 +165,14 @@ export async function loadWorkspaceAgents(
 export async function createWorkspaceAgent(
   pool: Pool,
   access: WorkspaceAccess,
+  projectId: string,
   input: AgentInput,
   provenance?: {
     key: string; version: number; snapshot: object;
     permissionCeiling: ConfigurableAgent['permissionCeiling'];
     requiredCapabilities: string[]; disabledCapabilities: string[];
-  }
+  },
+  validateBeforeCreate?: (client: PoolClient) => Promise<void>
 ): Promise<ConfigurableAgent> {
   if (access.membership.role !== 'owner') throw new WorkspaceAccessError('Workspace owner access is required');
   const agent = normalizeInput(input);
@@ -165,11 +180,12 @@ export async function createWorkspaceAgent(
   try {
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
-    const project = await client.query<{ id: string }>(
-      'SELECT id FROM public.project WHERE workspace_id = $1 ORDER BY created_at, id LIMIT 1 FOR SHARE',
+    await requireActivePilotProjectMembership(client, access, projectId, true);
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
       [access.workspace.id]
     );
-    if (!project.rows[0]) throw new AgentConfigurationError('A Project is required before adding an Agent');
+    await validateBeforeCreate?.(client);
     const id = randomUUID();
     const memberId = `${id}:member`;
     const inserted = await client.query<{
@@ -200,7 +216,7 @@ export async function createWorkspaceAgent(
     await client.query(
       `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
        VALUES ($1, $2, $3)`,
-      [access.workspace.id, project.rows[0].id, memberId]
+      [access.workspace.id, projectId, memberId]
     );
     await client.query(
       `INSERT INTO public.audit_event (
@@ -240,11 +256,30 @@ export async function updateWorkspaceAgent(
   try {
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [access.workspace.id]
+    );
+    const existing = await client.query<{
+      template_key: string | null;
+      permission_ceiling: AgentPermissionCeiling;
+    }>(
+      `SELECT template_key, permission_ceiling
+       FROM public.agent
+       WHERE id = $1 AND workspace_id = $2
+       FOR UPDATE`,
+      [agentId, access.workspace.id]
+    );
+    if (!existing.rows[0]) throw new AgentConfigurationError('Agent was not found');
+    if (existing.rows[0].template_key) {
+      assertAgentTemplatePermissionCeiling(agent.agentType, existing.rows[0].permission_ceiling);
+    }
     const updated = await client.query(
       `UPDATE public.agent
        SET name = $3, agent_type = $4, role_label = $5, instructions = $6,
            participation_mode = $7, ambient_triggers = $8, reply_mode = $9,
            enabled = $10,
+           configuration_version = configuration_version + 1,
            status = CASE WHEN $10 THEN CASE WHEN status = 'disabled' THEN 'idle' ELSE status END
                          ELSE 'disabled' END
        WHERE id = $1 AND workspace_id = $2`,

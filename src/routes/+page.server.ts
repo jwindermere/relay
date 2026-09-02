@@ -11,15 +11,19 @@ import {
   loadSharedAgentChannel,
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
-import { loadWorkspaceAgents } from '$lib/server/collaboration/agents.js';
-import { listAgentTemplates } from '$lib/server/collaboration/agent-templates.js';
+import {
+  findAgentTemplateUpgrade,
+  listAgentTemplates,
+  loadAgentTemplateContext,
+  previewAgentTemplate
+} from '$lib/server/collaboration/agent-templates.js';
+import { loadActivePilotProjects } from '$lib/server/collaboration/project-access.js';
 import { loadActiveChannelCall } from '$lib/server/collaboration/calls.js';
 import { loadAvailableWorkspaces } from '$lib/server/collaboration/workspaces.js';
 import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliation.js';
 import { loadCollaborationAccountability } from '$lib/server/collaboration/accountability.js';
 import { getDatabasePool } from '$lib/server/database/pool.js';
 import { isJitsiEmbeddingEnabled } from '$lib/server/configuration.js';
-import { getGitHubRepositoryGateway } from '$lib/server/github/api.js';
 import { loadLinkedRepository } from '$lib/server/github/connection.js';
 import { loadProviderConnection } from '$lib/server/provider/connection.js';
 
@@ -31,22 +35,25 @@ export async function load({ request }) {
       getRelayAuth(),
       request.headers
     );
-    const [sharedChannel, providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces] = await Promise.all([
-      loadSharedAgentChannel(pool, access),
+    const sharedChannel = await loadSharedAgentChannel(pool, access);
+    const [providerConnection, linkedRepository, currentUserResult, agentTemplateContext, workspaces, agentProjects] = await Promise.all([
       loadProviderConnection(pool, access),
       loadLinkedRepository(pool, access),
       pool.query<{ name: string }>(
         `SELECT name FROM auth."user" WHERE id = $1`,
         [access.identity.userId]
       ),
-      loadWorkspaceAgents(pool, access),
-      loadAvailableWorkspaces(pool, access)
+      loadAgentTemplateContext(pool, access, sharedChannel.project.id),
+      loadAvailableWorkspaces(pool, access),
+      loadActivePilotProjects(pool, access)
     ]);
+    const { agentConfiguration, availableCapabilities, projectAgents } = agentTemplateContext;
     const [reconciliation, activeCall, accountability] = await Promise.all([
       loadChannelReconciliation(pool, access, sharedChannel.channel.id, {}),
       loadActiveChannelCall(pool, access, sharedChannel.channel.id),
       loadCollaborationAccountability(pool, access, sharedChannel.project.id)
     ]);
+    const agentTemplates = listAgentTemplates();
     return {
       email: access.identity.email,
       role: access.membership.role,
@@ -60,7 +67,20 @@ export async function load({ request }) {
       providerConnection,
       linkedRepository,
       agentConfiguration,
-      agentTemplates: listAgentTemplates(),
+      agentProjects,
+      agentTemplates,
+      agentTemplatePreviews: Object.fromEntries(agentTemplates.map((template) => [
+        template.key,
+        previewAgentTemplate(template.key, {
+          availableCapabilities,
+          existingAgents: agentConfiguration.agents,
+          existingProjectAgents: projectAgents
+        })
+      ])),
+      agentTemplateUpgrades: Object.fromEntries(agentConfiguration.agents.map((agent) => [
+        agent.id,
+        agent.templateProvenance ? findAgentTemplateUpgrade(agent.templateProvenance) : null
+      ])),
       workspaces,
       reconciliation,
       accountability,
@@ -102,8 +122,7 @@ export const actions = {
           body,
           submissionId,
           ...(typeof parentMessageId === 'string' && parentMessageId ? { parentMessageId } : {})
-        },
-        { getRepositoryGateway: getGitHubRepositoryGateway }
+        }
       );
       return { sent: true };
     } catch (error) {

@@ -168,6 +168,10 @@ A Project-scoped, source-backed statement promoted from a Finding or explicitly 
 
 An ordered, durable constraint appended by a Pilot member to an active AgentRun. It is delivered at the next known Provider interaction boundary, is visible in the Shared Agent Channel, and cannot broaden the AgentRun's permissions.
 
+## Coordination plan constraint input
+
+A Pilot-member-authored constraint that narrows an approved Coordination plan without changing its participants or authority. It remains pending until delivered to a later Coordination step, then becomes an active plan constraint with an attributable delivery boundary.
+
 ## Coordination plan
 
 A coordinating Agent's proposed goal, participants, steps, dependencies, execution policy, and explicit limits. It performs no work until a Project Pilot member approves it and may then be paused or cancelled by a Pilot member.

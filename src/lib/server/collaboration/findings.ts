@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import { recordCollaborationEvaluationEvent } from './evaluation.js';
 
 export type EvidenceType = 'external' | 'repository' | 'message' | 'artifact';
 export type MemoryType =
@@ -40,6 +41,30 @@ export class FindingError extends Error {
   }
 }
 
+const RESTRICTED_MEMORY_PATTERNS = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
+  /\b(?:sk|ghp)_[A-Za-z0-9_-]{12,}\b/u,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/u,
+  /\bgithub_pat_[A-Za-z0-9_]{12,}\b/u,
+  /\bAKIA[A-Z0-9]{16}\b/u,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/u,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/iu,
+  /\bauthorization\s*:\s*(?:basic|bearer)\s+\S+/iu,
+  /\b(?:api[ _-]?key|password|secret|token)\s*[:=]\s*\S{8,}/iu,
+  /\b(?:api[ _-]?key|password|secret|token|credential)\s+(?:is|was)\s+\S+/iu,
+  /\b(?:credentialStoreReference|providerEventId|encrypted_reasoning)\b/u,
+  /"(?:method|params|result)"\s*:/u,
+  /\b(?:chain[ -]of[ -]thought|hidden reasoning|internal reasoning)\b/iu,
+  /(?:^|\n)\s*(?:user|assistant|system)\s*:.*\n\s*(?:user|assistant|system)\s*:/iu,
+  /```(?:json)?[\s\S]*"(?:method|params|result)"\s*:/iu
+];
+
+function assertContainsNoRecognizedRestrictedMaterial(statement: string): void {
+  if (RESTRICTED_MEMORY_PATTERNS.some((pattern) => pattern.test(statement))) {
+    throw new FindingError('Memory must not contain credentials or Provider traces');
+  }
+}
+
 function cleanList(value: unknown, label: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
     throw new FindingError(`${label} must be a list of concise statements`);
@@ -54,6 +79,7 @@ function cleanList(value: unknown, label: string): string[] {
 export function normalizeFindingInput(input: FindingInput): FindingInput {
   const summary = input?.summary?.trim();
   if (!summary || summary.length > 4000) throw new FindingError('Finding summary is required');
+  assertContainsNoRecognizedRestrictedMaterial(summary);
   if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
     throw new FindingError('Finding confidence must be between 0 and 1');
   }
@@ -111,6 +137,7 @@ export function selectProjectMemoryContext<T extends ProjectMemoryContextEntry>(
   entries: T[], limit = 20
 ): T[] {
   const safeLimit = Math.max(0, Math.min(100, Math.trunc(limit)));
+  if (safeLimit === 0 || !Number.isFinite(safeLimit)) return [];
   return entries
     .filter(({ lifecycle }) => lifecycle === 'active')
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
@@ -210,19 +237,20 @@ export async function createFinding(
   }
 }
 
-export async function createFindingFromAgentResult(
-  pool: Pool,
-  input: FindingInput & {
-    workspaceId: string; projectId: string; authorAgentId: string;
-    resultMessageId: string; sourceHandoffId?: string;
-  }
+type AgentFindingResultInput = FindingInput & {
+  workspaceId: string; projectId: string; authorAgentId: string;
+  resultMessageId: string; sourceHandoffId?: string; routingPolicyVersion: string;
+  agentConfigurationVersion: string;
+  agentType: string;
+};
+
+export async function persistFindingFromAgentResult(
+  client: PoolClient,
+  input: AgentFindingResultInput
 ): Promise<string> {
   const finding = normalizeFindingInput(input);
-  const client = await pool.connect();
   const id = randomUUID();
-  try {
-    await client.query('BEGIN');
-    const source = await client.query<{ author_member_id: string }>(
+  const source = await client.query<{ author_member_id: string }>(
       `SELECT author.id AS author_member_id
        FROM public.message message
        JOIN public.channel channel ON channel.id = message.channel_id
@@ -279,16 +307,25 @@ export async function createFindingFromAgentResult(
       [randomUUID(), input.workspaceId, input.projectId, source.rows[0].author_member_id,
         finding.summary, JSON.stringify([`finding:${id}`, `message:${input.resultMessageId}`])]
     );
+    await recordCollaborationEvaluationEvent(client, {
+      workspaceId: input.workspaceId, projectId: input.projectId,
+      eventType: 'outcome.completed', agentId: input.authorAgentId,
+      routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+      agentConfigurationVersion: input.agentConfigurationVersion,
+      agentType: input.agentType,
+      permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
+      evidence: { status: 'completed', evidenceCount: finding.evidence.length }
+    });
     if (finding.evidence.length === 0 && finding.confidence >= 0.8) {
-      await client.query(
-        `INSERT INTO public.collaboration_evaluation_event (
-           id, workspace_id, project_id, event_type, agent_id,
-           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
-         ) VALUES ($1, $2, $3, 'unsupported.certainty', $4,
-           'conversation-v1', 'read-only-v1', 'finding', $5,
-           jsonb_build_object('confidence', $6::numeric, 'evidenceCount', 0))`,
-        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId, id, finding.confidence]
-      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: input.workspaceId, projectId: input.projectId,
+        eventType: 'unsupported.certainty', agentId: input.authorAgentId,
+        routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+        agentConfigurationVersion: input.agentConfigurationVersion,
+        agentType: input.agentType,
+        permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
+        evidence: { confidence: finding.confidence, evidenceCount: 0 }
+      });
     }
     const duplicate = await client.query<{ id: string }>(
       `SELECT id FROM public.agent_finding
@@ -298,17 +335,27 @@ export async function createFindingFromAgentResult(
       [input.workspaceId, input.projectId, id, finding.summary]
     );
     if (duplicate.rows[0]) {
-      await client.query(
-        `INSERT INTO public.collaboration_evaluation_event (
-           id, workspace_id, project_id, event_type, agent_id,
-           prompt_version, permission_policy_version, outcome_type, outcome_id, evidence
-         ) VALUES ($1, $2, $3, 'duplicate.investigation', $4,
-           'conversation-v1', 'read-only-v1', 'finding', $5,
-           jsonb_build_object('duplicatesFindingId', $6::text))`,
-        [randomUUID(), input.workspaceId, input.projectId, input.authorAgentId,
-          id, duplicate.rows[0].id]
-      );
+      await recordCollaborationEvaluationEvent(client, {
+        workspaceId: input.workspaceId, projectId: input.projectId,
+        eventType: 'duplicate.investigation', agentId: input.authorAgentId,
+        routingPolicyVersion: input.routingPolicyVersion, promptVersion: 'conversation-v1',
+        agentConfigurationVersion: input.agentConfigurationVersion,
+        agentType: input.agentType,
+        permissionPolicyVersion: 'read-only-v1', outcomeType: 'finding', outcomeId: id,
+        evidence: { duplicatesFindingId: duplicate.rows[0].id }
+      });
     }
+  return id;
+}
+
+export async function createFindingFromAgentResult(
+  pool: Pool,
+  input: AgentFindingResultInput
+): Promise<string> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const id = await persistFindingFromAgentResult(client, input);
     await client.query('COMMIT');
     return id;
   } catch (error) {
@@ -324,14 +371,28 @@ export async function createProjectMemory(
   access: WorkspaceAccess,
   input: { projectId: string; type: MemoryType; statement: string; sourceReferences: string[]; supersedesId?: string }
 ): Promise<string> {
-  const statement = input.statement?.trim();
+  const projectId = typeof input?.projectId === 'string' ? input.projectId.trim() : '';
+  if (!projectId) throw new FindingError('Project is required');
+  const statement = typeof input?.statement === 'string' ? input.statement.trim() : '';
   if (!statement || statement.length > 4000) throw new FindingError('Memory statement is required');
+  assertContainsNoRecognizedRestrictedMaterial(statement);
   const allowedTypes: MemoryType[] = ['decision', 'terminology', 'constraint', 'finding', 'convention', 'rejected_approach'];
   if (!allowedTypes.includes(input.type)) throw new FindingError('Memory type is invalid');
-  const sourceReferences = [...new Set(input.sourceReferences ?? [])];
+  if (!Array.isArray(input.sourceReferences)
+    || input.sourceReferences.some((reference) => typeof reference !== 'string')) {
+    throw new FindingError('Memory requires authorised provenance');
+  }
+  const sourceReferences = [...new Set(input.sourceReferences.map((reference) => reference.trim()))]
+    .filter(Boolean);
   if (sourceReferences.length === 0 || sourceReferences.length > 50) {
     throw new FindingError('Memory requires authorised provenance');
   }
+  const supersedesId = input.supersedesId === undefined
+    ? undefined
+    : typeof input.supersedesId === 'string' && input.supersedesId.trim()
+      ? input.supersedesId.trim()
+      : null;
+  if (supersedesId === null) throw new FindingError('Memory supersession is invalid');
   const id = randomUUID();
   const client = await pool.connect();
   try {
@@ -342,7 +403,7 @@ export async function createProjectMemory(
        JOIN public.project_membership project_member ON project_member.workspace_member_id = member.id
        WHERE membership.id = $2 AND member.workspace_id = $1 AND project_member.project_id = $3
          AND membership.revoked_at IS NULL`,
-      [access.workspace.id, access.membership.id, input.projectId]
+      [access.workspace.id, access.membership.id, projectId]
     );
     if (!actor.rows[0]) throw new FindingError('active Project membership is required');
     for (const reference of sourceReferences) {
@@ -360,7 +421,7 @@ export async function createProjectMemory(
       const found = await client.query<{ allowed: boolean }>(
         `SELECT EXISTS (SELECT 1 FROM ${table}
          WHERE item.id = $1 AND item.workspace_id = $2 AND ${projectPredicate}) AS allowed`,
-        [match[2], access.workspace.id, input.projectId]
+        [match[2], access.workspace.id, projectId]
       );
       if (!found.rows[0]?.allowed) throw new FindingError('Memory provenance is outside the Project');
     }
@@ -373,16 +434,17 @@ export async function createProjectMemory(
        FROM (SELECT 1) seed
        LEFT JOIN public.project_memory prior
          ON prior.id = $8 AND prior.workspace_id = $2 AND prior.project_id = $3
+        AND prior.lifecycle = 'active'
        WHERE $8::text IS NULL OR prior.id IS NOT NULL`,
-      [id, access.workspace.id, input.projectId, actor.rows[0].id, input.type,
-        statement, JSON.stringify(sourceReferences), input.supersedesId ?? null]
+      [id, access.workspace.id, projectId, actor.rows[0].id, input.type,
+        statement, JSON.stringify(sourceReferences), supersedesId ?? null]
     );
     if (inserted.rowCount !== 1) throw new FindingError('Memory provenance is outside the Project');
-    if (input.supersedesId) {
+    if (supersedesId) {
       await client.query(
         `UPDATE public.project_memory SET lifecycle = 'superseded', updated_at = now()
          WHERE id = $1 AND workspace_id = $2 AND project_id = $3 AND lifecycle = 'active'`,
-        [input.supersedesId, access.workspace.id, input.projectId]
+        [supersedesId, access.workspace.id, projectId]
       );
     }
     await client.query('COMMIT');
@@ -399,16 +461,20 @@ export async function setProjectMemoryLifecycle(
   pool: Pool,
   access: WorkspaceAccess,
   memoryId: string,
-  lifecycle: 'active' | 'archived' | 'deleted'
+  lifecycle: 'archived' | 'deleted'
 ): Promise<void> {
-  if (!['active', 'archived', 'deleted'].includes(lifecycle)) {
+  if (!['archived', 'deleted'].includes(lifecycle)) {
     throw new FindingError('Memory lifecycle is invalid');
   }
   const updated = await pool.query(
     `UPDATE public.project_memory memory
-     SET lifecycle = $4, deleted_at = CASE WHEN $4 = 'deleted' THEN now() ELSE NULL END,
+     SET lifecycle = $4,
+         statement = CASE WHEN $4 = 'deleted' THEN '[deleted]' ELSE statement END,
+         source_references = CASE WHEN $4 = 'deleted' THEN '[]'::jsonb ELSE source_references END,
+         deleted_at = CASE WHEN $4 = 'deleted' THEN now() ELSE NULL END,
          updated_at = now()
      WHERE memory.id = $1 AND memory.workspace_id = $2
+       AND memory.lifecycle <> 'deleted'
        AND EXISTS (
          SELECT 1 FROM public.workspace_member member
          JOIN public.workspace_membership membership ON membership.id = member.pilot_membership_id
@@ -419,6 +485,43 @@ export async function setProjectMemoryLifecycle(
     [memoryId, access.workspace.id, access.membership.id, lifecycle]
   );
   if (updated.rowCount !== 1) throw new FindingError('Project memory was not found');
+}
+
+export async function loadAgentProjectMemoryContext(
+  pool: Pool,
+  scope: { workspaceId: string; projectId: string; agentId: string },
+  limit = 20
+): Promise<ProjectMemoryContextEntry[]> {
+  const rows = await pool.query<{
+    id: string; memory_type: MemoryType; statement: string;
+    lifecycle: ProjectMemoryContextEntry['lifecycle']; created_at: Date;
+  }>(
+    `SELECT memory.id, memory.memory_type, memory.statement, memory.lifecycle, memory.created_at
+     FROM public.project_memory memory
+     WHERE memory.workspace_id = $1 AND memory.project_id = $2
+       AND EXISTS (
+         SELECT 1 FROM public.agent agent
+         JOIN public.workspace_member member
+           ON member.agent_id = agent.id AND member.workspace_id = agent.workspace_id
+         JOIN public.project_membership project_member
+           ON project_member.workspace_member_id = member.id
+          AND project_member.workspace_id = member.workspace_id
+         WHERE agent.id = $3 AND agent.workspace_id = memory.workspace_id
+           AND project_member.project_id = memory.project_id
+       )
+     ORDER BY memory.created_at, memory.id`,
+    [scope.workspaceId, scope.projectId, scope.agentId]
+  );
+  return selectProjectMemoryContext(rows.rows.map((row) => ({
+    id: row.id, type: row.memory_type, statement: row.statement,
+    lifecycle: row.lifecycle, createdAt: row.created_at.toISOString()
+  })), limit);
+}
+
+export function renderProjectMemoryContext(entries: ProjectMemoryContextEntry[]): string {
+  return entries
+    .map(({ type, statement }) => `[${type}] ${statement.slice(0, 1000)}`)
+    .join('\n');
 }
 
 export async function loadProjectMemoryContext(

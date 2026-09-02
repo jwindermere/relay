@@ -23,9 +23,20 @@ import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js'
 import {
   claimCoordinationStep,
   decideCoordinationPlan,
-  proposeCoordinationPlan
+  editCoordinationPlan,
+  loadWorkspaceCoordinationPolicy,
+  proposeCoordinationPlan,
+  recordCoordinationProviderUsage,
+  updateWorkspaceCoordinationPolicy
 } from '../src/lib/server/collaboration/coordination.js';
 import { loadCollaborationAccountability } from '../src/lib/server/collaboration/accountability.js';
+import {
+  createProjectMemory,
+  loadAgentProjectMemoryContext,
+  loadProjectMemoryContext,
+  setProjectMemoryLifecycle,
+  type MemoryType
+} from '../src/lib/server/collaboration/findings.js';
 import { loadChannelReconciliation } from '../src/lib/server/collaboration/reconciliation.js';
 import {
   AgentRunProviderError,
@@ -963,16 +974,20 @@ if (skipDatabaseTests) {
         sourceMessageId: string;
         originatingRequest: { messageId: string; body: string };
       };
+      supplied_context: Array<{ author_name: string; body: string }>;
       artifact_references: unknown[];
       expected_response_shape: string;
       outcome_snapshot: unknown;
     }>(
       `SELECT originating_pilot_member_id, source_agent_id, target_agent_id, project_id,
-              context_snapshot, artifact_references, expected_response_shape, outcome_snapshot
+              context_snapshot - 'suppliedChannelContext' AS context_snapshot,
+              context_snapshot->'suppliedChannelContext' AS supplied_context,
+              artifact_references, expected_response_shape, outcome_snapshot
        FROM public.agent_handoff WHERE receiving_turn_id = $1`,
       [handoff.rows[0]?.id]
     );
-    assert.deepEqual(durableHandoff.rows[0], {
+    const { supplied_context: suppliedContext, ...durableContract } = durableHandoff.rows[0]!;
+    assert.deepEqual(durableContract, {
       originating_pilot_member_id: ids.pilotMemberId,
       source_agent_id: ids.agentId,
       target_agent_id: productAgentId,
@@ -998,6 +1013,16 @@ if (skipDatabaseTests) {
       expected_response_shape: 'concise_text',
       outcome_snapshot: null
     });
+    assert.ok(suppliedContext.some(
+      ({ body }) => body === coordination.body
+    ));
+
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES ('late-handoff-context', $1, $2, $3, 'This arrived after the handoff contract.')`,
+      [ids.workspaceId, ids.channelId, ids.pilotMemberId]
+    );
 
     const handoffProvider = new FixtureProvider(async (input, observer) => {
       const workingHandoffView = await loadChannelReconciliation(
@@ -1012,6 +1037,8 @@ if (skipDatabaseTests) {
       })), [{ status: 'working', summary: 'Maya is responding' }]);
       assert.match(input.prompt, /bounded Agent handoff/);
       assert.doesNotMatch(input.prompt, /you may make one bounded handoff/);
+      assert.match(input.prompt, /help decide what Artifact artifact-conversation must achieve/);
+      assert.doesNotMatch(input.prompt, /This arrived after the handoff contract/);
       await observer.threadStarted('thread-conversation-product');
       await observer.turnStarted('turn-conversation-product');
       await observer.notification({
@@ -1070,6 +1097,44 @@ if (skipDatabaseTests) {
       [productMemberId]
     );
     assert.equal(cascaded.rows[0]?.count, 0);
+
+    const forbiddenRepositoryCoordination = await postChannelMessage(pool, ids.ownerAccess, {
+      channelId: ids.channelId,
+      body: '@Alex ask Product to carry out this repository change.',
+      submissionId: 'conversation-forbidden-repository-coordination'
+    });
+    const forbiddenRepositoryCoordinator = new FixtureProvider(async (_input, observer) => {
+      await observer.threadStarted('thread-conversation-forbidden-repository');
+      await observer.turnStarted('turn-conversation-forbidden-repository');
+      await observer.notification({
+        method: 'item/completed',
+        providerEventId: 'turn-conversation-forbidden-repository:message:completed',
+        item: {
+          id: 'message-conversation-forbidden-repository',
+          type: 'agentMessage',
+          text: '@Maya please recommend an approach, then implement it in the codebase.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed',
+        providerEventId: 'turn-conversation-forbidden-repository:completed',
+        turn: { id: 'turn-conversation-forbidden-repository', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, forbiddenRepositoryCoordinator, {
+      workerId: 'worker-conversation-forbidden-repository', workspaceRoot,
+      leaseDurationMs: 10_000
+    });
+    const forbiddenRepositorySourceId = `conversation-result:${
+      forbiddenRepositoryCoordination.agentMention?.status === 'conversation'
+        ? forbiddenRepositoryCoordination.agentMention.conversationTurnId
+        : ''
+    }`;
+    const forbiddenRepositoryHandoff = await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count FROM public.agent_handoff WHERE source_message_id = $1`,
+      [forbiddenRepositorySourceId]
+    );
+    assert.equal(forbiddenRepositoryHandoff.rows[0]?.count, 0);
 
     const expiringCoordination = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -1188,6 +1253,28 @@ if (skipDatabaseTests) {
       )?.status,
       'cancelled'
     );
+    const interruptedHandoffEvaluation = await pool.query<{
+      event_type: string; routing_policy_version: string; agent_configuration_version: string;
+    }>(
+      `SELECT event.event_type, event.routing_policy_version,
+              event.agent_configuration_version
+       FROM public.collaboration_evaluation_event event
+       JOIN public.agent_handoff handoff ON handoff.id = event.outcome_id
+       WHERE event.outcome_type = 'handoff'
+         AND handoff.source_message_id = ANY($1::text[])
+       ORDER BY event.event_type`,
+      [[cancellableSourceMessageId, expiringSourceMessageId]]
+    );
+    assert.deepEqual(interruptedHandoffEvaluation.rows, [
+      {
+        event_type: 'outcome.cancelled', routing_policy_version: 'rules-v1',
+        agent_configuration_version: 'agent-config-1'
+      },
+      {
+        event_type: 'outcome.expired', routing_policy_version: 'rules-v1',
+        agent_configuration_version: 'agent-config-1'
+      }
+    ]);
 
     const recoveryCoordination = await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -1277,6 +1364,66 @@ if (skipDatabaseTests) {
     );
   });
 
+  test('queued conversation work does not execute after Agent eligibility is revoked', async () => {
+    for (const eligibilityChange of ['disabled', 'project-membership-revoked'] as const) {
+      const ids = await seedQueuedAgentRun(pool, `conversation-${eligibilityChange}`);
+      await pool.query(
+        `UPDATE public.agent_run
+         SET status = 'completed', completed_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [ids.runId]
+      );
+      await pool.query(`UPDATE public.task SET status = 'completed' WHERE id = $1`, [
+        `task-conversation-${eligibilityChange}`
+      ]);
+      await pool.query(`UPDATE public.agent SET status = 'idle' WHERE id = $1`, [ids.agentId]);
+
+      const request = await postChannelMessage(pool, ids.ownerAccess, {
+        channelId: ids.channelId,
+        body: '@Alex explain what you can help with.',
+        submissionId: `conversation-${eligibilityChange}-request`
+      });
+      assert.equal(request.agentMention?.status, 'conversation');
+      const turnId = request.agentMention?.status === 'conversation'
+        ? request.agentMention.conversationTurnId
+        : '';
+
+      if (eligibilityChange === 'disabled') {
+        await pool.query(
+          `UPDATE public.agent SET enabled = false, status = 'disabled' WHERE id = $1`,
+          [ids.agentId]
+        );
+      } else {
+        await pool.query(
+          `DELETE FROM public.project_membership
+           WHERE project_id = $1 AND workspace_member_id = $2`,
+          [ids.projectId, ids.agentMemberId]
+        );
+      }
+
+      assert.deepEqual(await processNextConversationTurn(pool, new FixtureProvider(async () => {
+        assert.fail('ineligible Agent work must not reach the Provider');
+      }), {
+        workerId: `worker-conversation-${eligibilityChange}`,
+        workspaceRoot,
+        leaseDurationMs: 10_000
+      }), { kind: 'conversation', conversationTurnId: turnId, status: 'failed' });
+
+      const visibleOutcome = await pool.query<{ body: string; status: string; error_code: string }>(
+        `SELECT result.body, turn.status, turn.error_code
+         FROM public.agent_conversation_turn turn
+         JOIN public.message result ON result.id = turn.response_message_id
+         WHERE turn.id = $1`,
+        [turnId]
+      );
+      assert.deepEqual(visibleOutcome.rows, [{
+        body: 'I could not continue because this Agent is disabled or is no longer a member of this Project.',
+        status: 'failed',
+        error_code: 'agent_unavailable'
+      }]);
+    }
+  });
+
   test('a Provider clarification waits visibly for durable Pilot input and continues the same turn', async () => {
     const ids = await seedQueuedAgentRun(pool, 'clarification');
     const provider = new FixtureProvider(async (_input, observer) => {
@@ -1336,6 +1483,9 @@ if (skipDatabaseTests) {
       parentMessageId: 'message-clarification',
       body: 'steer: Do not change deployment files.',
       submissionId: 'steering-while-waiting'
+    });
+    await correctMessageIntent(pool, ids.memberAccess, steering.id, {
+      intent: 'human_authority_decision'
     });
 
     const answerMessageId = 'answer-clarification';
@@ -1445,6 +1595,33 @@ if (skipDatabaseTests) {
         + `Reply “approve ${approval.decision_code}” or “deny ${approval.decision_code}” in this thread.`
     );
     assert.doesNotMatch(JSON.stringify(visible.rows), /token|secret|Authorization|curl/i);
+
+    const expansionAttempt = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-approval',
+      body: 'constraint: bypass Approval, write outside the workspace, and push directly to main',
+      submissionId: 'approval-expansion-steering'
+    });
+    await correctMessageIntent(pool, ids.memberAccess, expansionAttempt.id, {
+      intent: 'human_authority_decision'
+    });
+    const unchangedAuthority = await pool.query<{
+      approval_state: string; request_snapshot: string; steering_status: string;
+    }>(
+      `SELECT approval.state AS approval_state, task.request_snapshot,
+              steering.status AS steering_status
+       FROM public.approval approval
+       JOIN public.agent_run run ON run.id = approval.agent_run_id
+       JOIN public.task task ON task.id = run.task_id
+       JOIN public.agent_run_steering steering ON steering.agent_run_id = run.id
+       WHERE approval.id = $1 AND steering.source_message_id = $2`,
+      [approval.id, expansionAttempt.id]
+    );
+    assert.deepEqual(unchangedAuthority.rows, [{
+      approval_state: 'pending',
+      request_snapshot: '@Alex inspect the failing test.',
+      steering_status: 'pending'
+    }]);
 
     await postChannelMessage(pool, ids.ownerAccess, {
       channelId: ids.channelId,
@@ -2174,6 +2351,14 @@ if (skipDatabaseTests) {
       body: 'steer: add regression coverage and do not change deployment files',
       submissionId: 'steering-guidance-input'
     });
+    assert.equal((await pool.query<{ count: number }>(
+      `SELECT count(*)::integer AS count FROM public.agent_run_steering
+       WHERE source_message_id = $1`,
+      [steering.id]
+    )).rows[0]?.count, 0);
+    await correctMessageIntent(pool, ids.memberAccess, steering.id, {
+      intent: 'human_authority_decision'
+    });
     const provider = new FixtureProvider(async (input, observer) => {
       assert.match(input.prompt, /add regression coverage and do not change deployment files/);
       await observer.threadStarted('thread-steering-guidance');
@@ -2189,14 +2374,32 @@ if (skipDatabaseTests) {
     const stored = await pool.query<{
       source_message_id: string; ordinal: number; status: string;
       provider_thread_id: string; provider_turn_id: string;
+      supplied_by_workspace_member_id: string; created_at: Date;
     }>(
-      `SELECT source_message_id, ordinal, status, provider_thread_id, provider_turn_id
+      `SELECT source_message_id, ordinal, status, provider_thread_id, provider_turn_id,
+              supplied_by_workspace_member_id, created_at
        FROM public.agent_run_steering WHERE agent_run_id = $1`,
       [ids.runId]
     );
-    assert.deepEqual(stored.rows, [{
+    assert.deepEqual(stored.rows.map(({ created_at, ...row }) => ({
+      ...row, accepted: created_at instanceof Date
+    })), [{
       source_message_id: steering.id, ordinal: 1, status: 'delivered',
-      provider_thread_id: 'thread-steering-guidance', provider_turn_id: 'turn-steering-guidance'
+      provider_thread_id: 'thread-steering-guidance', provider_turn_id: 'turn-steering-guidance',
+      supplied_by_workspace_member_id: ids.memberWorkspaceMemberId, accepted: true
+    }]);
+    const visible = await loadCollaborationAccountability(pool, ids.memberAccess, ids.projectId);
+    assert.deepEqual(visible.steering.map(({ createdAt, ...item }) => ({
+      ...item, accepted: Date.parse(createdAt) > 0
+    })), [{
+      id: visible.steering[0]?.id,
+      agentRunId: ids.runId,
+      sourceMessageId: steering.id,
+      guidance: 'add regression coverage and do not change deployment files',
+      ordinal: 1,
+      status: 'delivered',
+      suppliedBy: 'Pilot member',
+      accepted: true
     }]);
   });
 
@@ -2218,6 +2421,12 @@ if (skipDatabaseTests) {
       })
     ]);
     const retry = await postChannelMessage(pool, ids.ownerAccess, firstInput);
+    await correctMessageIntent(pool, ids.ownerAccess, first.id, {
+      intent: 'human_authority_decision'
+    });
+    await correctMessageIntent(pool, ids.memberAccess, second.id, {
+      intent: 'human_authority_decision'
+    });
 
     assert.equal(retry.id, first.id);
     const stored = await pool.query<{
@@ -2237,8 +2446,8 @@ if (skipDatabaseTests) {
     );
   });
 
-  test('steering remains visible when active, recovering, or paused and is rejected when terminal', async () => {
-    const acceptedStates = ['working', 'recovering', 'paused'] as const;
+  test('steering remains visible when active, waiting for Approval, recovering, or paused and is rejected when terminal', async () => {
+    const acceptedStates = ['working', 'waiting_for_approval', 'recovering', 'paused'] as const;
     for (const status of acceptedStates) {
       const ids = await seedQueuedAgentRun(pool, `steering-${status}`);
       await pool.query('UPDATE public.agent_run SET status = $2 WHERE id = $1', [ids.runId, status]);
@@ -2248,12 +2457,19 @@ if (skipDatabaseTests) {
         body: `guidance: preserve the ${status} evidence`,
         submissionId: `steering-${status}-input`
       });
+      await correctMessageIntent(pool, ids.memberAccess, steering.id, {
+        intent: 'human_authority_decision'
+      });
       const stored = await pool.query<{ source_message_id: string; status: string }>(
         `SELECT source_message_id, status FROM public.agent_run_steering
          WHERE agent_run_id = $1`,
         [ids.runId]
       );
       assert.deepEqual(stored.rows, [{ source_message_id: steering.id, status: 'pending' }]);
+      const run = await pool.query<{ status: string }>(
+        'SELECT status FROM public.agent_run WHERE id = $1', [ids.runId]
+      );
+      assert.equal(run.rows[0]?.status, status);
     }
 
     const terminalStates = ['completed', 'failed', 'cancelled'] as const;
@@ -2354,32 +2570,633 @@ if (skipDatabaseTests) {
     const planId = await proposeCoordinationPlan(pool, {
       workspaceId: ids.workspaceId, projectId: ids.projectId,
       coordinatingAgentId: ids.agentId, sourceMessageId: resultMessageId,
-      goal: 'Assess evidence', allowParallel: false,
+      routingPolicyVersion: 'message-intent-v1',
+      agentConfigurationVersion: 1,
+      agentType: 'engineering',
+      goal: 'Assess evidence', allowParallel: true,
       budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 },
-      steps: [{ key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] }]
+      steps: [
+        { key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] },
+        { key: 'challenge', agentId: researchAgentId, instruction: 'Challenge the evidence', dependencies: [] }
+      ]
     });
     assert.equal(await claimCoordinationStep(pool, planId), null);
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+      maxParticipants: 4, maxHandoffs: 0, maxDepth: 1,
+      maxAgentRuns: 0, maxElapsedSeconds: 3600, parallelPermitted: true
+    });
+    await assert.rejects(
+      decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve'),
+      /current Workspace or Provider limits/
+    );
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+      maxParticipants: 4, maxHandoffs: 8, maxDepth: 1,
+      maxAgentRuns: 0, maxElapsedSeconds: 3600, parallelPermitted: true
+    });
     await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
-    assert.ok(await claimCoordinationStep(pool, planId));
-    const created = await pool.query<{ turns: number; runs: number; depth: number }>(
+    await decideCoordinationPlan(pool, ids.memberAccess, planId, 'pause');
+    assert.equal(await claimCoordinationStep(pool, planId), null);
+    await decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume');
+    const resumed = await pool.query<{
+      status: string; approved_by_workspace_member_id: string; resume_events: number;
+    }>(
+      `SELECT plan.status, plan.approved_by_workspace_member_id,
+              (SELECT count(*)::integer FROM public.audit_event event
+               WHERE event.subject_type = 'coordination_plan' AND event.subject_id = plan.id
+                 AND event.event_type = 'coordination_plan.resumed'
+                 AND event.actor_membership_id = $2) AS resume_events
+       FROM public.coordination_plan plan WHERE plan.id = $1`,
+      [planId, ids.memberAccess.membership.id]
+    );
+    assert.deepEqual(resumed.rows[0], {
+      status: 'approved',
+      approved_by_workspace_member_id: ids.memberWorkspaceMemberId,
+      resume_events: 1
+    });
+    const planConstraint = await postChannelMessage(pool, ids.memberAccess, {
+      channelId: ids.channelId,
+      parentMessageId: 'message-coordination-approval',
+      body: 'constraint: cite the release evidence and do not create repository work',
+      submissionId: 'coordination-approval-steering'
+    });
+    await correctMessageIntent(pool, ids.memberAccess, planConstraint.id, {
+      intent: 'human_authority_decision'
+    });
+    const pendingPlan = (await loadCollaborationAccountability(
+      pool, ids.memberAccess, ids.projectId
+    )).plans.find(({ id }) => id === planId);
+    assert.deepEqual(pendingPlan?.constraints, []);
+    assert.deepEqual(pendingPlan?.constraintInputs.map((input) => ({
+      sourceMessageId: input.sourceMessageId,
+      guidance: input.guidance,
+      status: input.status,
+      deliveryConversationTurnId: input.deliveryConversationTurnId,
+      suppliedBy: input.suppliedBy
+    })), [{
+      sourceMessageId: planConstraint.id,
+      guidance: 'cite the release evidence and do not create repository work',
+      status: 'pending',
+      deliveryConversationTurnId: null,
+      suppliedBy: 'Pilot member'
+    }]);
+    const parallelClaims = await Promise.all([
+      claimCoordinationStep(pool, planId),
+      claimCoordinationStep(pool, planId)
+    ]);
+    assert.equal(parallelClaims.filter(Boolean).length, 1);
+    const claimedTurn = await pool.query<{ conversation_turn_id: string }>(
+      `SELECT conversation_turn_id FROM public.coordination_plan_step
+       WHERE plan_id = $1 AND status = 'active'`,
+      [planId]
+    );
+    const usageClient = await pool.connect();
+    try {
+      await usageClient.query('BEGIN');
+      await recordCoordinationProviderUsage(usageClient, {
+        workspaceId: ids.workspaceId,
+        conversationTurnId: claimedTurn.rows[0]!.conversation_turn_id,
+        amount: 7
+      });
+      await recordCoordinationProviderUsage(usageClient, {
+        workspaceId: ids.workspaceId,
+        conversationTurnId: claimedTurn.rows[0]!.conversation_turn_id,
+        amount: 7
+      });
+      await usageClient.query('COMMIT');
+    } finally {
+      usageClient.release();
+    }
+    const exhaustedPlan = (await loadCollaborationAccountability(
+      pool, ids.memberAccess, ids.projectId
+    )).plans.find(({ id }) => id === planId);
+    assert.deepEqual(exhaustedPlan && {
+      status: exhaustedPlan.status,
+      state: (exhaustedPlan.budget as typeof exhaustedPlan.budget & { state: string }).state,
+      stopReason: (exhaustedPlan.budget as typeof exhaustedPlan.budget & { stopReason: string | null }).stopReason,
+      noticeMessageId: (exhaustedPlan.budget as typeof exhaustedPlan.budget & { noticeMessageId: string | null }).noticeMessageId,
+      providerUsage: exhaustedPlan.budget.providerUsage
+    }, {
+      status: 'paused',
+      state: 'exhausted',
+      stopReason: 'handoff_limit',
+      noticeMessageId: `coordination-budget:${planId}`,
+      providerUsage: { known: true, consumed: 7, limit: null }
+    });
+    const budgetNotice = (await loadChannelReconciliation(
+      pool, ids.memberAccess, ids.channelId, {}
+    )).messages.find(({ id }) => id === `coordination-budget:${planId}`);
+    assert.match(budgetNotice?.body ?? '', /handoff limit reached.*Pilot direction is required/);
+    await assert.rejects(
+      decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume'),
+      /cannot resume after a hard budget stop/
+    );
+    const created = await pool.query<{
+      turns: number; runs: number; depth: number; request_body: string;
+      constraints: string[]; constraint_status: string;
+      delivery_conversation_turn_id: string; constraint_events: number;
+    }>(
       `SELECT
          count(*) FILTER (WHERE turn.id IS NOT NULL)::integer AS turns,
          (SELECT count(*)::integer FROM public.agent_run WHERE workspace_id = $1) AS runs,
-         max(turn.handoff_depth)::integer AS depth
+         max(turn.handoff_depth)::integer AS depth,
+         max(request.body) AS request_body,
+         max(plan.constraints::text)::jsonb AS constraints,
+         max(constraint_input.status) AS constraint_status,
+         max(constraint_input.delivery_conversation_turn_id) AS delivery_conversation_turn_id,
+         (SELECT count(*)::integer FROM public.audit_event event
+          WHERE event.subject_type = 'coordination_plan' AND event.subject_id = $2
+            AND event.event_type = 'coordination_plan.constraint_appended'
+            AND event.evidence->>'sourceMessageId' = $3) AS constraint_events
        FROM public.coordination_plan_step step
+       JOIN public.coordination_plan plan ON plan.id = step.plan_id
+       JOIN public.coordination_plan_constraint constraint_input
+         ON constraint_input.plan_id = plan.id
        LEFT JOIN public.agent_conversation_turn turn ON turn.id = step.conversation_turn_id
+       LEFT JOIN public.message request ON request.id = turn.request_message_id
        WHERE step.plan_id = $2`,
-      [ids.workspaceId, planId]
+      [ids.workspaceId, planId, planConstraint.id]
     );
-    assert.deepEqual(created.rows[0], { turns: 1, runs: 1, depth: 1 });
+    assert.deepEqual(created.rows[0] && {
+      ...created.rows[0],
+      delivery_conversation_turn_id: Boolean(created.rows[0].delivery_conversation_turn_id)
+    }, {
+      turns: 1, runs: 1, depth: 1,
+      request_body: 'Assess the evidence\n\nApproved coordination constraints:\n- cite the release evidence and do not create repository work',
+      constraints: ['cite the release evidence and do not create repository work'],
+      constraint_status: 'delivered',
+      delivery_conversation_turn_id: true,
+      constraint_events: 1
+    });
     await pool.query(
       `UPDATE public.agent_conversation_turn
-       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
-       WHERE id IN (
-         SELECT conversation_turn_id FROM public.coordination_plan_step WHERE plan_id = $1
-       ) AND status = 'queued'`,
+       SET status = 'working', lease_owner = 'coordination-cancel-worker',
+           lease_token = 'coordination-cancel-lease',
+           lease_expires_at = now() + interval '5 minutes', started_at = now()
+       WHERE id = $1`,
+      [claimedTurn.rows[0]!.conversation_turn_id]
+    );
+    await pool.query(
+      `UPDATE public.coordination_budget_reservation
+       SET outcome = 'started', updated_at = now()
+       WHERE plan_id = $1 AND outcome = 'reserved'`,
       [planId]
     );
+    await decideCoordinationPlan(pool, ids.memberAccess, planId, 'cancel');
+    const cancelledPlan = (await loadCollaborationAccountability(
+      pool, ids.memberAccess, ids.projectId
+    )).plans.find(({ id }) => id === planId);
+    assert.deepEqual(cancelledPlan && {
+      consumedHandoffs: cancelledPlan.budget.consumedHandoffs,
+      accounting: cancelledPlan.budget.reservationAccounting
+    }, {
+      consumedHandoffs: 1,
+      accounting: { reserved: 0, started: 0, failedStart: 0, failed: 0, cancelled: 1, completed: 0 }
+    });
+    const cancelledTurn = await pool.query<{
+      status: string; error_code: string; lease_owner: string | null; lease_token: string | null;
+    }>(
+      `SELECT status, error_code, lease_owner, lease_token
+       FROM public.agent_conversation_turn WHERE id = $1`,
+      [claimedTurn.rows[0]!.conversation_turn_id]
+    );
+    assert.deepEqual(cancelledTurn.rows[0], {
+      status: 'failed', error_code: 'coordination_cancelled', lease_owner: null, lease_token: null
+    });
+  });
+
+  test('Workspace coordination defaults stay within Provider limits and retain attribution', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-policy');
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET coordination_provider_usage_limit = 100 WHERE id = $1`,
+      [ids.providerConnectionId]
+    );
+    const requested = {
+      maxParticipants: 3,
+      maxHandoffs: 4,
+      maxDepth: 1,
+      maxAgentRuns: 0,
+      maxElapsedSeconds: 1800,
+      providerUsageLimit: 80,
+      parallelPermitted: false
+    };
+    await assert.rejects(
+      updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+        ...requested,
+        providerUsageLimit: 101
+      }),
+      /Provider limit/
+    );
+    await assert.rejects(
+      updateWorkspaceCoordinationPolicy(pool, ids.memberAccess, requested),
+      /Workspace owner/
+    );
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, requested);
+    assert.deepEqual(
+      await loadWorkspaceCoordinationPolicy(pool, ids.memberAccess),
+      requested
+    );
+    const audit = await pool.query<{ actor_membership_id: string; after: Record<string, unknown> }>(
+      `SELECT actor_membership_id, evidence->'after' AS after
+       FROM public.audit_event
+       WHERE workspace_id = $1 AND event_type = 'workspace_coordination_policy.updated'`,
+      [ids.workspaceId]
+    );
+    assert.deepEqual(audit.rows, [{
+      actor_membership_id: ids.ownerAccess.membership.id,
+      after: requested
+    }]);
+  });
+
+  test('Workspace coordination policy dimensions stay in parity across proposal, edit, approval, and resume', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-policy-parity');
+    const maximumWorkspacePolicy = {
+      maxParticipants: 8,
+      maxHandoffs: 20,
+      maxDepth: 1,
+      maxAgentRuns: 0,
+      maxElapsedSeconds: 86_400,
+      parallelPermitted: true
+    };
+    let proposalSequence = 0;
+    const planInput = (
+      suffix: string,
+      overrides: Partial<{
+        allowParallel: boolean;
+        budget: {
+          maxParticipants: number; maxHandoffs: number; maxDepth: number;
+          maxAgentRuns: number; maxElapsedSeconds: number; providerUsageLimit?: number;
+        };
+      }> = {}
+    ) => ({
+      goal: `Check ${suffix}`,
+      allowParallel: overrides.allowParallel ?? false,
+      budget: overrides.budget ?? {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600
+      },
+      steps: [{
+        key: 'check', agentId: ids.agentId, instruction: `Check ${suffix}`, dependencies: []
+      }]
+    });
+    const propose = async (suffix: string, input: ReturnType<typeof planInput>) => {
+      proposalSequence += 1;
+      const sourceMessageId = `message-coordination-policy-parity-${proposalSequence}-${suffix}`;
+      await pool.query(
+        `INSERT INTO public.message (
+           id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+         ) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [sourceMessageId, ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId,
+          `Proposed policy parity check ${suffix}`]
+      );
+      return proposeCoordinationPlan(pool, {
+        workspaceId: ids.workspaceId, projectId: ids.projectId,
+        coordinatingAgentId: ids.agentId, sourceMessageId,
+        routingPolicyVersion: 'message-intent-v1', agentConfigurationVersion: 1,
+        agentType: 'engineering', ...input
+      });
+    };
+    const assertRejectedAtEveryGate = async (
+      name: string,
+      input: ReturnType<typeof planInput>,
+      restrict: () => Promise<unknown>
+    ) => {
+      const approvalPlanId = await propose(`approval-${name}`, input);
+      const editPlanId = await propose(`edit-${name}`, input);
+      const resumePlanId = await propose(`resume-${name}`, input);
+      await decideCoordinationPlan(pool, ids.ownerAccess, resumePlanId, 'approve');
+      await decideCoordinationPlan(pool, ids.ownerAccess, resumePlanId, 'pause');
+      await restrict();
+      await assert.rejects(
+        propose(`proposal-reject-${name}`, input),
+        /exceeds Workspace defaults/,
+        `${name} must be enforced while proposing`
+      );
+      await assert.rejects(
+        editCoordinationPlan(pool, ids.memberAccess, editPlanId, input),
+        /exceeds Workspace defaults/,
+        `${name} must be enforced while editing`
+      );
+      await assert.rejects(
+        decideCoordinationPlan(pool, ids.ownerAccess, approvalPlanId, 'approve'),
+        /current Workspace or Provider limits/,
+        `${name} must be enforced while approving`
+      );
+      await assert.rejects(
+        decideCoordinationPlan(pool, ids.ownerAccess, resumePlanId, 'resume'),
+        /current Workspace or Provider limits/,
+        `${name} must be enforced while resuming`
+      );
+    };
+
+    const cases = [
+      {
+        name: 'participant ceiling',
+        input: planInput('participants', {
+          budget: { maxParticipants: 2, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxParticipants: 1 }
+      },
+      {
+        name: 'handoff ceiling',
+        input: planInput('handoffs', {
+          budget: { maxParticipants: 1, maxHandoffs: 2, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxHandoffs: 1 }
+      },
+      {
+        name: 'handoff-depth ceiling',
+        input: planInput('depth', {
+          budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxDepth: 0 }
+      },
+      {
+        name: 'elapsed-time ceiling',
+        input: planInput('elapsed', {
+          budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 }
+        }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, maxElapsedSeconds: 60 }
+      },
+      {
+        name: 'parallel-execution permission',
+        input: planInput('parallel', { allowParallel: true }),
+        restrictedPolicy: { ...maximumWorkspacePolicy, parallelPermitted: false }
+      },
+      {
+        name: 'Workspace Provider-usage ceiling',
+        input: planInput('workspace-provider-usage', {
+          budget: {
+            maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+            maxAgentRuns: 0, maxElapsedSeconds: 600, providerUsageLimit: 50
+          }
+        }),
+        permissiveProviderUsageLimit: 100,
+        restrictedPolicy: { ...maximumWorkspacePolicy, providerUsageLimit: 40 }
+      }
+    ];
+
+    for (const policyCase of cases) {
+      await pool.query(
+        `UPDATE public.provider_connection
+         SET coordination_provider_usage_limit = NULL WHERE id = $1`,
+        [ids.providerConnectionId]
+      );
+      await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+        ...maximumWorkspacePolicy,
+        ...(policyCase.permissiveProviderUsageLimit === undefined
+          ? {} : { providerUsageLimit: policyCase.permissiveProviderUsageLimit })
+      });
+      await assertRejectedAtEveryGate(
+        policyCase.name,
+        policyCase.input,
+        () => updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, policyCase.restrictedPolicy)
+      );
+    }
+
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET coordination_provider_usage_limit = 100 WHERE id = $1`,
+      [ids.providerConnectionId]
+    );
+    const providerPolicy = { ...maximumWorkspacePolicy, providerUsageLimit: 100 };
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, providerPolicy);
+    const providerInput = planInput('Provider connection usage', {
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600, providerUsageLimit: 50
+      }
+    });
+    await assertRejectedAtEveryGate(
+      'Provider connection usage ceiling',
+      providerInput,
+      () => pool.query(
+        `UPDATE public.provider_connection
+         SET coordination_provider_usage_limit = 40 WHERE id = $1`,
+        [ids.providerConnectionId]
+      )
+    );
+
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET coordination_provider_usage_limit = NULL WHERE id = $1`,
+      [ids.providerConnectionId]
+    );
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, maximumWorkspacePolicy);
+    const zeroAgentRunInput = planInput('zero AgentRuns');
+    const zeroAgentRunId = await propose('zero-agent-runs', zeroAgentRunInput);
+    await editCoordinationPlan(pool, ids.memberAccess, zeroAgentRunId, zeroAgentRunInput);
+    const nonzeroAgentRunInput = planInput('nonzero AgentRuns', {
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 1, maxElapsedSeconds: 600
+      }
+    });
+    await assert.rejects(
+      propose('nonzero-agent-runs', nonzeroAgentRunInput),
+      /AgentRun limit must be zero/
+    );
+    await assert.rejects(
+      editCoordinationPlan(pool, ids.memberAccess, zeroAgentRunId, nonzeroAgentRunInput),
+      /AgentRun limit must be zero/
+    );
+    await assert.rejects(
+      pool.query(
+        `UPDATE public.coordination_plan SET max_agent_runs = 1 WHERE id = $1`,
+        [zeroAgentRunId]
+      ),
+      /coordination_plan_max_agent_runs_check/
+    );
+    await assert.rejects(
+      pool.query(
+        `UPDATE public.workspace_coordination_policy
+         SET default_max_agent_runs = 1 WHERE workspace_id = $1`,
+        [ids.workspaceId]
+      ),
+      /workspace_coordination_policy_default_max_agent_runs_check/
+    );
+    await decideCoordinationPlan(pool, ids.ownerAccess, zeroAgentRunId, 'approve');
+    await decideCoordinationPlan(pool, ids.ownerAccess, zeroAgentRunId, 'pause');
+    await decideCoordinationPlan(pool, ids.ownerAccess, zeroAgentRunId, 'resume');
+  });
+
+  test('Coordination workers enforce the approved structured Finding output', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-output-contract');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'failed', completed_at = now(), last_error_code = 'test_setup'
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    const conversationId = 'conversation-coordination-output-contract';
+    const sourceMessageId = 'message-coordination-output-contract-source';
+    await pool.query(
+      `INSERT INTO public.agent_conversation (
+         id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [conversationId, ids.workspaceId, ids.channelId, ids.messageId,
+        ids.agentId, ids.providerConnectionId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES ($1, $2, $3, $4, $5, 'I propose a structured evidence review.')`,
+      [sourceMessageId, ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, response_message_id, status,
+         response_placement, response_parent_message_id, completed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      ['turn-coordination-output-source', ids.workspaceId, conversationId,
+        ids.messageId, ids.pilotMemberId, sourceMessageId]
+    );
+    const planId = await proposeCoordinationPlan(pool, {
+      workspaceId: ids.workspaceId, projectId: ids.projectId,
+      coordinatingAgentId: ids.agentId, sourceMessageId,
+      routingPolicyVersion: 'message-intent-v1', agentConfigurationVersion: 1,
+      agentType: 'engineering', goal: 'Assess evidence', allowParallel: false,
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600
+      },
+      steps: [{
+        key: 'evidence', agentId: ids.agentId, instruction: 'Assess the evidence',
+        dependencies: [], expectedOutput: 'structured_finding'
+      }]
+    });
+    await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /requires a structured Finding/);
+      await observer.threadStarted('thread-coordination-output-contract');
+      await observer.turnStarted('turn-coordination-output-contract');
+      await observer.notification({
+        method: 'item/completed', providerEventId: 'coordination-output-contract:message',
+        item: { id: 'coordination-output-message', type: 'agentMessage', text: 'Plain output.' }
+      });
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'coordination-output-contract:completed',
+        turn: { id: 'turn-coordination-output-contract', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, provider, {
+      workerId: 'worker-coordination-output-contract', workspaceRoot
+    });
+    const stored = await pool.query<{
+      plan_status: string; step_status: string; body: string; findings: number;
+    }>(
+      `SELECT plan.status AS plan_status, step.status AS step_status, result.body,
+              (SELECT count(*)::integer FROM public.agent_finding finding
+               WHERE finding.result_message_id = result.id) AS findings
+       FROM public.coordination_plan plan
+       JOIN public.coordination_plan_step step ON step.plan_id = plan.id
+       JOIN public.message result ON result.id = step.result_message_id
+       WHERE plan.id = $1`,
+      [planId]
+    );
+    assert.deepEqual(stored.rows[0], {
+      plan_status: 'paused', step_status: 'failed', body: 'Plain output.', findings: 0
+    });
+    await assert.rejects(
+      decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume'),
+      /cannot resume with failed steps/
+    );
+
+    await pool.query(
+      `UPDATE public.agent SET agent_type = 'research' WHERE id = $1`,
+      [ids.agentId]
+    );
+    const conciseRequestMessageId = 'message-coordination-concise-request';
+    const conciseSourceMessageId = 'message-coordination-concise-source';
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES
+         ($1, $3, $4, $5, $6, 'Please provide a concise review.'),
+         ($2, $3, $4, $7, $6, 'I propose a concise review.')`,
+      [conciseRequestMessageId, conciseSourceMessageId, ids.workspaceId, ids.channelId,
+        ids.pilotMemberId, ids.messageId, ids.agentMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, response_message_id, status,
+         response_placement, response_parent_message_id, completed_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      ['turn-coordination-concise-source', ids.workspaceId, conversationId,
+        conciseRequestMessageId, ids.pilotMemberId, conciseSourceMessageId]
+    );
+    const concisePlanId = await proposeCoordinationPlan(pool, {
+      workspaceId: ids.workspaceId, projectId: ids.projectId,
+      coordinatingAgentId: ids.agentId, sourceMessageId: conciseSourceMessageId,
+      routingPolicyVersion: 'message-intent-v1', agentConfigurationVersion: 1,
+      agentType: 'research', goal: 'Summarize evidence', allowParallel: false,
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600
+      },
+      steps: [{
+        key: 'summary', agentId: ids.agentId, instruction: 'Summarize the evidence',
+        dependencies: [], expectedOutput: 'concise_text'
+      }]
+    });
+    await decideCoordinationPlan(pool, ids.ownerAccess, concisePlanId, 'approve');
+    const conciseProvider = new FixtureProvider(async (input, observer) => {
+      assert.equal(input.providerThreadId, 'thread-coordination-output-contract');
+      assert.match(input.prompt, /requires a concise text result/);
+      assert.doesNotMatch(input.prompt, /relay-finding|structured Finding/);
+      await observer.threadStarted('thread-coordination-output-contract');
+      await observer.turnStarted('turn-coordination-concise');
+      await observer.notification({
+        method: 'item/completed', providerEventId: 'coordination-concise:message',
+        item: {
+          id: 'coordination-concise-message', type: 'agentMessage',
+          text: 'The evidence supports a phased launch.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'coordination-concise:completed',
+        turn: { id: 'turn-coordination-concise', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, conciseProvider, {
+      workerId: 'worker-coordination-concise', workspaceRoot
+    });
+    const conciseResult = await pool.query<{
+      plan_status: string; step_status: string; result_message_id: string;
+      synthesis_message_id: string; synthesis: string; findings: number;
+    }>(
+      `SELECT plan.status AS plan_status, step.status AS step_status,
+              step.result_message_id, plan.synthesis_message_id,
+              synthesis.body AS synthesis,
+              (SELECT count(*)::integer FROM public.agent_finding finding
+               WHERE finding.result_message_id = step.result_message_id) AS findings
+       FROM public.coordination_plan plan
+       JOIN public.coordination_plan_step step ON step.plan_id = plan.id
+       JOIN public.message synthesis ON synthesis.id = plan.synthesis_message_id
+       WHERE plan.id = $1`,
+      [concisePlanId]
+    );
+    assert.match(conciseResult.rows[0]?.result_message_id ?? '', /^conversation-result:/u);
+    const { result_message_id: _resultMessageId, ...conciseOutcome } = conciseResult.rows[0]!;
+    assert.deepEqual({
+      ...conciseOutcome,
+      synthesis: conciseOutcome.synthesis.replace(
+        /#message-conversation-result%3A[^)]+/u,
+        '#message-conversation-result%3A<turn-id>'
+      )
+    }, {
+      plan_status: 'completed', step_status: 'completed',
+      synthesis_message_id: `coordination-synthesis:${concisePlanId}`,
+      synthesis: `Coordination synthesis: Summarize evidence
+
+Overall assessment: The evidence supports a phased launch.
+
+Supporting results:
+1. Alex — summary: The evidence supports a phased launch. [View result](#message-conversation-result%3A<turn-id>)`,
+      findings: 0
+    });
   });
 
   test('Research Agents preserve inaccessible cross-Project evidence as visible provenance', async () => {
@@ -2408,6 +3225,15 @@ if (skipDatabaseTests) {
       submissionId: 'structured-finding-request'
     });
     assert.equal(request.routingDecision?.intent, 'research_request');
+    await correctMessageIntent(pool, ids.ownerAccess, request.id, {
+      intent: 'research_request'
+    });
+    const researchTurn = await pool.query<{ id: string }>(
+      `SELECT id FROM public.agent_conversation_turn
+       WHERE request_message_id = $1 AND workspace_id = $2`,
+      [request.id, ids.workspaceId]
+    );
+    const researchTurnId = researchTurn.rows[0]?.id ?? '';
     await pool.query(
       `INSERT INTO public.project (id, workspace_id, name)
        VALUES ('project-structured-finding-other', $1, 'Other Project')`,
@@ -2427,8 +3253,12 @@ if (skipDatabaseTests) {
        )`,
       [ids.workspaceId, ids.pilotMemberId]
     );
-    const researchTurnId = request.agentMention?.status === 'conversation'
-      ? request.agentMention.conversationTurnId : '';
+    await pool.query(
+      `UPDATE public.agent
+       SET configuration_version = configuration_version + 1, agent_type = 'product'
+       WHERE id = $1`,
+      [researchAgentId]
+    );
     await pool.query(
       `UPDATE public.agent_conversation_turn
        SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
@@ -2461,15 +3291,35 @@ if (skipDatabaseTests) {
       conversationTurnId: researchTurnId,
       status: 'completed'
     });
-    const stored = await pool.query<{ findings: number; evidence: number; memory: number }>(
+    const stored = await pool.query<{
+      findings: number; evidence: number; memory: number; evaluation_events: number;
+      routing_policy_version: string; agent_configuration_version: string; agent_type: string;
+    }>(
       `SELECT
          (SELECT count(*)::integer FROM public.agent_finding WHERE project_id = $1) AS findings,
          (SELECT count(*)::integer FROM public.finding_evidence WHERE project_id = $1) AS evidence,
          (SELECT count(*)::integer FROM public.project_memory
-          WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory`,
+          WHERE project_id = $1 AND memory_type = 'finding' AND lifecycle = 'active') AS memory,
+         (SELECT count(*)::integer FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed') AS evaluation_events,
+         (SELECT routing_policy_version FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed' LIMIT 1) AS routing_policy_version,
+         (SELECT agent_configuration_version FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed' LIMIT 1) AS agent_configuration_version,
+         (SELECT agent_type FROM public.collaboration_evaluation_event
+          WHERE project_id = $1 AND outcome_type = 'finding'
+            AND event_type = 'outcome.completed' LIMIT 1) AS agent_type`,
       [ids.projectId]
     );
-    assert.deepEqual(stored.rows[0], { findings: 1, evidence: 2, memory: 1 });
+    assert.deepEqual(stored.rows[0], {
+      findings: 1, evidence: 2, memory: 1, evaluation_events: 1,
+      routing_policy_version: 'rules-v1',
+      agent_configuration_version: 'agent-config-1',
+      agent_type: 'research'
+    });
     const accountability = await loadCollaborationAccountability(
       pool, ids.ownerAccess, ids.projectId
     );
@@ -2485,6 +3335,468 @@ if (skipDatabaseTests) {
         claim: 'The other Project chose a phased release.',
         accessible: false
       }
+    );
+  });
+
+  test('Project memory is provenance-scoped, superseded, archived, deleted, and deterministically bounded', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'project-memory');
+    const otherWorkspace = await seedQueuedAgentRun(pool, 'project-memory-other-workspace');
+    await pool.query(`UPDATE public.agent_run SET available_at = 'infinity' WHERE id = $1`, [
+      otherWorkspace.runId
+    ]);
+    const sourceMessageId = 'message-project-memory';
+    const types: MemoryType[] = [
+      'decision', 'terminology', 'constraint', 'finding', 'convention', 'rejected_approach'
+    ];
+    const memoryIds = new Map<MemoryType, string>();
+
+    for (const type of types) {
+      memoryIds.set(type, await createProjectMemory(pool, ids.ownerAccess, {
+        projectId: ids.projectId,
+        type,
+        statement: `${type} statement`,
+        sourceReferences: [`message:${sourceMessageId}`]
+      }));
+    }
+
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ('project-memory-neighbour', $1, 'Neighbour Project')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.channel (id, workspace_id, project_id, name)
+       VALUES ('channel-project-memory-neighbour', $1, 'project-memory-neighbour', 'neighbour')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES (
+         'message-project-memory-neighbour', $1, 'channel-project-memory-neighbour', $2,
+         'A decision from another Project.'
+       )`,
+      [ids.workspaceId, ids.pilotMemberId]
+    );
+    await assert.rejects(
+      createProjectMemory(pool, ids.ownerAccess, {
+        projectId: ids.projectId,
+        type: 'decision',
+        statement: 'Cross-Project memory',
+        sourceReferences: ['message:message-project-memory-neighbour']
+      }),
+      /provenance is outside the Project/
+    );
+    await assert.rejects(
+      createProjectMemory(pool, ids.ownerAccess, {
+        projectId: ids.projectId,
+        type: 'constraint',
+        statement: 'Authorization: Bearer credential-that-must-not-be-stored',
+        sourceReferences: [`message:${sourceMessageId}`]
+      }),
+      /must not contain credentials or Provider traces/
+    );
+
+    const originalDecisionId = memoryIds.get('decision');
+    assert.ok(originalDecisionId);
+    const correctedDecisionId = await createProjectMemory(pool, ids.memberAccess, {
+      projectId: ids.projectId,
+      type: 'decision',
+      statement: 'corrected decision statement',
+      sourceReferences: [`message:${sourceMessageId}`],
+      supersedesId: originalDecisionId
+    });
+    await setProjectMemoryLifecycle(
+      pool, ids.memberAccess, memoryIds.get('convention')!, 'archived'
+    );
+    await setProjectMemoryLifecycle(
+      pool, ids.ownerAccess, memoryIds.get('constraint')!, 'deleted'
+    );
+
+    const visible = await loadCollaborationAccountability(pool, ids.ownerAccess, ids.projectId);
+    assert.deepEqual(
+      visible.memory.find(({ id }) => id === originalDecisionId)?.lifecycle,
+      'superseded'
+    );
+    assert.deepEqual(
+      visible.memory.find(({ id }) => id === correctedDecisionId)?.supersedesId,
+      originalDecisionId
+    );
+    assert.deepEqual(
+      visible.memory.find(({ id }) => id === memoryIds.get('constraint')),
+      {
+        id: memoryIds.get('constraint'),
+        type: 'constraint',
+        statement: '[deleted]',
+        sourceReferences: [],
+        lifecycle: 'deleted',
+        supersedesId: null,
+        authorName: 'Owner',
+        createdAt: visible.memory.find(({ id }) => id === memoryIds.get('constraint'))?.createdAt
+      }
+    );
+
+    assert.deepEqual(
+      (await loadProjectMemoryContext(pool, ids.ownerAccess, ids.projectId, 2))
+        .map(({ statement }) => statement),
+      ['rejected_approach statement', 'corrected decision statement']
+    );
+    assert.deepEqual(
+      await loadProjectMemoryContext(pool, otherWorkspace.ownerAccess, ids.projectId),
+      []
+    );
+    assert.deepEqual(
+      (await loadAgentProjectMemoryContext(pool, {
+        workspaceId: ids.workspaceId,
+        projectId: ids.projectId,
+        agentId: ids.agentId
+      }, 2)).map(({ statement }) => statement),
+      ['rejected_approach statement', 'corrected decision statement']
+    );
+
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /Active authorised Project memory/);
+      assert.match(input.prompt, /\[terminology\] terminology statement/);
+      assert.match(input.prompt, /\[finding\] finding statement/);
+      assert.match(input.prompt, /\[rejected_approach\] rejected_approach statement/);
+      assert.match(input.prompt, /\[decision\] corrected decision statement/);
+      assert.doesNotMatch(input.prompt, /\[decision\] decision statement/);
+      assert.doesNotMatch(input.prompt, /constraint statement|convention statement|Neighbour Project/);
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'project-memory:completed',
+        turn: { id: 'turn-project-memory', status: 'completed' }
+      });
+    });
+    assert.deepEqual(await processNextAgentRun(pool, provider, {
+      workerId: 'worker-project-memory', workspaceRoot
+    }), { kind: 'executed', agentRunId: ids.runId, status: 'completed' });
+
+    await pool.query(
+      `INSERT INTO public.agent (id, workspace_id, name, role_label)
+       VALUES ('agent-project-memory-source', $1, 'Riley', 'Research agent')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ('agent-member-project-memory-source', $1, 'agent', 'agent-project-memory-source')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, 'agent-member-project-memory-source')`,
+      [ids.workspaceId, ids.projectId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation (
+         id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+       ) VALUES (
+         'conversation-project-memory-provenance', $1, $2, $3, $4, $5
+       )`,
+      [ids.workspaceId, ids.channelId, sourceMessageId, ids.agentId, ids.providerConnectionId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, status
+       ) VALUES (
+         'turn-project-memory-provenance', $1, 'conversation-project-memory-provenance',
+         $2, $3, 'queued'
+       )`,
+      [ids.workspaceId, sourceMessageId, ids.pilotMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_handoff (
+         id, workspace_id, project_id, originating_pilot_member_id,
+         source_agent_id, target_agent_id, source_message_id, source_task_id,
+         receiving_turn_id, question
+       ) VALUES (
+         'handoff-project-memory-provenance', $1, $2, $3,
+         'agent-project-memory-source', $4, $5, 'task-project-memory',
+         'turn-project-memory-provenance', 'Confirm the durable outcome.'
+       )`,
+      [ids.workspaceId, ids.projectId, ids.pilotMemberId, ids.agentId, sourceMessageId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES (
+         'artifact-result-project-memory', $1, $2, $3, $4,
+         'Pull request #33 is ready for review.'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId, sourceMessageId]
+    );
+    await pool.query(
+      `INSERT INTO public.artifact (
+         id, workspace_id, project_id, task_id, agent_run_id, result_message_id,
+         kind, repository_id, branch, commit_sha, pull_request_number, url
+       ) VALUES (
+         'artifact-project-memory', $1, $2, 'task-project-memory', $3,
+         'artifact-result-project-memory', 'github_pull_request', $4,
+         'relay/project-memory', $5, 33, 'https://github.test/relay/pull/33'
+       )`,
+      [ids.workspaceId, ids.projectId, ids.runId, ids.linkedRepositoryId, 'a'.repeat(40)]
+    );
+    const multiSourceMemoryId = await createProjectMemory(pool, ids.ownerAccess, {
+      projectId: ids.projectId,
+      type: 'finding',
+      statement: 'All supported durable provenance resolves inside the Project.',
+      sourceReferences: [
+        'handoff:handoff-project-memory-provenance',
+        'task:task-project-memory',
+        `agent_run:${ids.runId}`,
+        'artifact:artifact-project-memory'
+      ]
+    });
+    assert.deepEqual(
+      (await loadCollaborationAccountability(pool, ids.ownerAccess, ids.projectId))
+        .memory.find(({ id }) => id === multiSourceMemoryId)?.sourceReferences,
+      [
+        'handoff:handoff-project-memory-provenance',
+        'task:task-project-memory',
+        `agent_run:${ids.runId}`,
+        'artifact:artifact-project-memory'
+      ]
+    );
+
+    await pool.query(
+      `DELETE FROM public.project_membership
+       WHERE project_id = $1 AND workspace_member_id = $2`,
+      [ids.projectId, ids.agentMemberId]
+    );
+    assert.deepEqual(await loadAgentProjectMemoryContext(pool, {
+      workspaceId: ids.workspaceId,
+      projectId: ids.projectId,
+      agentId: ids.agentId
+    }), []);
+  });
+
+  test('Agent inbox ignores stale AgentRun events and links durable waiting clarification state', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-clarification');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'waiting_for_input', provider_thread_id = 'thread-agent-inbox',
+           active_turn_id = 'turn-agent-inbox', updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id,
+         parent_message_id, body
+       ) VALUES (
+         'clarification-request-agent-inbox', $1, $2, $3, $4,
+         'Which deployment target should I use?'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run_clarification (
+         id, workspace_id, agent_run_id, provider_request_id, provider_turn_id,
+         provider_item_id, questions, request_message_id
+       ) VALUES (
+         'clarification-agent-inbox', $1, $2, 'request-agent-inbox',
+         'turn-agent-inbox', 'item-agent-inbox', '["Which target?"]',
+         'clarification-request-agent-inbox'
+       )`,
+      [ids.workspaceId, ids.runId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run_event (
+         workspace_id, agent_run_id, sequence, event_type, status, summary
+       ) VALUES ($1, $2, 2, 'provider.stale-retry', 'queued', 'Stale queued retry')`,
+      [ids.workspaceId, ids.runId]
+    );
+
+    const item = (await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    )).inbox.find(({ id }) => id === ids.runId);
+
+    assert.deepEqual(item, {
+      id: ids.runId,
+      agentId: ids.agentId,
+      agentName: 'Alex',
+      state: 'waiting',
+      kind: 'task',
+      sourceMessageId: ids.messageId,
+      relatedId: ids.taskId,
+      summary: '@Alex inspect the failing test.',
+      requiresHumanAction: true,
+      urgency: 'high',
+      links: {
+        messageId: ids.messageId,
+        taskId: ids.taskId,
+        agentRunId: ids.runId,
+        clarificationId: 'clarification-agent-inbox',
+        clarificationMessageId: 'clarification-request-agent-inbox',
+        approvalId: null,
+        approvalMessageId: null,
+        handoffId: null,
+        coordinationPlanId: null,
+        coordinationStepId: null,
+        resultMessageId: null,
+        artifactId: null,
+        artifactMessageId: null
+      }
+    });
+  });
+
+  test('Agent inbox collapses retries to the latest durable AgentRun', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-retry');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'failed', completed_at = now(), last_error_code = 'provider_failed',
+           updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    const retryRequestMessageId = 'message-agent-inbox-retry-2';
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, body
+       ) VALUES ($1, $2, $3, $4, '@Alex retry the failing test.')`,
+      [retryRequestMessageId, ids.workspaceId, ids.channelId, ids.pilotMemberId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_run (
+         id, workspace_id, task_id, agent_id, provider_connection_id,
+         linked_repository_id, attempt_number, status,
+         requested_by_workspace_member_id, request_message_id
+       )
+       SELECT 'run-agent-inbox-retry-2', workspace_id, task_id, agent_id,
+              provider_connection_id, linked_repository_id, 2, 'queued',
+              requested_by_workspace_member_id, $2
+       FROM public.agent_run WHERE id = $1`,
+      [ids.runId, retryRequestMessageId]
+    );
+
+    const taskItems = (await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    )).inbox.filter(({ kind }) => kind === 'task');
+
+    assert.equal(taskItems.length, 1);
+    assert.equal(taskItems[0]?.id, 'run-agent-inbox-retry-2');
+    assert.equal(taskItems[0]?.links.agentRunId, 'run-agent-inbox-retry-2');
+  });
+
+  test('disabled Agents retain review-ready history with Artifact provenance', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-review-ready');
+    await pool.query(
+      `UPDATE public.agent_run SET status = 'completed', completed_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    await pool.query(
+      `UPDATE public.task SET status = 'completed', updated_at = now() WHERE id = $1`,
+      [ids.taskId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES (
+         'artifact-result-agent-inbox', $1, $2, $3, $4,
+         'Pull request #34 is ready for review.'
+       )`,
+      [ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.artifact (
+         id, workspace_id, project_id, task_id, agent_run_id, result_message_id,
+         kind, repository_id, branch, commit_sha, pull_request_number, url
+       ) VALUES (
+         'artifact-agent-inbox', $1, $2, $3, $4, 'artifact-result-agent-inbox',
+         'github_pull_request', $5, 'relay/agent-inbox', $6, 34,
+         'https://github.test/relay/pull/34'
+       )`,
+      [
+        ids.workspaceId, ids.projectId, ids.taskId, ids.runId,
+        ids.linkedRepositoryId, 'b'.repeat(40)
+      ]
+    );
+    await pool.query(
+      `UPDATE public.agent SET enabled = false, status = 'disabled' WHERE id = $1`,
+      [ids.agentId]
+    );
+
+    const accountability = await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    );
+    const item = accountability.inbox.find(({ id }) => id === ids.runId);
+
+    assert.equal(item?.state, 'review_ready');
+    assert.equal(item?.links.artifactId, 'artifact-agent-inbox');
+    assert.equal(item?.links.artifactMessageId, 'artifact-result-agent-inbox');
+    assert.equal(item?.requiresHumanAction, true);
+    assert.equal(
+      accountability.capacity.find(({ agentId }) => agentId === ids.agentId)?.reason,
+      'disabled'
+    );
+  });
+
+  test('Agent capacity reflects Provider connection-wide durable work instead of presence status', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-capacity');
+    await pool.query(
+      `INSERT INTO public.agent (id, workspace_id, name, role_label)
+       VALUES ('agent-inbox-capacity-riley', $1, 'Riley', 'Research agent')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.workspace_member (id, workspace_id, kind, agent_id)
+       VALUES ('agent-inbox-capacity-riley-member', $1, 'agent', 'agent-inbox-capacity-riley')`,
+      [ids.workspaceId]
+    );
+    await pool.query(
+      `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
+       VALUES ($1, $2, 'agent-inbox-capacity-riley-member')`,
+      [ids.workspaceId, ids.projectId]
+    );
+
+    const capacity = (await loadCollaborationAccountability(
+      pool, ids.ownerAccess, ids.projectId
+    )).capacity;
+
+    assert.deepEqual(capacity.find(({ agentId }) => agentId === ids.agentId), {
+      agentId: ids.agentId,
+      activeWork: 1,
+      providerConnectionActiveWork: 1,
+      inboxCounts: {
+        total: 1, queued: 1, active: 0, waiting: 0,
+        blocked: 0, review_ready: 0, completed: 0
+      },
+      available: false,
+      reason: 'occupied'
+    });
+    assert.deepEqual(capacity.find(({ agentId }) => agentId === 'agent-inbox-capacity-riley'), {
+      agentId: 'agent-inbox-capacity-riley',
+      activeWork: 0,
+      providerConnectionActiveWork: 1,
+      inboxCounts: {
+        total: 0, queued: 0, active: 0, waiting: 0,
+        blocked: 0, review_ready: 0, completed: 0
+      },
+      available: false,
+      reason: 'provider_connection_occupied'
+    });
+  });
+
+  test('Agent inbox rejects revoked and nonmember Project access', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'agent-inbox-authorization');
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ('agent-inbox-private-project', $1, 'Private Project')`,
+      [ids.workspaceId]
+    );
+    await assert.rejects(
+      loadCollaborationAccountability(pool, ids.memberAccess, 'agent-inbox-private-project'),
+      /active Project membership is required/
+    );
+
+    await pool.query(
+      `UPDATE public.workspace_membership SET revoked_at = now() WHERE id = $1`,
+      [ids.memberAccess.membership.id]
+    );
+    await assert.rejects(
+      loadCollaborationAccountability(pool, ids.memberAccess, ids.projectId),
+      /active Project membership is required/
     );
   });
 }
@@ -2694,6 +4006,8 @@ async function seedQueuedAgentRun(pool: Pool, suffix: string) {
 
   return {
     runId,
+    taskId,
+    messageId,
     providerConnectionId: effectiveProviderConnectionId,
     workspaceId,
     projectId,

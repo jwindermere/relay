@@ -206,6 +206,27 @@ export async function loadLinkedRepository(
   );
 }
 
+export async function hasActiveLinkedRepositoryForProject(
+  pool: Pick<Pool, 'query'>,
+  workspaceId: string,
+  projectId: string
+): Promise<boolean> {
+  const result = await pool.query<{ available: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM public.linked_repository repository
+       JOIN public.github_connection connection
+         ON connection.id = repository.github_connection_id
+         AND connection.workspace_id = repository.workspace_id
+       WHERE repository.workspace_id = $1
+         AND repository.project_id = $2
+         AND connection.status = 'active'
+     ) AS available`,
+    [workspaceId, projectId]
+  );
+  return result.rows[0]?.available === true;
+}
+
 export async function linkGitHubRepository(
   pool: Pool,
   access: WorkspaceAccess,
