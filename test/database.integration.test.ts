@@ -147,11 +147,14 @@ if (connectionString) {
       sendVerificationEmail
     });
   };
-  after(async () => {
-    await Promise.all(authPools.map((authPool) => authPool.end()));
-    await pool.end();
-    await container?.stop();
-  });
+  after(
+    async () => {
+      await Promise.all(authPools.map((authPool) => authPool.end()));
+      await pool.end();
+      await container?.stop();
+    },
+    { timeout: 10_000 }
+  );
 
   test('migrations isolate Relay domain data in public and authentication data in auth', async () => {
     await migrateDatabase(pool);
