@@ -3143,9 +3143,10 @@ if (skipDatabaseTests) {
     });
     await decideCoordinationPlan(pool, ids.ownerAccess, concisePlanId, 'approve');
     const conciseProvider = new FixtureProvider(async (input, observer) => {
+      assert.equal(input.providerThreadId, 'thread-coordination-output-contract');
       assert.match(input.prompt, /requires a concise text result/);
       assert.doesNotMatch(input.prompt, /relay-finding|structured Finding/);
-      await observer.threadStarted('thread-coordination-concise');
+      await observer.threadStarted('thread-coordination-output-contract');
       await observer.turnStarted('turn-coordination-concise');
       await observer.notification({
         method: 'item/completed', providerEventId: 'coordination-concise:message',
