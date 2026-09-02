@@ -64,6 +64,7 @@ interface ClaimedConversationTurn {
   recovering: boolean;
   routing_intent: string | null;
   routing_policy_version: string | null;
+  coordination_expected_output: 'concise_text' | 'structured_finding' | 'artifact' | null;
   agent_configuration_version: number;
   agent_type_snapshot: string;
   eligible: boolean;
@@ -72,6 +73,14 @@ interface ClaimedConversationTurn {
 export type ConversationWorkerResult =
   | { kind: 'idle' }
   | { kind: 'conversation'; conversationTurnId: string; status: 'completed' | 'failed' };
+
+function requiresStructuredFinding(claim: ClaimedConversationTurn): boolean {
+  if (claim.coordination_expected_output !== null) {
+    return claim.coordination_expected_output === 'structured_finding';
+  }
+  return claim.agent_type_snapshot === 'research'
+    || claim.template_expected_result_shapes.includes('structured_finding');
+}
 
 export async function processNextConversationTurn(
   pool: Pool,
@@ -124,6 +133,7 @@ export async function processNextConversationTurn(
 
   try {
     const channelMemory = await loadConversationMemory(pool, claim);
+    const structuredFindingRequired = requiresStructuredFinding(claim);
     const templateBounds = renderAgentTemplateExecutionBounds({
       expectedResultShapes: claim.template_expected_result_shapes,
       nonResponsibilities: claim.template_non_responsibilities,
@@ -152,10 +162,14 @@ export async function processNextConversationTurn(
         claim.routing_intent === 'coordination_candidate' && claim.handoff_depth === 0
           ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Do not start plan work; a Pilot member must approve it.'
           : '',
-        claim.agent_type === 'research'
-          && !claim.template_expected_result_shapes.includes('structured_finding')
+        structuredFindingRequired && claim.coordination_expected_output === null
           ? 'Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'
           : '',
+        claim.coordination_expected_output === 'structured_finding'
+          ? 'This approved Coordination step requires a structured Finding. Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'
+          : claim.coordination_expected_output === 'concise_text'
+            ? 'This approved Coordination step requires a concise text result.'
+            : '',
         'Do not repeat an answer already present in the recent context.',
         'Do not inspect files, run commands, modify a repository, or use tools.',
         'If the request is ambiguous, ask a concise conversational follow-up question.',
@@ -282,6 +296,7 @@ async function claimNextConversationTurn(
               turn.agent_configuration_version, turn.agent_type_snapshot,
               COALESCE(decision.corrected_intent, decision.selected_intent) AS routing_intent,
               decision.policy_version AS routing_policy_version,
+              coordination_step.expected_output AS coordination_expected_output,
               conversation.provider_thread_id, connection.id AS provider_connection_id,
               connection.credential_store_reference,
               agent.enabled AND agent.status <> 'disabled' AND EXISTS (
@@ -304,6 +319,9 @@ async function claimNextConversationTurn(
        LEFT JOIN public.agent_handoff handoff
          ON handoff.receiving_turn_id = turn.id
         AND handoff.workspace_id = turn.workspace_id
+       LEFT JOIN public.coordination_plan_step coordination_step
+         ON coordination_step.conversation_turn_id = turn.id
+        AND coordination_step.workspace_id = turn.workspace_id
        WHERE (
            (turn.status = 'queued' AND turn.available_at <= $1 AND turn.lease_expires_at IS NULL)
            OR (turn.status = 'working' AND turn.lease_expires_at <= $1)
@@ -489,10 +507,7 @@ async function finishConversationTurn(
     && claim.handoff_depth === 0) {
     try { proposal = parseCoordinationPlanProposal(body); } catch { proposal = null; }
   }
-  if (body !== null && status === 'completed' && (
-    claim.agent_type === 'research'
-    || claim.template_expected_result_shapes.includes('structured_finding')
-  )) {
+  if (body !== null && status === 'completed' && requiresStructuredFinding(claim)) {
     try { findingResult = parseFindingResult(body); } catch { findingResult = null; }
   }
   const visibleBody = proposal?.message || findingResult?.message || body;

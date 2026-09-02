@@ -2,6 +2,7 @@
   import { enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { onMount } from 'svelte';
+  import { canResumeCoordinationPlan } from '$lib/coordination-presentation.js';
   import BrandMark from '$lib/BrandMark.svelte';
   import JitsiCall from '$lib/JitsiCall.svelte';
   import MarkdownMessage from '$lib/MarkdownMessage.svelte';
@@ -1155,7 +1156,11 @@
         </div>
       {:else if plan.status === 'paused'}
         <div class="mt-2 flex gap-2">
-          {#if plan.budget.state !== 'exhausted'}
+          {#if canResumeCoordinationPlan({
+            status: plan.status,
+            budgetState: plan.budget.state,
+            stepStatuses: plan.steps.map((step) => step.status)
+          })}
             <button class="btn btn-primary btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'resume')}>Resume approved plan</button>
           {/if}
           <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>

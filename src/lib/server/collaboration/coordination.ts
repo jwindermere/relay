@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import { renderCoordinationSynthesis } from '../../coordination-presentation.js';
 import { recordCollaborationEvaluationEvent } from './evaluation.js';
 
 export interface CoordinationBudget {
@@ -150,7 +151,7 @@ export function reserveCoordinationBudget(
   return { consumed, remaining: budget.limit - consumed };
 }
 
-export function resolveCoordinationStepStatus(input: {
+function resolveCoordinationStepStatus(input: {
   providerStatus: 'completed' | 'failed';
   expectedOutput: CoordinationOutputType;
   hasResultMessage: boolean;
@@ -162,47 +163,6 @@ export function resolveCoordinationStepStatus(input: {
     return 'failed';
   }
   return 'completed';
-}
-
-export interface CoordinationSynthesisStep {
-  key: string;
-  agentName: string;
-  instruction: string;
-  summary: string | null;
-  resultMessageId: string | null;
-  artifactId: string | null;
-  artifactUrl: string | null;
-  artifactResultMessageId: string | null;
-}
-
-function synthesisText(value: string): string {
-  return value.replace(/\s+/gu, ' ').trim().slice(0, 1000).replace(/[\\[\]*_`]/gu, '\\$&');
-}
-
-function channelMessageLink(messageId: string, label: string): string {
-  return `[${label}](#message-${encodeURIComponent(messageId)})`;
-}
-
-export function renderCoordinationSynthesis(
-  goal: string,
-  steps: CoordinationSynthesisStep[]
-): string {
-  const lines = steps.map((step, index) => {
-    const prefix = `${index + 1}. ${synthesisText(step.agentName)} — ${synthesisText(step.key)}:`;
-    if (step.artifactId && step.artifactUrl) {
-      const artifact = `Existing Artifact [${synthesisText(step.artifactId)}](${step.artifactUrl})`;
-      const channelRecord = step.artifactResultMessageId
-        ? ` (${channelMessageLink(step.artifactResultMessageId, 'Channel record')})`
-        : '';
-      return `${prefix} ${artifact}${channelRecord}`;
-    }
-    const summary = synthesisText(step.summary || step.instruction);
-    const result = step.resultMessageId
-      ? ` ${channelMessageLink(step.resultMessageId, 'View result')}`
-      : '';
-    return `${prefix} ${summary}${result}`;
-  });
-  return `Coordination complete: ${synthesisText(goal)}\n\n${lines.join('\n')}`;
 }
 
 export async function updateWorkspaceCoordinationPolicy(
@@ -415,6 +375,7 @@ async function assertCoordinationPlanCanActivate(
 ): Promise<void> {
   const validation = await client.query<{
     allowed: boolean; budget_stop_reason: CoordinationBudgetStopReason | null;
+    has_failed_steps: boolean;
   }>(
     `SELECT (
        provider.status = 'ready'
@@ -469,7 +430,11 @@ async function assertCoordinationPlanCanActivate(
          WHERE step.plan_id = plan.id AND step.artifact_id IS NOT NULL
            AND step.status <> 'completed' AND artifact.id IS NULL
        )
-     ) AS allowed, plan.budget_stop_reason
+     ) AS allowed, plan.budget_stop_reason,
+     EXISTS (
+       SELECT 1 FROM public.coordination_plan_step step
+       WHERE step.plan_id = plan.id AND step.status = 'failed'
+     ) AS has_failed_steps
      FROM public.coordination_plan plan
      JOIN public.workspace_coordination_policy policy ON policy.workspace_id = plan.workspace_id
      JOIN public.provider_connection provider ON provider.workspace_id = plan.workspace_id
@@ -481,18 +446,37 @@ async function assertCoordinationPlanCanActivate(
   if (resuming && result?.budget_stop_reason) {
     throw new CoordinationError('Coordination plan cannot resume after a hard budget stop');
   }
+  if (resuming && result?.has_failed_steps) {
+    throw new CoordinationError('Coordination plan cannot resume with failed steps');
+  }
   if (!result?.allowed) {
     throw new CoordinationError('Coordination plan exceeds current Workspace or Provider limits');
   }
 }
 
+type CoordinationPlanDecision = 'approve' | 'reject' | 'pause' | 'resume' | 'cancel';
+
+const COORDINATION_PLAN_TRANSITIONS = {
+  approve: { allowedCurrent: ['proposed'], nextStatus: 'approved', validates: true, approves: true },
+  reject: { allowedCurrent: ['proposed'], nextStatus: 'rejected', validates: false, approves: false },
+  pause: { allowedCurrent: ['approved', 'active', 'paused'], nextStatus: 'paused', validates: false, approves: false },
+  resume: { allowedCurrent: ['paused'], nextStatus: null, validates: true, approves: true },
+  cancel: { allowedCurrent: ['approved', 'active', 'paused'], nextStatus: 'cancelled', validates: false, approves: false }
+} as const satisfies Record<CoordinationPlanDecision, {
+  allowedCurrent: readonly string[];
+  nextStatus: string | null;
+  validates: boolean;
+  approves: boolean;
+}>;
+
 export async function decideCoordinationPlan(
   pool: Pool,
   access: WorkspaceAccess,
   planId: string,
-  action: 'approve' | 'reject' | 'pause' | 'resume' | 'cancel'
+  action: CoordinationPlanDecision
 ): Promise<void> {
-  if (!['approve', 'reject', 'pause', 'resume', 'cancel'].includes(action)) {
+  const transition = COORDINATION_PLAN_TRANSITIONS[action];
+  if (!transition) {
     throw new CoordinationError('Coordination plan decision is invalid');
   }
   const client = await pool.connect();
@@ -508,7 +492,7 @@ export async function decideCoordinationPlan(
       [access.workspace.id, access.membership.id, planId]
     );
     if (!actor.rows[0]) throw new CoordinationError('active Pilot membership is required');
-    if (action === 'approve' || action === 'resume') {
+    if (transition.validates) {
       await assertCoordinationPlanCanActivate(
         client, access.workspace.id, planId, action === 'resume'
       );
@@ -522,13 +506,7 @@ export async function decideCoordinationPlan(
           [planId]
         )).rows[0]?.active ? 'active' : 'approved'
       : null;
-    const nextStatus = action === 'approve' ? 'approved'
-      : action === 'reject' ? 'rejected'
-        : action === 'pause' ? 'paused'
-          : action === 'resume' ? resumedStatus!
-            : 'cancelled';
-    const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed']
-      : action === 'resume' ? ['paused'] : ['approved', 'active', 'paused'];
+    const nextStatus = transition.nextStatus ?? resumedStatus!;
     const updated = await client.query<{
       project_id: string; coordinating_agent_id: string; routing_policy_version: string;
       agent_configuration_version: number;
@@ -542,8 +520,8 @@ export async function decideCoordinationPlan(
        WHERE id = $1 AND workspace_id = $2 AND status = ANY($5::text[])
        RETURNING project_id, coordinating_agent_id, routing_policy_version,
          agent_configuration_version, agent_type_snapshot`,
-      [planId, access.workspace.id, actor.rows[0].id, nextStatus, allowedCurrent,
-        action === 'approve' || action === 'resume']
+      [planId, access.workspace.id, actor.rows[0].id, nextStatus,
+        [...transition.allowedCurrent], transition.approves]
     );
     if (updated.rowCount !== 1) throw new CoordinationError('Coordination plan cannot accept that decision');
     if (action === 'resume') {

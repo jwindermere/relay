@@ -2807,6 +2807,90 @@ if (skipDatabaseTests) {
     }]);
   });
 
+  test('Coordination workers enforce the approved structured Finding output', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-output-contract');
+    await pool.query(
+      `UPDATE public.agent_run
+       SET status = 'failed', completed_at = now(), last_error_code = 'test_setup'
+       WHERE id = $1`,
+      [ids.runId]
+    );
+    const conversationId = 'conversation-coordination-output-contract';
+    const sourceMessageId = 'message-coordination-output-contract';
+    await pool.query(
+      `INSERT INTO public.agent_conversation (
+         id, workspace_id, channel_id, root_message_id, agent_id, provider_connection_id
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [conversationId, ids.workspaceId, ids.channelId, ids.messageId,
+        ids.agentId, ids.providerConnectionId]
+    );
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES ($1, $2, $3, $4, $5, 'I propose a structured evidence review.')`,
+      [sourceMessageId, ids.workspaceId, ids.channelId, ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, response_message_id, status,
+         response_placement, response_parent_message_id, completed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      ['turn-coordination-output-source', ids.workspaceId, conversationId,
+        ids.messageId, ids.pilotMemberId, sourceMessageId]
+    );
+    const planId = await proposeCoordinationPlan(pool, {
+      workspaceId: ids.workspaceId, projectId: ids.projectId,
+      coordinatingAgentId: ids.agentId, sourceMessageId,
+      routingPolicyVersion: 'message-intent-v1', agentConfigurationVersion: 1,
+      agentType: 'engineering', goal: 'Assess evidence', allowParallel: false,
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600
+      },
+      steps: [{
+        key: 'evidence', agentId: ids.agentId, instruction: 'Assess the evidence',
+        dependencies: [], expectedOutput: 'structured_finding'
+      }]
+    });
+    await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
+    const provider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /requires a structured Finding/);
+      await observer.threadStarted('thread-coordination-output-contract');
+      await observer.turnStarted('turn-coordination-output-contract');
+      await observer.notification({
+        method: 'item/completed', providerEventId: 'coordination-output-contract:message',
+        item: { id: 'coordination-output-message', type: 'agentMessage', text: 'Plain output.' }
+      });
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'coordination-output-contract:completed',
+        turn: { id: 'turn-coordination-output-contract', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, provider, {
+      workerId: 'worker-coordination-output-contract', workspaceRoot
+    });
+    const stored = await pool.query<{
+      plan_status: string; step_status: string; body: string; findings: number;
+    }>(
+      `SELECT plan.status AS plan_status, step.status AS step_status, result.body,
+              (SELECT count(*)::integer FROM public.agent_finding finding
+               WHERE finding.result_message_id = result.id) AS findings
+       FROM public.coordination_plan plan
+       JOIN public.coordination_plan_step step ON step.plan_id = plan.id
+       JOIN public.message result ON result.id = step.result_message_id
+       WHERE plan.id = $1`,
+      [planId]
+    );
+    assert.deepEqual(stored.rows[0], {
+      plan_status: 'paused', step_status: 'failed', body: 'Plain output.', findings: 0
+    });
+    await assert.rejects(
+      decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume'),
+      /cannot resume with failed steps/
+    );
+  });
+
   test('Research Agents preserve inaccessible cross-Project evidence as visible provenance', async () => {
     const ids = await seedQueuedAgentRun(pool, 'structured-finding');
     const researchAgentId = 'research-structured-finding';
