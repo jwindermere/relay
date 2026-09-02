@@ -2889,6 +2889,97 @@ if (skipDatabaseTests) {
       decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume'),
       /cannot resume with failed steps/
     );
+
+    await pool.query(
+      `UPDATE public.agent SET agent_type = 'research' WHERE id = $1`,
+      [ids.agentId]
+    );
+    const conciseSourceMessageId = 'message-coordination-concise-source';
+    await pool.query(
+      `INSERT INTO public.message (
+         id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+       ) VALUES ($1, $2, $3, $4, $5, 'I propose a concise review.')`,
+      [conciseSourceMessageId, ids.workspaceId, ids.channelId,
+        ids.agentMemberId, ids.messageId]
+    );
+    await pool.query(
+      `INSERT INTO public.agent_conversation_turn (
+         id, workspace_id, conversation_id, request_message_id,
+         requested_by_workspace_member_id, response_message_id, status,
+         response_placement, response_parent_message_id, completed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      ['turn-coordination-concise-source', ids.workspaceId, conversationId,
+        ids.messageId, ids.pilotMemberId, conciseSourceMessageId]
+    );
+    const concisePlanId = await proposeCoordinationPlan(pool, {
+      workspaceId: ids.workspaceId, projectId: ids.projectId,
+      coordinatingAgentId: ids.agentId, sourceMessageId: conciseSourceMessageId,
+      routingPolicyVersion: 'message-intent-v1', agentConfigurationVersion: 1,
+      agentType: 'research', goal: 'Summarize evidence', allowParallel: false,
+      budget: {
+        maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+        maxAgentRuns: 0, maxElapsedSeconds: 600
+      },
+      steps: [{
+        key: 'summary', agentId: ids.agentId, instruction: 'Summarize the evidence',
+        dependencies: [], expectedOutput: 'concise_text'
+      }]
+    });
+    await decideCoordinationPlan(pool, ids.ownerAccess, concisePlanId, 'approve');
+    const conciseProvider = new FixtureProvider(async (input, observer) => {
+      assert.match(input.prompt, /requires a concise text result/);
+      assert.doesNotMatch(input.prompt, /relay-finding|structured Finding/);
+      await observer.threadStarted('thread-coordination-concise');
+      await observer.turnStarted('turn-coordination-concise');
+      await observer.notification({
+        method: 'item/completed', providerEventId: 'coordination-concise:message',
+        item: {
+          id: 'coordination-concise-message', type: 'agentMessage',
+          text: 'The evidence supports a phased launch.'
+        }
+      });
+      await observer.notification({
+        method: 'turn/completed', providerEventId: 'coordination-concise:completed',
+        turn: { id: 'turn-coordination-concise', status: 'completed' }
+      });
+    });
+    await processNextConversationTurn(pool, conciseProvider, {
+      workerId: 'worker-coordination-concise', workspaceRoot
+    });
+    const conciseResult = await pool.query<{
+      plan_status: string; step_status: string; result_message_id: string;
+      synthesis_message_id: string; synthesis: string; findings: number;
+    }>(
+      `SELECT plan.status AS plan_status, step.status AS step_status,
+              step.result_message_id, plan.synthesis_message_id,
+              synthesis.body AS synthesis,
+              (SELECT count(*)::integer FROM public.agent_finding finding
+               WHERE finding.result_message_id = step.result_message_id) AS findings
+       FROM public.coordination_plan plan
+       JOIN public.coordination_plan_step step ON step.plan_id = plan.id
+       JOIN public.message synthesis ON synthesis.id = plan.synthesis_message_id
+       WHERE plan.id = $1`,
+      [concisePlanId]
+    );
+    assert.match(conciseResult.rows[0]?.result_message_id ?? '', /^conversation-result:/u);
+    const { result_message_id: _resultMessageId, ...conciseOutcome } = conciseResult.rows[0]!;
+    assert.deepEqual({
+      ...conciseOutcome,
+      synthesis: conciseOutcome.synthesis.replace(
+        /#message-conversation-result%3A[^)]+/u,
+        '#message-conversation-result%3A<turn-id>'
+      )
+    }, {
+      plan_status: 'completed', step_status: 'completed',
+      synthesis_message_id: `coordination-synthesis:${concisePlanId}`,
+      synthesis: `Coordination synthesis: Summarize evidence
+
+Overall assessment: The evidence supports a phased launch.
+
+Supporting results:
+1. Alex — summary: The evidence supports a phased launch. [View result](#message-conversation-result%3A<turn-id>)`,
+      findings: 0
+    });
   });
 
   test('Research Agents preserve inaccessible cross-Project evidence as visible provenance', async () => {

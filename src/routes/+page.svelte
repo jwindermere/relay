@@ -1,7 +1,7 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { canResumeCoordinationPlan } from '$lib/coordination-presentation.js';
   import BrandMark from '$lib/BrandMark.svelte';
   import JitsiCall from '$lib/JitsiCall.svelte';
@@ -166,6 +166,24 @@
     openThreadIds = openThreadIds.includes(messageId)
       ? openThreadIds.filter((id) => id !== messageId)
       : [...openThreadIds, messageId];
+  }
+
+  async function revealLinkedMessage(): Promise<void> {
+    const prefix = '#message-';
+    if (!window.location.hash.startsWith(prefix)) return;
+    let messageId: string;
+    try {
+      messageId = decodeURIComponent(window.location.hash.slice(prefix.length));
+    } catch {
+      return;
+    }
+    const message = channelMessages.find(({ id }) => id === messageId);
+    if (!message) return;
+    if (message.parentMessageId && !openThreadIds.includes(message.parentMessageId)) {
+      openThreadIds = [...openThreadIds, message.parentMessageId];
+    }
+    await tick();
+    document.getElementById(`message-${messageId}`)?.scrollIntoView({ block: 'center' });
   }
 
   function formatTime(timestamp: string) {
@@ -555,6 +573,7 @@
     };
     window.addEventListener('focus', wake);
     window.addEventListener('pageshow', wake);
+    window.addEventListener('hashchange', revealLinkedMessage);
     document.addEventListener('visibilitychange', visibilityWake);
     const typingExpiryTimer = setInterval(() => {
       const now = Date.now();
@@ -564,6 +583,7 @@
       if (Object.keys(active).length !== Object.keys(humanTypers).length) humanTypers = active;
     }, 1_000);
     void connect();
+    void revealLinkedMessage();
 
     return () => {
       stopped = true;
@@ -573,6 +593,7 @@
       realtimeSocket?.close();
       window.removeEventListener('focus', wake);
       window.removeEventListener('pageshow', wake);
+      window.removeEventListener('hashchange', revealLinkedMessage);
       document.removeEventListener('visibilitychange', visibilityWake);
     };
   });
@@ -1604,7 +1625,7 @@
                         <span>{formatDateDivider(reply.createdAt)}</span>
                       </div>
                     {/if}
-                    <div class="message-row relative flex gap-3 py-1 pr-10">
+                    <div id={`message-${reply.id}`} class="message-row relative flex gap-3 py-1 pr-10">
                       <div class="message-actions" aria-label="Message actions">
                         <button
                           class="message-action"

@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 
+import type {
+  CoordinationPlanStatus,
+  CoordinationStepStatus
+} from '../../coordination-presentation.js';
+
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 
 export class AccountabilityError extends Error {
@@ -219,7 +224,7 @@ interface VisibleCoordinationStep {
   instruction: string;
   dependencies: string[];
   expectedOutput: 'concise_text' | 'structured_finding' | 'artifact';
-  status: string;
+  status: CoordinationStepStatus;
   resultMessageId: string | null;
   artifactId: string | null;
 }
@@ -276,7 +281,7 @@ export async function loadCollaborationAccountability(
       [access.workspace.id, projectId]
     ),
     pool.query<{
-      id: string; source_message_id: string; goal: string; constraints: string[]; status: string; allow_parallel: boolean;
+      id: string; source_message_id: string; goal: string; constraints: string[]; status: CoordinationPlanStatus; allow_parallel: boolean;
       max_participants: number; max_handoffs: number; max_depth: number; max_agent_runs: number;
       max_elapsed_seconds: number; provider_usage_limit: string | null;
       provider_usage_consumed: string | null; provider_usage_known: boolean;

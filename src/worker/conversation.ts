@@ -135,7 +135,9 @@ export async function processNextConversationTurn(
     const channelMemory = await loadConversationMemory(pool, claim);
     const structuredFindingRequired = requiresStructuredFinding(claim);
     const templateBounds = renderAgentTemplateExecutionBounds({
-      expectedResultShapes: claim.template_expected_result_shapes,
+      expectedResultShapes: claim.coordination_expected_output === null
+        ? claim.template_expected_result_shapes
+        : [],
       nonResponsibilities: claim.template_non_responsibilities,
       staySilentWhen: claim.template_stay_silent_when,
       disabledCapabilities: claim.disabled_capabilities,

@@ -9,10 +9,20 @@ export interface CoordinationSynthesisStep {
   artifactResultMessageId: string | null;
 }
 
+export type CoordinationPlanStatus =
+  | 'proposed' | 'approved' | 'active' | 'paused'
+  | 'completed' | 'rejected' | 'cancelled' | 'failed';
+
+export type CoordinationStepStatus =
+  | 'pending' | 'ready' | 'active' | 'completed'
+  | 'blocked' | 'cancelled' | 'failed';
+
+export type CoordinationBudgetState = 'available' | 'approaching' | 'exhausted';
+
 export interface CoordinationPlanResumeState {
-  status: string;
-  budgetState: string;
-  stepStatuses: string[];
+  status: CoordinationPlanStatus;
+  budgetState: CoordinationBudgetState;
+  stepStatuses: CoordinationStepStatus[];
 }
 
 function synthesisText(value: string): string {
@@ -27,8 +37,12 @@ export function renderCoordinationSynthesis(
   goal: string,
   steps: CoordinationSynthesisStep[]
 ): string {
-  const assessments = steps
-    .map((step) => synthesisText(step.summary || step.instruction))
+  const resultSummaries = steps
+    .map((step) => step.summary
+      ? synthesisText(step.summary)
+      : step.artifactId
+        ? `Review existing Artifact ${synthesisText(step.artifactId)}.`
+        : '')
     .filter(Boolean);
   const lines = steps.map((step, index) => {
     const prefix = `${index + 1}. ${synthesisText(step.agentName)} — ${synthesisText(step.key)}:`;
@@ -45,9 +59,9 @@ export function renderCoordinationSynthesis(
       : '';
     return `${prefix} ${summary}${result}`;
   });
-  const overallAssessment = assessments.length === 0
+  const overallAssessment = resultSummaries.length === 0
     ? 'No substantive result was recorded.'
-    : assessments.join(' ');
+    : resultSummaries.join(' ');
   return `Coordination synthesis: ${synthesisText(goal)}\n\nOverall assessment: ${overallAssessment}\n\nSupporting results:\n${lines.join('\n')}`;
 }
 

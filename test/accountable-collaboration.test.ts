@@ -199,7 +199,7 @@ test('coordination synthesis summarizes and links every approved step output', (
   }]);
   assert.equal(synthesis, `Coordination synthesis: Assess launch readiness
 
-Overall assessment: Release evidence supports a phased launch. Review the existing pull request
+Overall assessment: Release evidence supports a phased launch. Review existing Artifact artifact-7.
 
 Supporting results:
 1. Riley — research: Release evidence supports a phased launch. [View result](#message-result%3Aresearch)
