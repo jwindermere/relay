@@ -3,7 +3,10 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { createDatabasePool } from '../lib/server/database/pool.js';
-import { loadFileBackedEnvironment } from '../lib/server/configuration.js';
+import {
+  getInvitationDeliveryMode,
+  loadFileBackedEnvironment
+} from '../lib/server/configuration.js';
 import { getAuthDatabasePool, getRelayAuth } from '../lib/server/auth.js';
 import { formatError } from '../lib/server/errors.js';
 import { attachAuthenticatedRealtime } from '../lib/server/realtime.js';
@@ -18,6 +21,7 @@ await loadFileBackedEnvironment([
   'RELAY_GITHUB_PRIVATE_KEY',
   'RELAY_GITHUB_WEBHOOK_SECRET'
 ]);
+getInvitationDeliveryMode();
 const pool = createDatabasePool();
 
 try {

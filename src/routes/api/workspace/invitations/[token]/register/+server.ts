@@ -19,7 +19,12 @@ export async function POST({ params, request }) {
         password: typeof input.password === 'string' ? input.password : ''
       }
     );
-    return json({ account: { email: account.email } }, { status: 201 });
+    return json({
+      account: {
+        email: account.email,
+        verificationRequired: account.verificationRequired
+      }
+    }, { status: 201 });
   } catch (error) {
     if (error instanceof WorkspaceInvitationError || error instanceof SyntaxError) {
       return json(

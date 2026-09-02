@@ -7,9 +7,19 @@ import { test } from 'node:test';
 import {
   buildJitsiMeetingUrl,
   getJitsiBaseUrl,
+  getInvitationDeliveryMode,
   isJitsiEmbeddingEnabled,
   loadFileBackedEnvironment
 } from '../src/lib/server/configuration.js';
+
+test('email delivery remains the invitation default and manual delivery is explicit', () => {
+  assert.equal(getInvitationDeliveryMode({}), 'email');
+  assert.equal(getInvitationDeliveryMode({ RELAY_INVITATION_DELIVERY_MODE: 'manual' }), 'manual');
+  assert.throws(
+    () => getInvitationDeliveryMode({ RELAY_INVITATION_DELIVERY_MODE: 'disabled' }),
+    /must be email or manual/
+  );
+});
 
 test('service secrets load from independently mounted files without retaining file variables', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-secret-config-'));

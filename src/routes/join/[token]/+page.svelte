@@ -20,7 +20,9 @@
       const result = await response.json();
       if (!response.ok) throw new Error(result.message ?? 'Registration failed');
       registered = true;
-      message = `Check ${result.account.email} for the verification link, then sign in and return to this invitation.`;
+      message = result.account.verificationRequired
+        ? `Check ${result.account.email} for the verification link, then sign in and return to this invitation.`
+        : 'Account created. Sign in, then return to this invitation to accept it.';
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     } finally {
@@ -56,7 +58,7 @@
     <BrandMark />
     <div class="eyebrow mt-10">Workspace invitation</div>
     <h1 class="font-display mt-2 text-3xl font-medium tracking-[-0.04em] text-white">Join the conversation</h1>
-    <p class="mt-3 text-sm leading-6 text-base-content/50">Create your account, verify your email, then accept this invitation. Already registered and verified? Accept it now.</p>
+    <p class="mt-3 text-sm leading-6 text-base-content/50">Create your account, then sign in and accept this invitation. If this Relay requires email verification, check your inbox before signing in.</p>
 
     {#if !registered}
       <form class="mt-7 space-y-3" onsubmit={(event) => { event.preventDefault(); void register(); }}>

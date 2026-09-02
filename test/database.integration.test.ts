@@ -657,6 +657,35 @@ if (connectionString) {
     });
     assert.equal(thirdInvitation.email, 'third@example.com');
     assert.equal(fourthInvitation.email, 'fourth@example.com');
+
+    verificationUrl = undefined;
+    const manuallyVerifiedAccount = await registerInvitedAccount(
+      pool,
+      auth,
+      fourthInvitation.token,
+      {
+        name: 'Manually invited member',
+        password: 'manual invitation password'
+      },
+      { deliveryMode: 'manual' }
+    );
+    assert.equal(manuallyVerifiedAccount.verificationRequired, false);
+    assert.equal(verificationUrl, undefined);
+    const manualVerification = await pool.query<{
+      email_verified: boolean;
+      evidence: Record<string, unknown>;
+    }>(
+      `SELECT u."emailVerified" AS email_verified, event.evidence
+       FROM auth."user" u
+       JOIN public.audit_event event
+         ON event.subject_id = u.id
+        AND event.event_type = 'authentication.invited_account.manually_verified'
+       WHERE u.id = $1`,
+      [manuallyVerifiedAccount.userId]
+    );
+    assert.equal(manualVerification.rows[0]?.email_verified, true);
+    assert.equal(manualVerification.rows[0]?.evidence.verification, 'invitation_token');
+
     await assert.rejects(
       issueWorkspaceInvitation(pool, ownerAccess, { email: 'third@example.com' }),
       /already has an active invitation/
