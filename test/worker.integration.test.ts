@@ -3107,22 +3107,25 @@ if (skipDatabaseTests) {
       `UPDATE public.agent SET agent_type = 'research' WHERE id = $1`,
       [ids.agentId]
     );
+    const conciseRequestMessageId = 'message-coordination-concise-request';
     const conciseSourceMessageId = 'message-coordination-concise-source';
     await pool.query(
       `INSERT INTO public.message (
          id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
-       ) VALUES ($1, $2, $3, $4, $5, 'I propose a concise review.')`,
-      [conciseSourceMessageId, ids.workspaceId, ids.channelId,
-        ids.agentMemberId, ids.messageId]
+       ) VALUES
+         ($1, $3, $4, $5, $6, 'Please provide a concise review.'),
+         ($2, $3, $4, $7, $6, 'I propose a concise review.')`,
+      [conciseRequestMessageId, conciseSourceMessageId, ids.workspaceId, ids.channelId,
+        ids.pilotMemberId, ids.messageId, ids.agentMemberId]
     );
     await pool.query(
       `INSERT INTO public.agent_conversation_turn (
          id, workspace_id, conversation_id, request_message_id,
          requested_by_workspace_member_id, response_message_id, status,
          response_placement, response_parent_message_id, completed_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', 'thread', $4, now())`,
       ['turn-coordination-concise-source', ids.workspaceId, conversationId,
-        ids.messageId, ids.pilotMemberId, conciseSourceMessageId]
+        conciseRequestMessageId, ids.pilotMemberId, conciseSourceMessageId]
     );
     const concisePlanId = await proposeCoordinationPlan(pool, {
       workspaceId: ids.workspaceId, projectId: ids.projectId,
