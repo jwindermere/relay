@@ -23,8 +23,10 @@ import {
 } from '../src/lib/server/collaboration/agents.js';
 import {
   instantiateAgentTemplate,
+  loadAgentTemplateContext,
   loadAvailableAgentTemplateCapabilities
 } from '../src/lib/server/collaboration/agent-templates.js';
+import { loadActivePilotProjects } from '../src/lib/server/collaboration/project-access.js';
 import {
   endChannelCall,
   joinChannelCall,
@@ -765,10 +767,21 @@ if (connectionString) {
       [foreignProjectId, foreignWorkspaceId]
     );
 
-    assert.deepEqual(
-      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess, selectedProjectId),
-      ['project_data']
+    assert.ok(
+      (await loadActivePilotProjects(pool, ownerAccess)).some(
+        ({ id }) => id === selectedProjectId
+      )
     );
+    assert.ok(
+      !(await loadActivePilotProjects(pool, ownerAccess)).some(
+        ({ id }) => id === inaccessibleProjectId || id === foreignProjectId
+      )
+    );
+    const selectedContext = await loadAgentTemplateContext(
+      pool, ownerAccess, selectedProjectId
+    );
+    assert.deepEqual(selectedContext.availableCapabilities, ['project_data']);
+    assert.deepEqual(selectedContext.projectAgents, []);
     await assert.rejects(
       loadAvailableAgentTemplateCapabilities(pool, ownerAccess, inaccessibleProjectId),
       /active Project membership is required/
@@ -784,8 +797,9 @@ if (connectionString) {
       selectedProjectId,
       'support',
       {
-        availableCapabilities: ['project_data'],
-        existingAgents: (await loadWorkspaceAgents(pool, ownerAccess)).agents,
+        availableCapabilities: selectedContext.availableCapabilities,
+        existingAgents: selectedContext.agentConfiguration.agents,
+        existingProjectAgents: selectedContext.projectAgents,
         name: 'Selected Project Support'
       }
     );

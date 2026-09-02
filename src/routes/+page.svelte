@@ -52,6 +52,12 @@
   let agentReplyMode = $state<'adaptive' | 'channel' | 'thread'>('adaptive');
   let agentEnabled = $state(true);
   let agentTemplateKey = $state('');
+  let agentProjectId = $state('');
+  let agentPreviewBusy = $state(false);
+  let agentTemplatePreviewCache = $state<Record<
+    string,
+    (typeof data.agentTemplatePreviews)[string]
+  >>({});
   let inboxAgentFilter = $state('all');
   let inboxStateFilter = $state('all');
   let inboxUrgencyFilter = $state('all');
@@ -94,8 +100,13 @@
   let selectedAgentTemplate = $derived(
     data.agentTemplates.find((template) => template.key === agentTemplateKey)
   );
+  let selectedAgentProjectId = $derived(agentProjectId || data.sharedChannel.project.id);
   let selectedTemplatePreview = $derived(
-    selectedAgentTemplate ? data.agentTemplatePreviews[selectedAgentTemplate.key] : undefined
+    selectedAgentTemplate
+      ? selectedAgentProjectId === data.sharedChannel.project.id
+        ? data.agentTemplatePreviews[selectedAgentTemplate.key]
+        : agentTemplatePreviewCache[`${selectedAgentProjectId}:${selectedAgentTemplate.key}`]
+      : undefined
   );
   let agentHandoffs = $derived(
     realtimeHandoffs.length > 0 ? realtimeHandoffs : data.reconciliation.handoffs
@@ -758,7 +769,7 @@
           ambientTriggers: agentTopics.split(',').map((topic) => topic.trim()).filter(Boolean),
           replyMode: agentReplyMode,
           enabled: agentEnabled,
-          projectId: data.sharedChannel.project.id
+          projectId: selectedAgentProjectId
         })
       });
       const result = response.status === 204 ? {} : await response.json();
@@ -783,7 +794,7 @@
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           key: selectedAgentTemplate.key,
-          projectId: data.sharedChannel.project.id
+          projectId: selectedAgentProjectId
         })
       });
       const result = await response.json();
@@ -797,6 +808,29 @@
       agentMessage = error instanceof Error ? error.message : String(error);
     } finally {
       agentBusy = false;
+    }
+  }
+
+  async function refreshAgentTemplatePreview() {
+    const key = agentTemplateKey;
+    const projectId = selectedAgentProjectId;
+    if (!key || projectId === data.sharedChannel.project.id) return;
+    const cacheKey = `${projectId}:${key}`;
+    if (agentTemplatePreviewCache[cacheKey]) return;
+    agentPreviewBusy = true;
+    agentMessage = '';
+    try {
+      const url = new URL('/api/workspace/agent-templates', window.location.origin);
+      url.searchParams.set('key', key);
+      url.searchParams.set('projectId', projectId);
+      const response = await fetch(url);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message ?? 'Agent template preview failed');
+      agentTemplatePreviewCache = { ...agentTemplatePreviewCache, [cacheKey]: result.preview };
+    } catch (error) {
+      agentMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      agentPreviewBusy = false;
     }
   }
 
@@ -1978,9 +2012,33 @@
       </div>
       {#if data.agentConfiguration.canManage}
         <div class="mt-5 space-y-3 border-t border-white/10 pt-5">
+          <div class="space-y-2">
+            <label class="text-xs text-base-content/60" for="agent-project">Project for new Agent</label>
+            <select
+              id="agent-project"
+              class="select select-sm w-full border-white/18 bg-transparent"
+              value={selectedAgentProjectId}
+              onchange={(event) => {
+                agentProjectId = event.currentTarget.value;
+                void refreshAgentTemplatePreview();
+              }}
+            >
+              {#each data.agentProjects as project (project.id)}
+                <option value={project.id}>{project.name}</option>
+              {/each}
+            </select>
+          </div>
           <div class="space-y-2 border border-white/10 p-3">
             <label class="text-xs text-base-content/60" for="agent-template">Optional bounded Agent template</label>
-            <select id="agent-template" class="select select-sm w-full border-white/18 bg-transparent" bind:value={agentTemplateKey}>
+            <select
+              id="agent-template"
+              class="select select-sm w-full border-white/18 bg-transparent"
+              value={agentTemplateKey}
+              onchange={(event) => {
+                agentTemplateKey = event.currentTarget.value;
+                void refreshAgentTemplatePreview();
+              }}
+            >
               <option value="">Choose a specialist Agent template</option>
               {#each data.agentTemplates as template (template.key)}
                 <option value={template.key}>{template.name} · v{template.version}</option>
@@ -2005,7 +2063,7 @@
                   <p class="text-warning">{warning}</p>
                 {/each}
               </div>
-              <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy} onclick={() => void instantiateTemplate()}>
+              <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy || agentPreviewBusy || !selectedTemplatePreview} onclick={() => void instantiateTemplate()}>
                 Add from Agent template
               </button>
             {/if}

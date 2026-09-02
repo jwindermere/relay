@@ -86,6 +86,18 @@ test('responsibility overlap detects shared specialist concerns, not only identi
   assert.deepEqual(preview.warnings, ['Role responsibilities overlap with Riley.']);
 });
 
+test('Agent template overlap warnings stay within the selected Project', () => {
+  const preview = previewAgentTemplate('data-analyst', {
+    availableCapabilities: ['project_data'],
+    existingAgents: [{
+      name: 'Riley', roleLabel: 'Research analyst', ambientTriggers: ['analysis']
+    }],
+    existingProjectAgents: []
+  });
+
+  assert.deepEqual(preview.warnings, []);
+});
+
 test('Agent template execution bounds make outputs, silence, dependencies, and ceilings enforceable', () => {
   const bounds = renderAgentTemplateExecutionBounds({
     expectedResultShapes: ['structured_finding'],
@@ -136,13 +148,17 @@ test('Agent template capabilities expose only authorised Project data and integr
 
   const capabilities = await loadAvailableAgentTemplateCapabilities(
     pool as never,
-    { workspace: { id: 'workspace-1' }, membership: { id: 'member-1' } } as never,
+    {
+      identity: { userId: 'user-1' },
+      workspace: { id: 'workspace-1' },
+      membership: { id: 'member-1' }
+    } as never,
     'project-2'
   );
 
   assert.deepEqual(capabilities, ['project_data', 'repository_read']);
   assert.deepEqual(queries, [
-    ['workspace-1', 'member-1', 'project-2'],
+    ['workspace-1', 'member-1', 'project-2', 'user-1'],
     ['workspace-1', 'project-2']
   ]);
 });
@@ -157,7 +173,11 @@ test('Agent template capabilities fail closed for a Project outside active membe
   await assert.rejects(
     loadAvailableAgentTemplateCapabilities(
       pool as never,
-      { workspace: { id: 'workspace-1' }, membership: { id: 'member-1' } } as never,
+      {
+        identity: { userId: 'user-1' },
+        workspace: { id: 'workspace-1' },
+        membership: { id: 'member-1' }
+      } as never,
       'project-outside-membership'
     ),
     /active Project membership is required/

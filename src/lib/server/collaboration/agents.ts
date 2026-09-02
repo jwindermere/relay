@@ -6,6 +6,7 @@ import {
   type WorkspaceAccess,
   WorkspaceAccessError
 } from '../authentication/authorization.js';
+import { requireActivePilotProjectMembership } from './project-access.js';
 
 export type AgentType = 'engineering' | 'research' | 'product' | 'support' | 'general';
 export type AgentParticipationMode = 'reactive' | 'ambient';
@@ -178,25 +179,7 @@ export async function createWorkspaceAgent(
   try {
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
-    const project = await client.query<{ id: string }>(
-      `SELECT project.id FROM public.project project
-       JOIN public.project_membership project_member
-         ON project_member.workspace_id = project.workspace_id
-        AND project_member.project_id = project.id
-       JOIN public.workspace_member member
-         ON member.workspace_id = project.workspace_id
-        AND member.id = project_member.workspace_member_id
-       JOIN public.workspace_membership membership
-         ON membership.workspace_id = member.workspace_id
-        AND membership.id = member.pilot_membership_id
-       WHERE project.workspace_id = $1
-         AND project.id = $2
-         AND membership.id = $3
-         AND membership.revoked_at IS NULL
-       FOR SHARE OF project, project_member, member, membership`,
-      [access.workspace.id, projectId, access.membership.id]
-    );
-    if (!project.rows[0]) throw new WorkspaceAccessError('active Project membership is required');
+    await requireActivePilotProjectMembership(client, access, projectId, true);
     const id = randomUUID();
     const memberId = `${id}:member`;
     const inserted = await client.query<{
@@ -227,7 +210,7 @@ export async function createWorkspaceAgent(
     await client.query(
       `INSERT INTO public.project_membership (workspace_id, project_id, workspace_member_id)
        VALUES ($1, $2, $3)`,
-      [access.workspace.id, project.rows[0].id, memberId]
+      [access.workspace.id, projectId, memberId]
     );
     await client.query(
       `INSERT INTO public.audit_event (

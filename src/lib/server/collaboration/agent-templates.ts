@@ -1,19 +1,18 @@
 import type { Pool } from 'pg';
 
-import {
-  type WorkspaceAccess,
-  WorkspaceAccessError
-} from '../authentication/authorization.js';
+import type { WorkspaceAccess } from '../authentication/authorization.js';
 import { hasActiveLinkedRepositoryForProject } from '../github/connection.js';
 import {
   createWorkspaceAgent,
   assertAgentTemplatePermissionCeiling,
+  loadWorkspaceAgents,
   type AgentPermissionCeiling,
   type AgentParticipationMode,
   type AgentReplyMode,
   type AgentType,
   type ConfigurableAgent
 } from './agents.js';
+import { requireActivePilotProjectMembership } from './project-access.js';
 
 export { assertAgentTemplatePermissionCeiling } from './agents.js';
 
@@ -105,6 +104,7 @@ export class AgentTemplateError extends Error {
 interface TemplatePreviewInput {
   availableCapabilities: AgentCapability[];
   existingAgents: Array<Pick<ConfigurableAgent, 'name' | 'roleLabel' | 'ambientTriggers'>>;
+  existingProjectAgents?: Array<Pick<ConfigurableAgent, 'name' | 'roleLabel' | 'ambientTriggers'>>;
   name?: string;
   roleLabel?: string;
   ambientTriggers?: string[];
@@ -131,13 +131,14 @@ export function previewAgentTemplate(
   const name = input.name?.trim() || template.name;
   const roleLabel = input.roleLabel?.trim() || template.roleLabel;
   const ambientTriggers = input.ambientTriggers ?? template.ambientTriggers;
+  const projectAgents = input.existingProjectAgents ?? input.existingAgents;
   const warnings: string[] = [];
   const named = input.existingAgents.find((agent) =>
     agent.name.toLocaleLowerCase() === name.toLocaleLowerCase()
   );
   if (named) warnings.push(`An Agent named ${name} already exists.`);
   for (const trigger of ambientTriggers) {
-    const overlapping = input.existingAgents.find((agent) =>
+    const overlapping = projectAgents.find((agent) =>
       agent.ambientTriggers.some(
         (existing) => existing.toLocaleLowerCase() === trigger.toLocaleLowerCase()
       )
@@ -147,7 +148,7 @@ export function previewAgentTemplate(
       break;
     }
   }
-  const roleOverlap = input.existingAgents.find((agent) =>
+  const roleOverlap = projectAgents.find((agent) =>
     rolesOverlap(agent.roleLabel, roleLabel)
   );
   if (roleOverlap) warnings.push(`Role responsibilities overlap with ${roleOverlap.name}.`);
@@ -208,34 +209,45 @@ export async function loadAvailableAgentTemplateCapabilities(
   access: WorkspaceAccess,
   projectId: string
 ): Promise<AgentCapability[]> {
-  const membership = await pool.query<{ allowed: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM public.project project
-       JOIN public.project_membership project_member
-         ON project_member.workspace_id = project.workspace_id
-        AND project_member.project_id = project.id
-       JOIN public.workspace_member member
-         ON member.workspace_id = project.workspace_id
-        AND member.id = project_member.workspace_member_id
-       JOIN public.workspace_membership membership
-         ON membership.workspace_id = member.workspace_id
-        AND membership.id = member.pilot_membership_id
-       WHERE project.workspace_id = $1
-         AND membership.id = $2
-         AND project.id = $3
-         AND membership.revoked_at IS NULL
-     ) AS allowed`,
-    [access.workspace.id, access.membership.id, projectId]
-  );
-  if (!membership.rows[0]?.allowed) {
-    throw new WorkspaceAccessError('active Project membership is required');
-  }
+  await requireActivePilotProjectMembership(pool, access, projectId);
   const available: AgentCapability[] = [];
   available.push('project_data');
   if (await hasActiveLinkedRepositoryForProject(pool, access.workspace.id, projectId)) {
     available.push('repository_read');
   }
   return available;
+}
+
+export async function loadAgentTemplateContext(
+  pool: Pool,
+  access: WorkspaceAccess,
+  projectId: string
+): Promise<{
+  agentConfiguration: Awaited<ReturnType<typeof loadWorkspaceAgents>>;
+  availableCapabilities: AgentCapability[];
+  projectAgents: ConfigurableAgent[];
+}> {
+  const availableCapabilities = await loadAvailableAgentTemplateCapabilities(pool, access, projectId);
+  const [agentConfiguration, projectAgentIds] = await Promise.all([
+    loadWorkspaceAgents(pool, access),
+    pool.query<{ agent_id: string }>(
+      `SELECT member.agent_id
+       FROM public.project_membership project_member
+       JOIN public.workspace_member member
+         ON member.workspace_id = project_member.workspace_id
+        AND member.id = project_member.workspace_member_id
+       WHERE project_member.workspace_id = $1
+         AND project_member.project_id = $2
+         AND member.agent_id IS NOT NULL`,
+      [access.workspace.id, projectId]
+    )
+  ]);
+  const projectAgentIdSet = new Set(projectAgentIds.rows.map(({ agent_id }) => agent_id));
+  return {
+    agentConfiguration,
+    availableCapabilities,
+    projectAgents: agentConfiguration.agents.filter(({ id }) => projectAgentIdSet.has(id))
+  };
 }
 
 export async function instantiateAgentTemplate(

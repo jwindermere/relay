@@ -11,13 +11,13 @@ import {
   loadSharedAgentChannel,
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
-import { loadWorkspaceAgents } from '$lib/server/collaboration/agents.js';
 import {
   findAgentTemplateUpgrade,
   listAgentTemplates,
-  loadAvailableAgentTemplateCapabilities,
+  loadAgentTemplateContext,
   previewAgentTemplate
 } from '$lib/server/collaboration/agent-templates.js';
+import { loadActivePilotProjects } from '$lib/server/collaboration/project-access.js';
 import { loadActiveChannelCall } from '$lib/server/collaboration/calls.js';
 import { loadAvailableWorkspaces } from '$lib/server/collaboration/workspaces.js';
 import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliation.js';
@@ -36,17 +36,18 @@ export async function load({ request }) {
       request.headers
     );
     const sharedChannel = await loadSharedAgentChannel(pool, access);
-    const [providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces, agentTemplateCapabilities] = await Promise.all([
+    const [providerConnection, linkedRepository, currentUserResult, agentTemplateContext, workspaces, agentProjects] = await Promise.all([
       loadProviderConnection(pool, access),
       loadLinkedRepository(pool, access),
       pool.query<{ name: string }>(
         `SELECT name FROM auth."user" WHERE id = $1`,
         [access.identity.userId]
       ),
-      loadWorkspaceAgents(pool, access),
+      loadAgentTemplateContext(pool, access, sharedChannel.project.id),
       loadAvailableWorkspaces(pool, access),
-      loadAvailableAgentTemplateCapabilities(pool, access, sharedChannel.project.id)
+      loadActivePilotProjects(pool, access)
     ]);
+    const { agentConfiguration, availableCapabilities, projectAgents } = agentTemplateContext;
     const [reconciliation, activeCall, accountability] = await Promise.all([
       loadChannelReconciliation(pool, access, sharedChannel.channel.id, {}),
       loadActiveChannelCall(pool, access, sharedChannel.channel.id),
@@ -66,12 +67,14 @@ export async function load({ request }) {
       providerConnection,
       linkedRepository,
       agentConfiguration,
+      agentProjects,
       agentTemplates,
       agentTemplatePreviews: Object.fromEntries(agentTemplates.map((template) => [
         template.key,
         previewAgentTemplate(template.key, {
-          availableCapabilities: agentTemplateCapabilities,
-          existingAgents: agentConfiguration.agents
+          availableCapabilities,
+          existingAgents: agentConfiguration.agents,
+          existingProjectAgents: projectAgents
         })
       ])),
       agentTemplateUpgrades: Object.fromEntries(agentConfiguration.agents.map((agent) => [
