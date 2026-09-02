@@ -23,7 +23,10 @@ import { cancelAgentHandoff } from '../src/lib/server/collaboration/handoffs.js'
 import {
   claimCoordinationStep,
   decideCoordinationPlan,
-  proposeCoordinationPlan
+  loadWorkspaceCoordinationPolicy,
+  proposeCoordinationPlan,
+  recordCoordinationProviderUsage,
+  updateWorkspaceCoordinationPolicy
 } from '../src/lib/server/collaboration/coordination.js';
 import { loadCollaborationAccountability } from '../src/lib/server/collaboration/accountability.js';
 import {
@@ -2569,11 +2572,26 @@ if (skipDatabaseTests) {
       routingPolicyVersion: 'message-intent-v1',
       agentConfigurationVersion: 1,
       agentType: 'engineering',
-      goal: 'Assess evidence', allowParallel: false,
+      goal: 'Assess evidence', allowParallel: true,
       budget: { maxParticipants: 1, maxHandoffs: 1, maxDepth: 1, maxAgentRuns: 0, maxElapsedSeconds: 600 },
-      steps: [{ key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] }]
+      steps: [
+        { key: 'research', agentId: researchAgentId, instruction: 'Assess the evidence', dependencies: [] },
+        { key: 'challenge', agentId: researchAgentId, instruction: 'Challenge the evidence', dependencies: [] }
+      ]
     });
     assert.equal(await claimCoordinationStep(pool, planId), null);
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+      maxParticipants: 4, maxHandoffs: 0, maxDepth: 1,
+      maxAgentRuns: 0, maxElapsedSeconds: 3600, parallelPermitted: true
+    });
+    await assert.rejects(
+      decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve'),
+      /current Workspace or Provider limits/
+    );
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+      maxParticipants: 4, maxHandoffs: 8, maxDepth: 1,
+      maxAgentRuns: 0, maxElapsedSeconds: 3600, parallelPermitted: true
+    });
     await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
     const planConstraint = await postChannelMessage(pool, ids.memberAccess, {
       channelId: ids.channelId,
@@ -2601,7 +2619,53 @@ if (skipDatabaseTests) {
       deliveryConversationTurnId: null,
       suppliedBy: 'Pilot member'
     }]);
-    assert.ok(await claimCoordinationStep(pool, planId));
+    const parallelClaims = await Promise.all([
+      claimCoordinationStep(pool, planId),
+      claimCoordinationStep(pool, planId)
+    ]);
+    assert.equal(parallelClaims.filter(Boolean).length, 1);
+    const claimedTurn = await pool.query<{ conversation_turn_id: string }>(
+      `SELECT conversation_turn_id FROM public.coordination_plan_step
+       WHERE plan_id = $1 AND status = 'active'`,
+      [planId]
+    );
+    const usageClient = await pool.connect();
+    try {
+      await usageClient.query('BEGIN');
+      await recordCoordinationProviderUsage(usageClient, {
+        workspaceId: ids.workspaceId,
+        conversationTurnId: claimedTurn.rows[0]!.conversation_turn_id,
+        amount: 7
+      });
+      await recordCoordinationProviderUsage(usageClient, {
+        workspaceId: ids.workspaceId,
+        conversationTurnId: claimedTurn.rows[0]!.conversation_turn_id,
+        amount: 7
+      });
+      await usageClient.query('COMMIT');
+    } finally {
+      usageClient.release();
+    }
+    const exhaustedPlan = (await loadCollaborationAccountability(
+      pool, ids.memberAccess, ids.projectId
+    )).plans.find(({ id }) => id === planId);
+    assert.deepEqual(exhaustedPlan && {
+      status: exhaustedPlan.status,
+      state: (exhaustedPlan.budget as typeof exhaustedPlan.budget & { state: string }).state,
+      stopReason: (exhaustedPlan.budget as typeof exhaustedPlan.budget & { stopReason: string | null }).stopReason,
+      noticeMessageId: (exhaustedPlan.budget as typeof exhaustedPlan.budget & { noticeMessageId: string | null }).noticeMessageId,
+      providerUsage: exhaustedPlan.budget.providerUsage
+    }, {
+      status: 'paused',
+      state: 'exhausted',
+      stopReason: 'handoff_limit',
+      noticeMessageId: `coordination-budget:${planId}`,
+      providerUsage: { known: true, consumed: 7, limit: null }
+    });
+    const budgetNotice = (await loadChannelReconciliation(
+      pool, ids.memberAccess, ids.channelId, {}
+    )).messages.find(({ id }) => id === `coordination-budget:${planId}`);
+    assert.match(budgetNotice?.body ?? '', /handoff limit reached.*Pilot direction is required/);
     const created = await pool.query<{
       turns: number; runs: number; depth: number; request_body: string;
       constraints: string[]; constraint_status: string;
@@ -2641,12 +2705,83 @@ if (skipDatabaseTests) {
     });
     await pool.query(
       `UPDATE public.agent_conversation_turn
-       SET status = 'failed', completed_at = now(), error_code = 'test_cleanup'
-       WHERE id IN (
-         SELECT conversation_turn_id FROM public.coordination_plan_step WHERE plan_id = $1
-       ) AND status = 'queued'`,
+       SET status = 'working', lease_owner = 'coordination-cancel-worker',
+           lease_token = 'coordination-cancel-lease',
+           lease_expires_at = now() + interval '5 minutes', started_at = now()
+       WHERE id = $1`,
+      [claimedTurn.rows[0]!.conversation_turn_id]
+    );
+    await pool.query(
+      `UPDATE public.coordination_budget_reservation
+       SET outcome = 'started', updated_at = now()
+       WHERE plan_id = $1 AND outcome = 'reserved'`,
       [planId]
     );
+    await decideCoordinationPlan(pool, ids.memberAccess, planId, 'cancel');
+    const cancelledPlan = (await loadCollaborationAccountability(
+      pool, ids.memberAccess, ids.projectId
+    )).plans.find(({ id }) => id === planId);
+    assert.deepEqual(cancelledPlan && {
+      consumedHandoffs: cancelledPlan.budget.consumedHandoffs,
+      accounting: cancelledPlan.budget.reservationAccounting
+    }, {
+      consumedHandoffs: 1,
+      accounting: { reserved: 0, started: 0, failedStart: 0, failed: 0, cancelled: 1, completed: 0 }
+    });
+    const cancelledTurn = await pool.query<{
+      status: string; error_code: string; lease_owner: string | null; lease_token: string | null;
+    }>(
+      `SELECT status, error_code, lease_owner, lease_token
+       FROM public.agent_conversation_turn WHERE id = $1`,
+      [claimedTurn.rows[0]!.conversation_turn_id]
+    );
+    assert.deepEqual(cancelledTurn.rows[0], {
+      status: 'failed', error_code: 'coordination_cancelled', lease_owner: null, lease_token: null
+    });
+  });
+
+  test('Workspace coordination defaults stay within Provider limits and retain attribution', async () => {
+    const ids = await seedQueuedAgentRun(pool, 'coordination-policy');
+    await pool.query(
+      `UPDATE public.provider_connection
+       SET coordination_provider_usage_limit = 100 WHERE id = $1`,
+      [ids.providerConnectionId]
+    );
+    const requested = {
+      maxParticipants: 3,
+      maxHandoffs: 4,
+      maxDepth: 1,
+      maxAgentRuns: 2,
+      maxElapsedSeconds: 1800,
+      providerUsageLimit: 80,
+      parallelPermitted: false
+    };
+    await assert.rejects(
+      updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, {
+        ...requested,
+        providerUsageLimit: 101
+      }),
+      /Provider limit/
+    );
+    await assert.rejects(
+      updateWorkspaceCoordinationPolicy(pool, ids.memberAccess, requested),
+      /Workspace owner/
+    );
+    await updateWorkspaceCoordinationPolicy(pool, ids.ownerAccess, requested);
+    assert.deepEqual(
+      await loadWorkspaceCoordinationPolicy(pool, ids.memberAccess),
+      requested
+    );
+    const audit = await pool.query<{ actor_membership_id: string; after: Record<string, unknown> }>(
+      `SELECT actor_membership_id, evidence->'after' AS after
+       FROM public.audit_event
+       WHERE workspace_id = $1 AND event_type = 'workspace_coordination_policy.updated'`,
+      [ids.workspaceId]
+    );
+    assert.deepEqual(audit.rows, [{
+      actor_membership_id: ids.ownerAccess.membership.id,
+      after: requested
+    }]);
   });
 
   test('Research Agents preserve inaccessible cross-Project evidence as visible provenance', async () => {

@@ -1100,12 +1100,27 @@
       </div>
       <p class="mt-1 text-base-content/55">
         {plan.steps.length} steps · {plan.allowParallel ? 'parallel when dependencies allow' : 'sequential'}
-        · {plan.budget.maxParticipants} participants max
+        · {plan.budget.consumedParticipants}/{plan.budget.maxParticipants} participants
         · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs
-        · depth {plan.budget.maxDepth} · {plan.budget.maxAgentRuns} AgentRuns max
-        · {plan.budget.maxElapsedSeconds}s max
+        · depth {plan.budget.maxDepth} · {plan.budget.consumedAgentRuns}/{plan.budget.maxAgentRuns} AgentRuns
+        · {plan.budget.elapsedSeconds}/{plan.budget.maxElapsedSeconds}s elapsed
         · provider usage {plan.budget.providerUsage.known ? `${plan.budget.providerUsage.consumed}/${plan.budget.providerUsage.limit ?? '∞'}` : 'unknown'}
       </p>
+      <p class="mt-1 text-base-content/45">
+        Reservations · {plan.budget.reservationAccounting.reserved} queued
+        · {plan.budget.reservationAccounting.started} started
+        · {plan.budget.reservationAccounting.failedStart} failed before start
+        · {plan.budget.reservationAccounting.failed} failed after start
+        · {plan.budget.reservationAccounting.cancelled} cancelled
+        · {plan.budget.reservationAccounting.completed} completed
+      </p>
+      {#if plan.budget.state === 'approaching'}
+        <p class="mt-1 text-warning">Approaching: {plan.budget.warnings.map((warning) => warning.replaceAll('_', ' ')).join(', ')}</p>
+      {:else if plan.budget.state === 'exhausted'}
+        <p class="mt-1 text-error">
+          No new coordination work can start: {plan.budget.stopReason?.replaceAll('_', ' ')}. Pilot direction is required.
+        </p>
+      {/if}
       {#if plan.constraints.length > 0}
         <p class="mt-1 text-info">Active constraints: {plan.constraints.join('; ')}</p>
       {/if}

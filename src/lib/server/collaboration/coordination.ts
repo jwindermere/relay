@@ -13,6 +13,10 @@ export interface CoordinationBudget {
   providerUsageLimit?: number;
 }
 
+export interface WorkspaceCoordinationPolicyInput extends CoordinationBudget {
+  parallelPermitted: boolean;
+}
+
 const COORDINATION_OUTPUT_TYPES = [
   'concise_text',
   'structured_finding',
@@ -62,6 +66,21 @@ function integerWithin(value: number, minimum: number, maximum: number, label: s
   return value;
 }
 
+function normalizeCoordinationBudget(input: CoordinationBudget): CoordinationBudget {
+  return {
+    maxParticipants: integerWithin(input.maxParticipants, 1, OPERATOR_LIMITS.maxParticipants, 'Participant budget'),
+    maxHandoffs: integerWithin(input.maxHandoffs, 0, OPERATOR_LIMITS.maxHandoffs, 'Handoff budget'),
+    maxDepth: integerWithin(input.maxDepth, 0, OPERATOR_LIMITS.maxDepth, 'Handoff depth'),
+    maxAgentRuns: integerWithin(input.maxAgentRuns, 0, OPERATOR_LIMITS.maxAgentRuns, 'AgentRun budget'),
+    maxElapsedSeconds: integerWithin(input.maxElapsedSeconds, 60, OPERATOR_LIMITS.maxElapsedSeconds, 'Elapsed-time budget'),
+    ...(input.providerUsageLimit === undefined
+      ? {}
+      : Number.isFinite(input.providerUsageLimit) && input.providerUsageLimit >= 0
+        ? { providerUsageLimit: input.providerUsageLimit }
+        : (() => { throw new CoordinationError('Provider usage budget is invalid'); })())
+  };
+}
+
 export function normalizeCoordinationPlan(input: CoordinationPlanInput): CoordinationPlanInput {
   const goal = input?.goal?.trim();
   if (!goal || goal.length > 4000) throw new CoordinationError('Coordination goal is required');
@@ -71,18 +90,10 @@ export function normalizeCoordinationPlan(input: CoordinationPlanInput): Coordin
   if (input.budget.maxDepth > 1) {
     throw new CoordinationError('Coordination handoff depth cannot exceed 1');
   }
-  const budget: CoordinationBudget = {
-    maxParticipants: integerWithin(input.budget.maxParticipants, 1, OPERATOR_LIMITS.maxParticipants, 'Participant budget'),
-    maxHandoffs: integerWithin(input.budget.maxHandoffs, 0, OPERATOR_LIMITS.maxHandoffs, 'Handoff budget'),
-    maxDepth: integerWithin(input.budget.maxDepth, 0, OPERATOR_LIMITS.maxDepth, 'Handoff depth'),
-    maxAgentRuns: integerWithin(input.budget.maxAgentRuns, 0, OPERATOR_LIMITS.maxAgentRuns, 'AgentRun budget'),
-    maxElapsedSeconds: integerWithin(input.budget.maxElapsedSeconds, 60, OPERATOR_LIMITS.maxElapsedSeconds, 'Elapsed-time budget'),
-    ...(input.budget.providerUsageLimit === undefined
-      ? {}
-      : Number.isFinite(input.budget.providerUsageLimit) && input.budget.providerUsageLimit >= 0
-        ? { providerUsageLimit: input.budget.providerUsageLimit }
-        : (() => { throw new CoordinationError('Provider usage budget is invalid'); })())
-  };
+  const budget = normalizeCoordinationBudget(input.budget);
+  if (input.allowParallel && budget.providerUsageLimit !== undefined) {
+    throw new CoordinationError('Provider-usage-limited coordination must run sequentially');
+  }
   const keys = new Set<string>();
   const participants = new Set<string>();
   const steps = input.steps.map((step) => {
@@ -121,6 +132,15 @@ export function normalizeCoordinationPlan(input: CoordinationPlanInput): Coordin
   return { goal, constraints, allowParallel: Boolean(input.allowParallel), budget, steps };
 }
 
+function normalizeWorkspaceCoordinationPolicy(
+  input: WorkspaceCoordinationPolicyInput
+): WorkspaceCoordinationPolicyInput {
+  return {
+    ...normalizeCoordinationBudget(input),
+    parallelPermitted: Boolean(input.parallelPermitted)
+  };
+}
+
 export function reserveCoordinationBudget(
   budget: { consumed: number; limit: number }, amount: number
 ): { consumed: number; remaining: number } {
@@ -128,6 +148,99 @@ export function reserveCoordinationBudget(
   if (budget.consumed + amount > budget.limit) throw new CoordinationError('Coordination budget is exhausted');
   const consumed = budget.consumed + amount;
   return { consumed, remaining: budget.limit - consumed };
+}
+
+export async function updateWorkspaceCoordinationPolicy(
+  pool: Pool,
+  access: WorkspaceAccess,
+  input: WorkspaceCoordinationPolicyInput
+): Promise<void> {
+  if (access.membership.role !== 'owner') {
+    throw new CoordinationError('Workspace owner membership is required');
+  }
+  const policy = normalizeWorkspaceCoordinationPolicy(input);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const previous = await client.query(
+      `SELECT default_max_participants, default_max_handoffs, default_max_depth,
+              default_max_agent_runs, default_max_elapsed_seconds,
+              default_provider_usage_limit, parallel_permitted
+       FROM public.workspace_coordination_policy
+       WHERE workspace_id = $1 FOR UPDATE`,
+      [access.workspace.id]
+    );
+    if (!previous.rows[0]) throw new CoordinationError('Workspace coordination policy was not found');
+    const provider = await client.query<{ coordination_provider_usage_limit: string | null }>(
+      `SELECT coordination_provider_usage_limit
+       FROM public.provider_connection
+       WHERE workspace_id = $1 FOR UPDATE`,
+      [access.workspace.id]
+    );
+    const providerLimit = provider.rows[0]?.coordination_provider_usage_limit ?? null;
+    if (providerLimit !== null && (
+      policy.providerUsageLimit === undefined
+      || policy.providerUsageLimit > Number(providerLimit)
+    )) {
+      throw new CoordinationError('Workspace defaults exceed the Provider limit');
+    }
+    await client.query(
+      `UPDATE public.workspace_coordination_policy
+       SET default_max_participants = $2, default_max_handoffs = $3,
+           default_max_depth = $4, default_max_agent_runs = $5,
+           default_max_elapsed_seconds = $6, default_provider_usage_limit = $7,
+           parallel_permitted = $8, updated_at = now()
+       WHERE workspace_id = $1`,
+      [access.workspace.id, policy.maxParticipants, policy.maxHandoffs,
+        policy.maxDepth, policy.maxAgentRuns, policy.maxElapsedSeconds,
+        policy.providerUsageLimit ?? null, policy.parallelPermitted]
+    );
+    await client.query(
+      `INSERT INTO public.audit_event (
+         workspace_id, actor_user_id, actor_membership_id,
+         event_type, subject_type, subject_id, evidence
+       ) VALUES ($1, $2, $3, 'workspace_coordination_policy.updated',
+         'workspace_coordination_policy', $1,
+         jsonb_build_object('before', $4::jsonb, 'after', $5::jsonb))`,
+      [access.workspace.id, access.identity.userId, access.membership.id,
+        JSON.stringify(previous.rows[0]), JSON.stringify(policy)]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function loadWorkspaceCoordinationPolicy(
+  pool: Pool,
+  access: WorkspaceAccess
+): Promise<WorkspaceCoordinationPolicyInput> {
+  const result = await pool.query<{
+    default_max_participants: number; default_max_handoffs: number; default_max_depth: number;
+    default_max_agent_runs: number; default_max_elapsed_seconds: number;
+    default_provider_usage_limit: string | null; parallel_permitted: boolean;
+  }>(
+    `SELECT default_max_participants, default_max_handoffs, default_max_depth,
+            default_max_agent_runs, default_max_elapsed_seconds,
+            default_provider_usage_limit, parallel_permitted
+     FROM public.workspace_coordination_policy WHERE workspace_id = $1`,
+    [access.workspace.id]
+  );
+  const row = result.rows[0];
+  if (!row) throw new CoordinationError('Workspace coordination policy was not found');
+  return {
+    maxParticipants: row.default_max_participants,
+    maxHandoffs: row.default_max_handoffs,
+    maxDepth: row.default_max_depth,
+    maxAgentRuns: row.default_max_agent_runs,
+    maxElapsedSeconds: row.default_max_elapsed_seconds,
+    ...(row.default_provider_usage_limit === null
+      ? {} : { providerUsageLimit: Number(row.default_provider_usage_limit) }),
+    parallelPermitted: row.parallel_permitted
+  };
 }
 
 export function parseCoordinationPlanProposal(
@@ -191,12 +304,18 @@ export async function proposeCoordinationPlan(
           AND $4 <= default_max_depth
           AND $5 <= default_max_agent_runs
           AND $6 <= default_max_elapsed_seconds
+          AND (NOT $8 OR workspace_policy.parallel_permitted)
           AND (default_provider_usage_limit IS NULL
-            OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))) AS allowed
-       FROM public.workspace_coordination_policy WHERE workspace_id = $1 FOR UPDATE`,
+            OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))
+          AND (provider.coordination_provider_usage_limit IS NULL
+            OR ($7::numeric IS NOT NULL
+              AND $7 <= provider.coordination_provider_usage_limit))) AS allowed
+       FROM public.workspace_coordination_policy workspace_policy
+       JOIN public.provider_connection provider ON provider.workspace_id = workspace_policy.workspace_id
+       WHERE workspace_policy.workspace_id = $1 FOR UPDATE OF workspace_policy, provider`,
       [input.workspaceId, plan.budget.maxParticipants, plan.budget.maxHandoffs,
         plan.budget.maxDepth, plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
-        plan.budget.providerUsageLimit ?? null]
+        plan.budget.providerUsageLimit ?? null, plan.allowParallel]
     );
     if (!policy.rows[0]?.allowed) throw new CoordinationError('Coordination plan exceeds Workspace defaults');
     await client.query(
@@ -255,6 +374,36 @@ export async function decideCoordinationPlan(
       [access.workspace.id, access.membership.id, planId]
     );
     if (!actor.rows[0]) throw new CoordinationError('active Pilot membership is required');
+    if (action === 'approve') {
+      const withinCurrentLimits = await client.query<{ allowed: boolean }>(
+        `SELECT (
+           plan.max_participants <= policy.default_max_participants
+           AND plan.max_handoffs <= policy.default_max_handoffs
+           AND plan.max_depth <= policy.default_max_depth
+           AND plan.max_agent_runs <= policy.default_max_agent_runs
+           AND plan.max_elapsed_seconds <= policy.default_max_elapsed_seconds
+           AND (NOT plan.allow_parallel OR policy.parallel_permitted)
+           AND NOT (plan.allow_parallel AND plan.provider_usage_limit IS NOT NULL)
+           AND (policy.default_provider_usage_limit IS NULL OR (
+             plan.provider_usage_limit IS NOT NULL
+             AND plan.provider_usage_limit <= policy.default_provider_usage_limit
+           ))
+           AND (provider.coordination_provider_usage_limit IS NULL OR (
+             plan.provider_usage_limit IS NOT NULL
+             AND plan.provider_usage_limit <= provider.coordination_provider_usage_limit
+           ))
+         ) AS allowed
+         FROM public.coordination_plan plan
+         JOIN public.workspace_coordination_policy policy ON policy.workspace_id = plan.workspace_id
+         JOIN public.provider_connection provider ON provider.workspace_id = plan.workspace_id
+         WHERE plan.id = $1 AND plan.workspace_id = $2
+         FOR UPDATE OF plan, policy, provider`,
+        [planId, access.workspace.id]
+      );
+      if (!withinCurrentLimits.rows[0]?.allowed) {
+        throw new CoordinationError('Coordination plan exceeds current Workspace or Provider limits');
+      }
+    }
     const nextStatus = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : action === 'pause' ? 'paused' : 'cancelled';
     const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed'] : ['approved', 'active', 'paused'];
     const updated = await client.query<{
@@ -280,9 +429,29 @@ export async function decideCoordinationPlan(
         [planId, access.workspace.id]
       );
     } else if (action === 'cancel' || action === 'reject') {
+      if (action === 'cancel') {
+        await client.query(
+          `UPDATE public.agent_conversation_turn turn
+           SET status = 'failed', error_code = 'coordination_cancelled',
+               lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+               completed_at = now(), updated_at = now()
+           FROM public.coordination_plan_step step
+           WHERE step.plan_id = $1 AND step.conversation_turn_id = turn.id
+             AND turn.status IN ('queued', 'working')`,
+          [planId]
+        );
+        await client.query(
+          `UPDATE public.coordination_budget_reservation
+           SET outcome = 'cancelled', updated_at = now()
+           WHERE plan_id = $1 AND outcome IN ('reserved', 'started')`,
+          [planId]
+        );
+        await refreshCoordinationProviderUsage(client, planId, access.workspace.id);
+      }
       await client.query(
         `UPDATE public.coordination_plan_step SET status = 'cancelled'
-         WHERE plan_id = $1 AND workspace_id = $2 AND status IN ('pending', 'ready', 'blocked')`,
+         WHERE plan_id = $1 AND workspace_id = $2
+           AND status IN ('pending', 'ready', 'active', 'blocked')`,
         [planId, access.workspace.id]
       );
       await recordCollaborationEvaluationEvent(client, {
@@ -315,8 +484,14 @@ export async function editCoordinationPlan(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const editable = await client.query<{ project_id: string }>(
-      `SELECT proposal.project_id
+    const editable = await client.query<{
+      project_id: string; max_participants: number; max_handoffs: number; max_depth: number;
+      max_agent_runs: number; max_elapsed_seconds: number; provider_usage_limit: string | null;
+      allow_parallel: boolean;
+    }>(
+      `SELECT proposal.project_id, proposal.max_participants, proposal.max_handoffs,
+              proposal.max_depth, proposal.max_agent_runs, proposal.max_elapsed_seconds,
+              proposal.provider_usage_limit, proposal.allow_parallel
        FROM public.coordination_plan proposal
        WHERE proposal.id = $1 AND proposal.workspace_id = $2 AND proposal.status = 'proposed'
          AND EXISTS (
@@ -356,12 +531,18 @@ export async function editCoordinationPlan(
       `SELECT ($2 <= default_max_participants AND $3 <= default_max_handoffs
           AND $4 <= default_max_depth AND $5 <= default_max_agent_runs
           AND $6 <= default_max_elapsed_seconds
+          AND (NOT $8 OR workspace_policy.parallel_permitted)
           AND (default_provider_usage_limit IS NULL
-            OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))) AS allowed
-       FROM public.workspace_coordination_policy WHERE workspace_id = $1 FOR UPDATE`,
+            OR ($7::numeric IS NOT NULL AND $7 <= default_provider_usage_limit))
+          AND (provider.coordination_provider_usage_limit IS NULL
+            OR ($7::numeric IS NOT NULL
+              AND $7 <= provider.coordination_provider_usage_limit))) AS allowed
+       FROM public.workspace_coordination_policy workspace_policy
+       JOIN public.provider_connection provider ON provider.workspace_id = workspace_policy.workspace_id
+       WHERE workspace_policy.workspace_id = $1 FOR UPDATE OF workspace_policy, provider`,
       [access.workspace.id, plan.budget.maxParticipants, plan.budget.maxHandoffs,
         plan.budget.maxDepth, plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
-        plan.budget.providerUsageLimit ?? null]
+        plan.budget.providerUsageLimit ?? null, plan.allowParallel]
     );
     if (!policy.rows[0]?.allowed) throw new CoordinationError('Coordination plan exceeds Workspace defaults');
     await client.query(
@@ -375,6 +556,25 @@ export async function editCoordinationPlan(
         plan.allowParallel, plan.budget.maxParticipants, plan.budget.maxHandoffs,
         plan.budget.maxDepth, plan.budget.maxAgentRuns, plan.budget.maxElapsedSeconds,
         plan.budget.providerUsageLimit ?? null]
+    );
+    await client.query(
+      `INSERT INTO public.audit_event (
+         workspace_id, actor_user_id, actor_membership_id,
+         event_type, subject_type, subject_id, evidence
+       ) VALUES ($1, $2, $3, 'coordination_plan.budget_edited', 'coordination_plan', $4,
+         jsonb_build_object('before', $5::jsonb, 'after', $6::jsonb))`,
+      [access.workspace.id, access.identity.userId, access.membership.id, planId,
+        JSON.stringify({
+          maxParticipants: editable.rows[0]!.max_participants,
+          maxHandoffs: editable.rows[0]!.max_handoffs,
+          maxDepth: editable.rows[0]!.max_depth,
+          maxAgentRuns: editable.rows[0]!.max_agent_runs,
+          maxElapsedSeconds: editable.rows[0]!.max_elapsed_seconds,
+          providerUsageLimit: editable.rows[0]!.provider_usage_limit === null
+            ? null : Number(editable.rows[0]!.provider_usage_limit),
+          allowParallel: editable.rows[0]!.allow_parallel
+        }),
+        JSON.stringify({ ...plan.budget, allowParallel: plan.allowParallel })]
     );
     await client.query(`DELETE FROM public.coordination_plan_step WHERE plan_id = $1`, [planId]);
     for (const [position, step] of plan.steps.entries()) {
@@ -420,15 +620,17 @@ export async function claimCoordinationStep(
       return null;
     }
     if (current.started_at && Date.now() - current.started_at.getTime() >= current.max_elapsed_seconds * 1000) {
-      await client.query(`UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`, [planId]);
+      await pauseCoordinationForBudget(client, planId, 'elapsed_time_limit');
       await client.query('COMMIT');
       return null;
     }
-    if (current.provider_usage_limit !== null && (
-      !current.provider_usage_known
-      || Number(current.provider_usage_consumed ?? 0) >= Number(current.provider_usage_limit)
-    )) {
-      await client.query(`UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`, [planId]);
+    if (current.provider_usage_limit !== null && current.provider_usage_known
+      && Number(current.provider_usage_consumed ?? 0) >= Number(current.provider_usage_limit)) {
+      await pauseCoordinationForBudget(
+        client,
+        planId,
+        'provider_usage_limit'
+      );
       await client.query('COMMIT');
       return null;
     }
@@ -438,7 +640,7 @@ export async function claimCoordinationStep(
        WHERE plan_id = $1 AND reservation_kind = 'agent_run'`, [planId]
     );
     if ((agentRunReservations.rows[0]?.count ?? 0) > current.max_agent_runs) {
-      await client.query(`UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`, [planId]);
+      await pauseCoordinationForBudget(client, planId, 'agent_run_limit');
       await client.query('COMMIT');
       return null;
     }
@@ -473,7 +675,7 @@ export async function claimCoordinationStep(
            WHERE active.plan_id = step.plan_id AND active.status = 'active'
          ))
        ORDER BY step.position, step.id FOR UPDATE OF step SKIP LOCKED LIMIT 1`,
-      [planId, current.allow_parallel]
+      [planId, current.allow_parallel && current.provider_usage_limit === null]
     );
     if (!step.rows[0]) {
       await client.query('COMMIT');
@@ -508,10 +710,7 @@ export async function claimCoordinationStep(
       [planId]
     );
     if ((consumed.rows[0]?.count ?? 0) >= current.max_handoffs) {
-      await client.query(
-        `UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`,
-        [planId]
-      );
+      await pauseCoordinationForBudget(client, planId, 'handoff_limit');
       await client.query('COMMIT');
       return null;
     }
@@ -610,6 +809,60 @@ export async function claimCoordinationStep(
   }
 }
 
+type CoordinationBudgetStopReason =
+  | 'handoff_limit'
+  | 'agent_run_limit'
+  | 'elapsed_time_limit'
+  | 'provider_usage_limit';
+
+async function pauseCoordinationForBudget(
+  client: PoolClient,
+  planId: string,
+  reason: CoordinationBudgetStopReason
+): Promise<void> {
+  const plan = await client.query<{
+    workspace_id: string; channel_id: string; root_message_id: string;
+    coordinator_member_id: string; budget_notice_message_id: string | null;
+  }>(
+    `UPDATE public.coordination_plan plan
+     SET status = 'paused', budget_stop_reason = $2, updated_at = now()
+     FROM public.message source, public.workspace_member coordinator
+     WHERE plan.id = $1 AND source.id = plan.source_message_id
+       AND coordinator.agent_id = plan.coordinating_agent_id
+     RETURNING plan.workspace_id, source.channel_id,
+       COALESCE(source.parent_message_id, source.id) AS root_message_id,
+       coordinator.id AS coordinator_member_id, plan.budget_notice_message_id`,
+    [planId, reason]
+  );
+  const row = plan.rows[0];
+  if (!row || row.budget_notice_message_id) return;
+  const noticeMessageId = `coordination-budget:${planId}`;
+  const label: Record<CoordinationBudgetStopReason, string> = {
+    handoff_limit: 'handoff limit reached',
+    agent_run_limit: 'AgentRun limit reached',
+    elapsed_time_limit: 'elapsed-time limit reached',
+    provider_usage_limit: 'Provider-usage limit reached'
+  };
+  await client.query(
+    `INSERT INTO public.message (
+       id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
+     ) VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (id) DO NOTHING`,
+    [noticeMessageId, row.workspace_id, row.channel_id, row.coordinator_member_id,
+      row.root_message_id,
+      `Coordination paused: ${label[reason]}. Pilot direction is required before more work can start.`]
+  );
+  await client.query(
+    `UPDATE public.coordination_plan SET budget_notice_message_id = $2 WHERE id = $1`,
+    [planId, noticeMessageId]
+  );
+  await client.query(
+    `INSERT INTO public.notification_outbox (workspace_id, message_id, topic, payload)
+     VALUES ($1, $2, 'channel.message', $3)`,
+    [row.workspace_id, noticeMessageId, { messageId: noticeMessageId }]
+  );
+}
+
 export async function activateNextCoordinationStep(pool: Pool): Promise<void> {
   const plans = await pool.query<{ id: string }>(
     `SELECT id FROM public.coordination_plan
@@ -636,6 +889,18 @@ export async function completeCoordinationStep(
   );
   const planId = completed.rows[0]?.plan_id;
   if (!planId) return;
+  await client.query(
+    `UPDATE public.coordination_budget_reservation
+     SET outcome = CASE
+       WHEN $2 = 'completed' THEN 'completed'
+       WHEN outcome = 'reserved' THEN 'failed_start'
+       WHEN outcome = 'started' THEN 'failed'
+       ELSE outcome
+     END, updated_at = now()
+     WHERE step_id = $1 AND reservation_kind = 'handoff'`,
+    [completed.rows[0]!.id, input.status]
+  );
+  await refreshCoordinationProviderUsage(client, planId, input.workspaceId);
   const evaluation = await client.query<{
     workspace_id: string; project_id: string; routing_policy_version: string;
     agent_configuration_version: number;
@@ -682,6 +947,66 @@ export async function completeCoordinationStep(
     [planId]
   );
   await finishCoordinationPlanIfComplete(client, planId);
+}
+
+export async function recordCoordinationProviderUsage(
+  client: PoolClient,
+  input: { workspaceId: string; conversationTurnId: string; amount: number }
+): Promise<void> {
+  if (!Number.isFinite(input.amount) || input.amount < 0) {
+    throw new CoordinationError('Measured Provider usage is invalid');
+  }
+  const inserted = await client.query<{ plan_id: string }>(
+    `INSERT INTO public.coordination_provider_usage_record (
+       id, workspace_id, plan_id, step_id, conversation_turn_id, amount
+     )
+     SELECT $1, step.workspace_id, step.plan_id, step.id, $2, $3
+     FROM public.coordination_plan_step step
+     WHERE step.conversation_turn_id = $2 AND step.workspace_id = $4
+     ON CONFLICT (conversation_turn_id) DO NOTHING
+     RETURNING plan_id`,
+    [randomUUID(), input.conversationTurnId, input.amount, input.workspaceId]
+  );
+  const planId = inserted.rows[0]?.plan_id;
+  if (!planId) return;
+  await refreshCoordinationProviderUsage(client, planId, input.workspaceId);
+}
+
+async function refreshCoordinationProviderUsage(
+  client: PoolClient,
+  planId: string,
+  workspaceId: string
+): Promise<void> {
+  await client.query(
+    `UPDATE public.coordination_plan plan
+     SET provider_usage_known = (
+           EXISTS (
+             SELECT 1 FROM public.coordination_provider_usage_record usage
+             WHERE usage.plan_id = plan.id
+           ) AND NOT EXISTS (
+             SELECT 1
+             FROM public.coordination_budget_reservation reservation
+             JOIN public.coordination_plan_step step ON step.id = reservation.step_id
+             JOIN public.agent_conversation_turn turn ON turn.id = step.conversation_turn_id
+             LEFT JOIN public.coordination_provider_usage_record usage
+               ON usage.conversation_turn_id = turn.id
+             WHERE reservation.plan_id = plan.id
+               AND usage.id IS NULL
+               AND (
+                 reservation.outcome IN ('started', 'failed', 'completed')
+                 OR (reservation.outcome = 'cancelled' AND turn.provider_turn_id IS NOT NULL)
+               )
+           )
+         ),
+         provider_usage_consumed = (
+           SELECT COALESCE(sum(amount), 0)
+           FROM public.coordination_provider_usage_record usage
+           WHERE usage.plan_id = plan.id
+         ),
+         updated_at = now()
+     WHERE plan.id = $1 AND plan.workspace_id = $2`,
+    [planId, workspaceId]
+  );
 }
 
 async function finishCoordinationPlanIfComplete(client: PoolClient, planId: string): Promise<void> {

@@ -280,7 +280,14 @@ export async function loadCollaborationAccountability(
       max_participants: number; max_handoffs: number; max_depth: number; max_agent_runs: number;
       max_elapsed_seconds: number; provider_usage_limit: string | null;
       provider_usage_consumed: string | null; provider_usage_known: boolean;
-      steps: VisibleCoordinationStep[]; consumed_handoffs: number;
+      started_at: Date | null; budget_stop_reason: string | null;
+      budget_notice_message_id: string | null;
+      steps: VisibleCoordinationStep[]; participant_count: number;
+      consumed_handoffs: number; consumed_agent_runs: number;
+      reservation_accounting: {
+        reserved: number; started: number; failedStart: number;
+        failed: number; cancelled: number; completed: number;
+      };
       constraint_inputs: Array<{
         id: string; sourceMessageId: string; guidance: string; ordinal: number;
         status: 'pending' | 'delivered'; deliveryConversationTurnId: string | null;
@@ -291,6 +298,7 @@ export async function loadCollaborationAccountability(
               plan.max_participants, plan.max_handoffs, plan.max_depth, plan.max_agent_runs,
               plan.max_elapsed_seconds, plan.provider_usage_limit,
               plan.provider_usage_consumed, plan.provider_usage_known,
+              plan.started_at, plan.budget_stop_reason, plan.budget_notice_message_id,
               COALESCE(jsonb_agg(jsonb_build_object(
                 'id', step.id, 'key', step.step_key, 'agentId', step.target_agent_id,
                 'agentName', agent.name, 'instruction', step.instruction,
@@ -298,8 +306,22 @@ export async function loadCollaborationAccountability(
                 'status', step.status, 'resultMessageId', step.result_message_id,
                 'artifactId', step.artifact_id
               ) ORDER BY step.position, step.id) FILTER (WHERE step.id IS NOT NULL), '[]') AS steps,
-              (SELECT count(*)::integer FROM public.coordination_budget_reservation reservation
+              count(DISTINCT step.target_agent_id)::integer AS participant_count,
+              (SELECT COALESCE(sum(reservation.amount), 0)::integer
+               FROM public.coordination_budget_reservation reservation
                WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'handoff') AS consumed_handoffs,
+              (SELECT COALESCE(sum(reservation.amount), 0)::integer
+               FROM public.coordination_budget_reservation reservation
+               WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'agent_run') AS consumed_agent_runs,
+              (SELECT jsonb_build_object(
+                 'reserved', COALESCE(sum(amount) FILTER (WHERE outcome = 'reserved'), 0),
+                 'started', COALESCE(sum(amount) FILTER (WHERE outcome = 'started'), 0),
+                 'failedStart', COALESCE(sum(amount) FILTER (WHERE outcome = 'failed_start'), 0),
+                 'failed', COALESCE(sum(amount) FILTER (WHERE outcome = 'failed'), 0),
+                 'cancelled', COALESCE(sum(amount) FILTER (WHERE outcome = 'cancelled'), 0),
+                 'completed', COALESCE(sum(amount) FILTER (WHERE outcome = 'completed'), 0)
+               ) FROM public.coordination_budget_reservation reservation
+               WHERE reservation.plan_id = plan.id) AS reservation_accounting,
               COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                   'id', constraint_input.id,
@@ -595,19 +617,45 @@ export async function loadCollaborationAccountability(
       guidance: row.guidance, ordinal: row.ordinal, status: row.status,
       suppliedBy: row.supplied_by, createdAt: row.created_at.toISOString()
     })),
-    plans: plans.rows.map((row) => ({
-      id: row.id, sourceMessageId: row.source_message_id, goal: row.goal,
-      constraints: row.constraints, status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
-      constraintInputs: row.constraint_inputs,
-      budget: {
-        maxParticipants: row.max_participants, maxHandoffs: row.max_handoffs,
-        consumedHandoffs: row.consumed_handoffs, maxDepth: row.max_depth,
-        maxAgentRuns: row.max_agent_runs, maxElapsedSeconds: row.max_elapsed_seconds,
-        providerUsage: row.provider_usage_known
-          ? { known: true, consumed: Number(row.provider_usage_consumed), limit: row.provider_usage_limit === null ? null : Number(row.provider_usage_limit) }
-          : { known: false, consumed: null, limit: row.provider_usage_limit === null ? null : Number(row.provider_usage_limit) }
+    plans: plans.rows.map((row) => {
+      const elapsedSeconds = row.started_at === null
+        ? 0 : Math.max(0, Math.floor((Date.now() - row.started_at.getTime()) / 1000));
+      const providerLimit = row.provider_usage_limit === null ? null : Number(row.provider_usage_limit);
+      const providerConsumed = row.provider_usage_known ? Number(row.provider_usage_consumed ?? 0) : null;
+      const warnings: string[] = [];
+      if (row.max_handoffs - row.consumed_handoffs === 1) warnings.push('handoff_limit');
+      if (row.max_agent_runs > 0 && row.max_agent_runs - row.consumed_agent_runs === 1) {
+        warnings.push('agent_run_limit');
       }
-    })),
+      if (row.started_at && row.max_elapsed_seconds - elapsedSeconds <= Math.max(60, row.max_elapsed_seconds * 0.1)) {
+        warnings.push('elapsed_time_limit');
+      }
+      if (providerLimit !== null && providerConsumed !== null
+        && providerLimit - providerConsumed <= Math.max(1, providerLimit * 0.1)) {
+        warnings.push('provider_usage_limit');
+      }
+      return {
+        id: row.id, sourceMessageId: row.source_message_id, goal: row.goal,
+        constraints: row.constraints, status: row.status, allowParallel: row.allow_parallel, steps: row.steps,
+        constraintInputs: row.constraint_inputs,
+        budget: {
+          state: row.budget_stop_reason ? 'exhausted' as const
+            : warnings.length > 0 ? 'approaching' as const : 'available' as const,
+          warnings,
+          stopReason: row.budget_stop_reason,
+          noticeMessageId: row.budget_notice_message_id,
+          reservationAccounting: row.reservation_accounting,
+          maxParticipants: row.max_participants, consumedParticipants: row.participant_count,
+          maxHandoffs: row.max_handoffs, consumedHandoffs: row.consumed_handoffs,
+          maxDepth: row.max_depth,
+          maxAgentRuns: row.max_agent_runs, consumedAgentRuns: row.consumed_agent_runs,
+          maxElapsedSeconds: row.max_elapsed_seconds, elapsedSeconds,
+          providerUsage: row.provider_usage_known
+            ? { known: true as const, consumed: providerConsumed!, limit: providerLimit }
+            : { known: false as const, consumed: null, limit: providerLimit }
+        }
+      };
+    }),
     findings: findings.rows.map((row) => ({
       id: row.id, resultMessageId: row.result_message_id, sourceHandoffId: row.source_handoff_id,
       summary: row.summary, confidence: Number(row.confidence), observedEvidence: row.observed_evidence,

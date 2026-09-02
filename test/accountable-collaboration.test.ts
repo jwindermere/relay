@@ -165,6 +165,21 @@ test('coordination plans cannot authorize unsupported work outputs', () => {
 \`\`\``), /output type is not allowed/);
 });
 
+test('Provider-usage-limited coordination cannot make unreservable parallel claims', () => {
+  assert.throws(() => normalizeCoordinationPlan({
+    goal: 'Assess two sources within a measurable Provider allowance',
+    allowParallel: true,
+    budget: {
+      maxParticipants: 2, maxHandoffs: 2, maxDepth: 1,
+      maxAgentRuns: 0, maxElapsedSeconds: 600, providerUsageLimit: 100
+    },
+    steps: [
+      { key: 'first', agentId: 'riley', instruction: 'Assess the first source', dependencies: [] },
+      { key: 'second', agentId: 'maya', instruction: 'Assess the second source', dependencies: [] }
+    ]
+  }), /Provider-usage-limited coordination must run sequentially/);
+});
+
 test('coordination budget reservations never overspend', () => {
   assert.deepEqual(reserveCoordinationBudget({ consumed: 1, limit: 2 }, 1), {
     consumed: 2, remaining: 0

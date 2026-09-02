@@ -175,9 +175,19 @@ export async function processNextConversationTurn(
       },
       async turnStarted(turnId) {
         await pool.query(
-          `UPDATE public.agent_conversation_turn
-           SET provider_turn_id = $4, updated_at = now()
-           WHERE id = $1 AND workspace_id = $2 AND lease_token = $3`,
+          `WITH started_turn AS (
+             UPDATE public.agent_conversation_turn
+             SET provider_turn_id = $4, updated_at = now()
+             WHERE id = $1 AND workspace_id = $2 AND lease_token = $3
+             RETURNING id
+           )
+           UPDATE public.coordination_budget_reservation reservation
+           SET outcome = 'started', updated_at = now()
+           FROM public.coordination_plan_step step, started_turn
+           WHERE step.conversation_turn_id = started_turn.id
+             AND reservation.step_id = step.id
+             AND reservation.reservation_kind = 'handoff'
+             AND reservation.outcome = 'reserved'`,
           [claim.id, claim.workspace_id, claim.lease_token, turnId]
         );
       },
@@ -489,6 +499,28 @@ async function finishConversationTurn(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const coordinationPlan = await client.query<{ plan_id: string }>(
+      `SELECT plan_id FROM public.coordination_plan_step
+       WHERE conversation_turn_id = $1 AND workspace_id = $2`,
+      [claim.id, claim.workspace_id]
+    );
+    if (coordinationPlan.rows[0]) {
+      await client.query(
+        `SELECT id FROM public.coordination_plan WHERE id = $1 FOR UPDATE`,
+        [coordinationPlan.rows[0].plan_id]
+      );
+    }
+    const ownedTurn = await client.query<{ status: string; lease_token: string | null }>(
+      `SELECT status, lease_token FROM public.agent_conversation_turn
+       WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+      [claim.id, claim.workspace_id]
+    );
+    if (ownedTurn.rows[0]?.status !== 'working'
+      || ownedTurn.rows[0].lease_token !== claim.lease_token) {
+      await restoreAgentStatus(client, claim.agent_id);
+      await client.query('COMMIT');
+      return;
+    }
     if (body !== null && status === 'completed' && claim.handoff_depth >= 1
       && /```relay-handoff\b/iu.test(body)) {
       await recordCollaborationEvaluationEvent(client, {
