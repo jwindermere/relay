@@ -6,6 +6,7 @@ import {
   findAgentTemplateUpgrade,
   instantiateAgentTemplate,
   listAgentTemplates,
+  loadAvailableAgentTemplateCapabilities,
   previewAgentTemplate,
   renderAgentTemplateExecutionBounds
 } from '../src/lib/server/collaboration/agent-templates.js';
@@ -118,6 +119,26 @@ test('Agent template instantiation rejects name collisions before persistence', 
     availableCapabilities: ['design_assets'],
     existingAgents: [{ name: 'Designer', roleLabel: 'Another role', ambientTriggers: [] }]
   }), /already exists/);
+});
+
+test('Agent template capabilities expose only authorised Project data and integrations', async () => {
+  const queries: unknown[][] = [];
+  const pool = {
+    async query(_statement: string, parameters: unknown[]) {
+      queries.push(parameters);
+      return queries.length === 1
+        ? { rows: [{ id: 'project-1' }] }
+        : { rows: [{ available: true }] };
+    }
+  };
+
+  const capabilities = await loadAvailableAgentTemplateCapabilities(
+    pool as never,
+    { workspace: { id: 'workspace-1' } } as never
+  );
+
+  assert.deepEqual(capabilities, ['project_data', 'repository_read']);
+  assert.deepEqual(queries, [['workspace-1'], ['workspace-1', 'project-1']]);
 });
 
 test('Agent template versions and permission ceilings are immutable catalog snapshots', () => {

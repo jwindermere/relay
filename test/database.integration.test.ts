@@ -1297,6 +1297,11 @@ if (connectionString) {
       }
     };
 
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess),
+      ['project_data']
+    );
+
     await assert.rejects(
       linkGitHubRepository(pool, memberAccess, {
         installationId: '101',
@@ -1322,6 +1327,33 @@ if (connectionString) {
       defaultBranch: 'main',
       releaseBranches: ['release']
     });
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, memberAccess),
+      ['project_data', 'repository_read']
+    );
+    const linkedProject = await pool.query<{ project_id: string }>(
+      'SELECT project_id FROM public.linked_repository WHERE workspace_id = $1',
+      [ownerAccess.workspace.id]
+    );
+    const otherProjectId = randomUUID();
+    await pool.query(
+      `INSERT INTO public.project (id, workspace_id, name)
+       VALUES ($1, $2, 'Other Project')`,
+      [otherProjectId, ownerAccess.workspace.id]
+    );
+    await pool.query(
+      'UPDATE public.linked_repository SET project_id = $2 WHERE workspace_id = $1',
+      [ownerAccess.workspace.id, otherProjectId]
+    );
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess),
+      ['project_data']
+    );
+    await pool.query(
+      'UPDATE public.linked_repository SET project_id = $2 WHERE workspace_id = $1',
+      [ownerAccess.workspace.id, linkedProject.rows[0]!.project_id]
+    );
+    await pool.query('DELETE FROM public.project WHERE id = $1', [otherProjectId]);
     await assert.rejects(
       requireAutonomousLinkedRepository(pool, ownerAccess.workspace.id, gateway),
       /verified Linked pilot repository is required/
@@ -1418,6 +1450,10 @@ if (connectionString) {
     assert.equal(disabled.linkState, 'linked');
     assert.equal(disabled.githubConnectionState, 'disabled');
     assert.equal(disabled.readyForAutonomousWork, false);
+    assert.deepEqual(
+      await loadAvailableAgentTemplateCapabilities(pool, ownerAccess),
+      ['project_data']
+    );
     const disabledVerification = await verifyLinkedRepository(pool, ownerAccess, gateway);
     assert.equal(disabledVerification.linkState, 'linked');
     assert.equal(disabledVerification.githubConnectionState, 'disabled');

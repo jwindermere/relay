@@ -1,6 +1,7 @@
 import type { Pool } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
+import { hasActiveLinkedRepositoryForProject } from '../github/connection.js';
 import {
   createWorkspaceAgent,
   assertAgentTemplatePermissionCeiling,
@@ -203,14 +204,20 @@ export async function loadAvailableAgentTemplateCapabilities(
   pool: Pool,
   access: WorkspaceAccess
 ): Promise<AgentCapability[]> {
-  const result = await pool.query<{ project_data: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM public.project WHERE workspace_id = $1
-     ) AS project_data`,
+  const project = await pool.query<{ id: string }>(
+    `SELECT id FROM public.project
+     WHERE workspace_id = $1
+     ORDER BY created_at, id
+     LIMIT 1`,
     [access.workspace.id]
   );
+  const projectId = project.rows[0]?.id;
+  if (!projectId) return [];
   const available: AgentCapability[] = [];
-  if (result.rows[0]?.project_data) available.push('project_data');
+  available.push('project_data');
+  if (await hasActiveLinkedRepositoryForProject(pool, access.workspace.id, projectId)) {
+    available.push('repository_read');
+  }
   return available;
 }
 
