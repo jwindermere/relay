@@ -1124,7 +1124,7 @@
         {plan.steps.length} steps · {plan.allowParallel ? 'parallel when dependencies allow' : 'sequential'}
         · {plan.budget.consumedParticipants}/{plan.budget.maxParticipants} participants
         · {plan.budget.consumedHandoffs}/{plan.budget.maxHandoffs} handoffs
-        · depth {plan.budget.maxDepth} · {plan.budget.consumedAgentRuns}/{plan.budget.maxAgentRuns} AgentRuns
+        · depth {plan.budget.maxDepth} · AgentRun limit 0 (Engineering delegation is independent)
         · {plan.budget.elapsedSeconds}/{plan.budget.maxElapsedSeconds}s elapsed
         · provider usage {plan.budget.providerUsage.known ? `${plan.budget.providerUsage.consumed}/${plan.budget.providerUsage.limit ?? '∞'}` : 'unknown'}
       </p>

@@ -155,7 +155,7 @@ test('coordination plans reject hidden participants and recursive handoffs', () 
 
   assert.equal(normalizeCoordinationPlan({
     goal: 'Use the existing review artifact', allowParallel: false,
-    budget: { maxParticipants: 1, maxHandoffs: 0, maxDepth: 0, maxAgentRuns: 1, maxElapsedSeconds: 600 },
+    budget: { maxParticipants: 1, maxHandoffs: 0, maxDepth: 0, maxAgentRuns: 0, maxElapsedSeconds: 600 },
     steps: [{
       key: 'review', agentId: 'alex', instruction: 'Review the existing result',
       dependencies: [], expectedOutput: 'artifact', artifactId: 'artifact-1'
@@ -164,9 +164,21 @@ test('coordination plans reject hidden participants and recursive handoffs', () 
 });
 
 test('coordination plans cannot authorize unsupported work outputs', () => {
+  assert.throws(() => normalizeCoordinationPlan({
+    goal: 'Reserve engineering execution through coordination', allowParallel: false,
+    budget: {
+      maxParticipants: 1, maxHandoffs: 1, maxDepth: 1,
+      maxAgentRuns: 1, maxElapsedSeconds: 600
+    },
+    steps: [{
+      key: 'research', agentId: 'riley', instruction: 'Assess engineering readiness',
+      dependencies: []
+    }]
+  }), /AgentRun limit must be zero.*Engineering delegation is independent/);
+
   assert.throws(() => parseCoordinationPlanProposal(`
 \`\`\`relay-coordination-plan
-{"goal":"Change the repository through coordination","allowParallel":false,"budget":{"maxParticipants":1,"maxHandoffs":1,"maxDepth":1,"maxAgentRuns":1,"maxElapsedSeconds":600},"steps":[{"key":"implement","agentId":"alex","instruction":"Commit the change","dependencies":[],"expectedOutput":"repository_change"}]}
+{"goal":"Change the repository through coordination","allowParallel":false,"budget":{"maxParticipants":1,"maxHandoffs":1,"maxDepth":1,"maxAgentRuns":0,"maxElapsedSeconds":600},"steps":[{"key":"implement","agentId":"alex","instruction":"Commit the change","dependencies":[],"expectedOutput":"repository_change"}]}
 \`\`\``), /output type is not allowed/);
 });
 

@@ -162,7 +162,7 @@ export async function processNextConversationTurn(
           ? 'This is a bounded Agent handoff. Answer the requested input directly and do not @mention another Agent.'
           : 'Do not start social or open-ended agent-to-agent chatter.',
         claim.routing_intent === 'coordination_candidate' && claim.handoff_depth === 0
-          ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Do not start plan work; a Pilot member must approve it.'
+          ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Set budget.maxAgentRuns to 0 because Coordination is conversational and Engineering delegation is independent. Do not start plan work; a Pilot member must approve it.'
           : '',
         structuredFindingRequired && claim.coordination_expected_output === null
           ? 'Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'

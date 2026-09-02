@@ -250,6 +250,39 @@ if (connectionString) {
       { table_name: 'coordination_plan', column_name: 'agent_configuration_version', is_nullable: 'NO' },
       { table_name: 'coordination_plan', column_name: 'agent_type_snapshot', is_nullable: 'NO' }
     ]);
+    const coordinationAgentRunConstraints = await pool.query<{
+      table_name: string; definition: string;
+    }>(`
+      SELECT table_row.relname AS table_name,
+             pg_get_constraintdef(constraint_row.oid) AS definition
+      FROM pg_constraint constraint_row
+      JOIN pg_class table_row ON table_row.oid = constraint_row.conrelid
+      JOIN pg_namespace schema_row ON schema_row.oid = table_row.relnamespace
+      WHERE schema_row.nspname = 'public'
+        AND constraint_row.conname IN (
+          'coordination_plan_max_agent_runs_check',
+          'workspace_coordination_policy_default_max_agent_runs_check',
+          'coordination_budget_reservation_reservation_kind_check'
+        )
+      ORDER BY table_row.relname
+    `);
+    assert.deepEqual(coordinationAgentRunConstraints.rows.map((row) => ({
+      tableName: row.table_name,
+      definition: row.definition.replaceAll(' ', '')
+    })), [
+      {
+        tableName: 'coordination_budget_reservation',
+        definition: "CHECK((reservation_kind='handoff'::text))"
+      },
+      {
+        tableName: 'coordination_plan',
+        definition: 'CHECK((max_agent_runs=0))'
+      },
+      {
+        tableName: 'workspace_coordination_policy',
+        definition: 'CHECK((default_max_agent_runs=0))'
+      }
+    ]);
     await assert.doesNotReject(assertCompatibleSchema(pool));
   });
 

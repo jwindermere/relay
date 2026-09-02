@@ -2774,7 +2774,7 @@ if (skipDatabaseTests) {
       maxParticipants: 3,
       maxHandoffs: 4,
       maxDepth: 1,
-      maxAgentRuns: 2,
+      maxAgentRuns: 0,
       maxElapsedSeconds: 1800,
       providerUsageLimit: 80,
       parallelPermitted: false
