@@ -768,18 +768,18 @@ if (connectionString) {
     t.after(async () => {
       await pool.query(
         `DELETE FROM public.project_membership
-         WHERE project_id = ANY($1::uuid[])`,
+         WHERE project_id = ANY($1::text[])`,
         [[selectedProjectId, inaccessibleProjectId, foreignProjectId]]
       );
       if (createdAgentIds.length > 0) {
         await pool.query(
-          `DELETE FROM public.workspace_member WHERE agent_id = ANY($1::uuid[])`,
+          `DELETE FROM public.workspace_member WHERE agent_id = ANY($1::text[])`,
           [createdAgentIds]
         );
-        await pool.query(`DELETE FROM public.agent WHERE id = ANY($1::uuid[])`, [createdAgentIds]);
+        await pool.query(`DELETE FROM public.agent WHERE id = ANY($1::text[])`, [createdAgentIds]);
       }
       await pool.query(
-        `DELETE FROM public.project WHERE id = ANY($1::uuid[])`,
+        `DELETE FROM public.project WHERE id = ANY($1::text[])`,
         [[selectedProjectId, inaccessibleProjectId, foreignProjectId]]
       );
       await pool.query(`DELETE FROM public.workspace WHERE id = $1`, [foreignWorkspaceId]);
