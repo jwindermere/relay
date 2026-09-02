@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { presentFindingEvidence } from '../src/lib/finding-presentation.js';
+import { renderMarkdown } from '../src/lib/markdown.js';
 import {
   normalizeFindingInput,
   parseFindingResult,
@@ -10,7 +11,9 @@ import {
 import {
   normalizeCoordinationPlan,
   parseCoordinationPlanProposal,
-  reserveCoordinationBudget
+  renderCoordinationSynthesis,
+  reserveCoordinationBudget,
+  resolveCoordinationStepStatus
 } from '../src/lib/server/collaboration/coordination.js';
 import { decideMessageIntent } from '../src/lib/server/collaboration/message-intent.js';
 import {
@@ -178,6 +181,47 @@ test('Provider-usage-limited coordination cannot make unreservable parallel clai
       { key: 'second', agentId: 'maya', instruction: 'Assess the second source', dependencies: [] }
     ]
   }), /Provider-usage-limited coordination must run sequentially/);
+});
+
+test('structured Finding steps fail closed when no Finding was persisted', () => {
+  assert.equal(resolveCoordinationStepStatus({
+    providerStatus: 'completed', expectedOutput: 'structured_finding',
+    hasResultMessage: true, hasStructuredFinding: false
+  }), 'failed');
+  assert.equal(resolveCoordinationStepStatus({
+    providerStatus: 'completed', expectedOutput: 'structured_finding',
+    hasResultMessage: true, hasStructuredFinding: true
+  }), 'completed');
+  assert.equal(resolveCoordinationStepStatus({
+    providerStatus: 'completed', expectedOutput: 'concise_text',
+    hasResultMessage: true, hasStructuredFinding: false
+  }), 'completed');
+  assert.equal(resolveCoordinationStepStatus({
+    providerStatus: 'completed', expectedOutput: 'concise_text',
+    hasResultMessage: false, hasStructuredFinding: false
+  }), 'failed');
+});
+
+test('coordination synthesis summarizes and links every approved step output', () => {
+  const synthesis = renderCoordinationSynthesis('Assess launch readiness', [{
+    key: 'research', agentName: 'Riley', instruction: 'Assess the evidence',
+    summary: 'Release evidence supports a phased launch.',
+    resultMessageId: 'result:research', artifactId: null, artifactUrl: null,
+    artifactResultMessageId: null
+  }, {
+    key: 'review', agentName: 'Alex', instruction: 'Review the existing pull request',
+    summary: null, resultMessageId: null, artifactId: 'artifact-7',
+    artifactUrl: 'https://github.test/acme/relay/pull/7',
+    artifactResultMessageId: 'result:artifact-7'
+  }]);
+  assert.equal(synthesis, `Coordination complete: Assess launch readiness
+
+1. Riley — research: Release evidence supports a phased launch. [View result](#message-result%3Aresearch)
+2. Alex — review: Existing Artifact [artifact-7](https://github.test/acme/relay/pull/7) ([Channel record](#message-result%3Aartifact-7))`);
+  const rendered = renderMarkdown(synthesis);
+  assert.match(rendered, /href="#message-result%3Aresearch"/);
+  assert.match(rendered, /href="https:\/\/github\.test\/acme\/relay\/pull\/7"/);
+  assert.match(rendered, /href="#message-result%3Aartifact-7"/);
 });
 
 test('coordination budget reservations never overspend', () => {

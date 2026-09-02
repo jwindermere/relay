@@ -2593,6 +2593,25 @@ if (skipDatabaseTests) {
       maxAgentRuns: 0, maxElapsedSeconds: 3600, parallelPermitted: true
     });
     await decideCoordinationPlan(pool, ids.ownerAccess, planId, 'approve');
+    await decideCoordinationPlan(pool, ids.memberAccess, planId, 'pause');
+    assert.equal(await claimCoordinationStep(pool, planId), null);
+    await decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume');
+    const resumed = await pool.query<{
+      status: string; approved_by_workspace_member_id: string; resume_events: number;
+    }>(
+      `SELECT plan.status, plan.approved_by_workspace_member_id,
+              (SELECT count(*)::integer FROM public.audit_event event
+               WHERE event.subject_type = 'coordination_plan' AND event.subject_id = plan.id
+                 AND event.event_type = 'coordination_plan.resumed'
+                 AND event.actor_membership_id = $2) AS resume_events
+       FROM public.coordination_plan plan WHERE plan.id = $1`,
+      [planId, ids.memberAccess.membership.id]
+    );
+    assert.deepEqual(resumed.rows[0], {
+      status: 'approved',
+      approved_by_workspace_member_id: ids.memberWorkspaceMemberId,
+      resume_events: 1
+    });
     const planConstraint = await postChannelMessage(pool, ids.memberAccess, {
       channelId: ids.channelId,
       parentMessageId: 'message-coordination-approval',
@@ -2666,6 +2685,10 @@ if (skipDatabaseTests) {
       pool, ids.memberAccess, ids.channelId, {}
     )).messages.find(({ id }) => id === `coordination-budget:${planId}`);
     assert.match(budgetNotice?.body ?? '', /handoff limit reached.*Pilot direction is required/);
+    await assert.rejects(
+      decideCoordinationPlan(pool, ids.memberAccess, planId, 'resume'),
+      /cannot resume after a hard budget stop/
+    );
     const created = await pool.query<{
       turns: number; runs: number; depth: number; request_body: string;
       constraints: string[]; constraint_status: string;

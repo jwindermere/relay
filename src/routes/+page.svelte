@@ -802,7 +802,7 @@
     await requestReconciliation();
   }
 
-  async function decidePlan(planId: string, action: 'approve' | 'reject' | 'pause' | 'cancel') {
+  async function decidePlan(planId: string, action: 'approve' | 'reject' | 'pause' | 'resume' | 'cancel') {
     const response = await fetch(`/api/workspace/coordination/${encodeURIComponent(planId)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
@@ -1151,6 +1151,13 @@
       {:else if ['approved', 'active'].includes(plan.status)}
         <div class="mt-2 flex gap-2">
           <button class="btn btn-ghost btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'pause')}>Pause</button>
+          <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
+        </div>
+      {:else if plan.status === 'paused'}
+        <div class="mt-2 flex gap-2">
+          {#if plan.budget.state !== 'exhausted'}
+            <button class="btn btn-primary btn-xs" type="button" onclick={() => void decidePlan(plan.id, 'resume')}>Resume approved plan</button>
+          {/if}
           <button class="btn btn-ghost btn-xs text-error" type="button" onclick={() => void decidePlan(plan.id, 'cancel')}>Cancel</button>
         </div>
       {/if}

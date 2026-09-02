@@ -150,6 +150,61 @@ export function reserveCoordinationBudget(
   return { consumed, remaining: budget.limit - consumed };
 }
 
+export function resolveCoordinationStepStatus(input: {
+  providerStatus: 'completed' | 'failed';
+  expectedOutput: CoordinationOutputType;
+  hasResultMessage: boolean;
+  hasStructuredFinding: boolean;
+}): 'completed' | 'failed' {
+  if (input.providerStatus === 'failed') return 'failed';
+  if (input.expectedOutput !== 'artifact' && !input.hasResultMessage) return 'failed';
+  if (input.expectedOutput === 'structured_finding' && !input.hasStructuredFinding) {
+    return 'failed';
+  }
+  return 'completed';
+}
+
+export interface CoordinationSynthesisStep {
+  key: string;
+  agentName: string;
+  instruction: string;
+  summary: string | null;
+  resultMessageId: string | null;
+  artifactId: string | null;
+  artifactUrl: string | null;
+  artifactResultMessageId: string | null;
+}
+
+function synthesisText(value: string): string {
+  return value.replace(/\s+/gu, ' ').trim().slice(0, 1000).replace(/[\\[\]*_`]/gu, '\\$&');
+}
+
+function channelMessageLink(messageId: string, label: string): string {
+  return `[${label}](#message-${encodeURIComponent(messageId)})`;
+}
+
+export function renderCoordinationSynthesis(
+  goal: string,
+  steps: CoordinationSynthesisStep[]
+): string {
+  const lines = steps.map((step, index) => {
+    const prefix = `${index + 1}. ${synthesisText(step.agentName)} — ${synthesisText(step.key)}:`;
+    if (step.artifactId && step.artifactUrl) {
+      const artifact = `Existing Artifact [${synthesisText(step.artifactId)}](${step.artifactUrl})`;
+      const channelRecord = step.artifactResultMessageId
+        ? ` (${channelMessageLink(step.artifactResultMessageId, 'Channel record')})`
+        : '';
+      return `${prefix} ${artifact}${channelRecord}`;
+    }
+    const summary = synthesisText(step.summary || step.instruction);
+    const result = step.resultMessageId
+      ? ` ${channelMessageLink(step.resultMessageId, 'View result')}`
+      : '';
+    return `${prefix} ${summary}${result}`;
+  });
+  return `Coordination complete: ${synthesisText(goal)}\n\n${lines.join('\n')}`;
+}
+
 export async function updateWorkspaceCoordinationPolicy(
   pool: Pool,
   access: WorkspaceAccess,
@@ -352,13 +407,92 @@ export async function proposeCoordinationPlan(
   }
 }
 
+async function assertCoordinationPlanCanActivate(
+  client: PoolClient,
+  workspaceId: string,
+  planId: string,
+  resuming: boolean
+): Promise<void> {
+  const validation = await client.query<{
+    allowed: boolean; budget_stop_reason: CoordinationBudgetStopReason | null;
+  }>(
+    `SELECT (
+       provider.status = 'ready'
+       AND plan.max_participants <= policy.default_max_participants
+       AND plan.max_handoffs <= policy.default_max_handoffs
+       AND plan.max_depth <= policy.default_max_depth
+       AND plan.max_agent_runs <= policy.default_max_agent_runs
+       AND plan.max_elapsed_seconds <= policy.default_max_elapsed_seconds
+       AND (NOT plan.allow_parallel OR policy.parallel_permitted)
+       AND NOT (plan.allow_parallel AND plan.provider_usage_limit IS NOT NULL)
+       AND (policy.default_provider_usage_limit IS NULL OR (
+         plan.provider_usage_limit IS NOT NULL
+         AND plan.provider_usage_limit <= policy.default_provider_usage_limit
+       ))
+       AND (provider.coordination_provider_usage_limit IS NULL OR (
+         plan.provider_usage_limit IS NOT NULL
+         AND plan.provider_usage_limit <= provider.coordination_provider_usage_limit
+       ))
+       AND (plan.started_at IS NULL
+         OR now() < plan.started_at + plan.max_elapsed_seconds * interval '1 second')
+       AND (plan.provider_usage_limit IS NULL OR NOT plan.provider_usage_known
+         OR COALESCE(plan.provider_usage_consumed, 0) < plan.provider_usage_limit)
+       AND (
+         NOT EXISTS (
+           SELECT 1 FROM public.coordination_plan_step step
+           WHERE step.plan_id = plan.id AND step.status <> 'completed'
+             AND step.expected_output <> 'artifact'
+         )
+         OR COALESCE((
+           SELECT sum(reservation.amount)
+           FROM public.coordination_budget_reservation reservation
+           WHERE reservation.plan_id = plan.id AND reservation.reservation_kind = 'handoff'
+         ), 0) < plan.max_handoffs
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM public.coordination_plan_step step
+         LEFT JOIN public.agent agent
+           ON agent.id = step.target_agent_id AND agent.workspace_id = step.workspace_id
+         LEFT JOIN public.workspace_member member ON member.agent_id = agent.id
+         LEFT JOIN public.project_membership project_member
+           ON project_member.workspace_member_id = member.id
+          AND project_member.project_id = step.project_id
+         WHERE step.plan_id = plan.id AND step.status <> 'completed'
+           AND (agent.id IS NULL OR NOT agent.enabled OR agent.status = 'disabled'
+             OR project_member.workspace_member_id IS NULL)
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM public.coordination_plan_step step
+         LEFT JOIN public.artifact artifact
+           ON artifact.id = step.artifact_id AND artifact.workspace_id = step.workspace_id
+          AND artifact.project_id = step.project_id
+         WHERE step.plan_id = plan.id AND step.artifact_id IS NOT NULL
+           AND step.status <> 'completed' AND artifact.id IS NULL
+       )
+     ) AS allowed, plan.budget_stop_reason
+     FROM public.coordination_plan plan
+     JOIN public.workspace_coordination_policy policy ON policy.workspace_id = plan.workspace_id
+     JOIN public.provider_connection provider ON provider.workspace_id = plan.workspace_id
+     WHERE plan.id = $1 AND plan.workspace_id = $2
+     FOR UPDATE OF plan, policy, provider`,
+    [planId, workspaceId]
+  );
+  const result = validation.rows[0];
+  if (resuming && result?.budget_stop_reason) {
+    throw new CoordinationError('Coordination plan cannot resume after a hard budget stop');
+  }
+  if (!result?.allowed) {
+    throw new CoordinationError('Coordination plan exceeds current Workspace or Provider limits');
+  }
+}
+
 export async function decideCoordinationPlan(
   pool: Pool,
   access: WorkspaceAccess,
   planId: string,
-  action: 'approve' | 'reject' | 'pause' | 'cancel'
+  action: 'approve' | 'reject' | 'pause' | 'resume' | 'cancel'
 ): Promise<void> {
-  if (!['approve', 'reject', 'pause', 'cancel'].includes(action)) {
+  if (!['approve', 'reject', 'pause', 'resume', 'cancel'].includes(action)) {
     throw new CoordinationError('Coordination plan decision is invalid');
   }
   const client = await pool.connect();
@@ -374,38 +508,27 @@ export async function decideCoordinationPlan(
       [access.workspace.id, access.membership.id, planId]
     );
     if (!actor.rows[0]) throw new CoordinationError('active Pilot membership is required');
-    if (action === 'approve') {
-      const withinCurrentLimits = await client.query<{ allowed: boolean }>(
-        `SELECT (
-           plan.max_participants <= policy.default_max_participants
-           AND plan.max_handoffs <= policy.default_max_handoffs
-           AND plan.max_depth <= policy.default_max_depth
-           AND plan.max_agent_runs <= policy.default_max_agent_runs
-           AND plan.max_elapsed_seconds <= policy.default_max_elapsed_seconds
-           AND (NOT plan.allow_parallel OR policy.parallel_permitted)
-           AND NOT (plan.allow_parallel AND plan.provider_usage_limit IS NOT NULL)
-           AND (policy.default_provider_usage_limit IS NULL OR (
-             plan.provider_usage_limit IS NOT NULL
-             AND plan.provider_usage_limit <= policy.default_provider_usage_limit
-           ))
-           AND (provider.coordination_provider_usage_limit IS NULL OR (
-             plan.provider_usage_limit IS NOT NULL
-             AND plan.provider_usage_limit <= provider.coordination_provider_usage_limit
-           ))
-         ) AS allowed
-         FROM public.coordination_plan plan
-         JOIN public.workspace_coordination_policy policy ON policy.workspace_id = plan.workspace_id
-         JOIN public.provider_connection provider ON provider.workspace_id = plan.workspace_id
-         WHERE plan.id = $1 AND plan.workspace_id = $2
-         FOR UPDATE OF plan, policy, provider`,
-        [planId, access.workspace.id]
+    if (action === 'approve' || action === 'resume') {
+      await assertCoordinationPlanCanActivate(
+        client, access.workspace.id, planId, action === 'resume'
       );
-      if (!withinCurrentLimits.rows[0]?.allowed) {
-        throw new CoordinationError('Coordination plan exceeds current Workspace or Provider limits');
-      }
     }
-    const nextStatus = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : action === 'pause' ? 'paused' : 'cancelled';
-    const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed'] : ['approved', 'active', 'paused'];
+    const resumedStatus = action === 'resume'
+      ? (await client.query<{ active: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM public.coordination_plan_step
+             WHERE plan_id = $1 AND status = 'active'
+           ) AS active`,
+          [planId]
+        )).rows[0]?.active ? 'active' : 'approved'
+      : null;
+    const nextStatus = action === 'approve' ? 'approved'
+      : action === 'reject' ? 'rejected'
+        : action === 'pause' ? 'paused'
+          : action === 'resume' ? resumedStatus!
+            : 'cancelled';
+    const allowedCurrent = action === 'approve' || action === 'reject' ? ['proposed']
+      : action === 'resume' ? ['paused'] : ['approved', 'active', 'paused'];
     const updated = await client.query<{
       project_id: string; coordinating_agent_id: string; routing_policy_version: string;
       agent_configuration_version: number;
@@ -413,15 +536,28 @@ export async function decideCoordinationPlan(
     }>(
       `UPDATE public.coordination_plan
        SET status = $4,
-           approved_by_workspace_member_id = CASE WHEN $4 = 'approved' THEN $3 ELSE approved_by_workspace_member_id END,
-           approved_at = CASE WHEN $4 = 'approved' THEN now() ELSE approved_at END,
+           approved_by_workspace_member_id = CASE WHEN $6 THEN $3 ELSE approved_by_workspace_member_id END,
+           approved_at = CASE WHEN $6 THEN now() ELSE approved_at END,
            updated_at = now()
        WHERE id = $1 AND workspace_id = $2 AND status = ANY($5::text[])
        RETURNING project_id, coordinating_agent_id, routing_policy_version,
          agent_configuration_version, agent_type_snapshot`,
-      [planId, access.workspace.id, actor.rows[0].id, nextStatus, allowedCurrent]
+      [planId, access.workspace.id, actor.rows[0].id, nextStatus, allowedCurrent,
+        action === 'approve' || action === 'resume']
     );
     if (updated.rowCount !== 1) throw new CoordinationError('Coordination plan cannot accept that decision');
+    if (action === 'resume') {
+      await client.query(
+        `INSERT INTO public.audit_event (
+           workspace_id, actor_user_id, actor_membership_id,
+           event_type, subject_type, subject_id, evidence
+         ) VALUES ($1, $2, $3, 'coordination_plan.resumed', 'coordination_plan', $4,
+           jsonb_build_object('status', $5::text,
+                              'approvedByWorkspaceMemberId', $6::text))`,
+        [access.workspace.id, access.identity.userId, access.membership.id,
+          planId, nextStatus, actor.rows[0].id]
+      );
+    }
     if (action === 'approve') {
       await client.query(
         `UPDATE public.coordination_plan_step step SET status = 'ready'
@@ -880,12 +1016,36 @@ export async function completeCoordinationStep(
     status: 'completed' | 'failed'; resultMessageId: string | null;
   }
 ): Promise<void> {
+  const output = await client.query<{
+    expected_output: CoordinationOutputType; has_structured_finding: boolean;
+  }>(
+    `SELECT step.expected_output,
+            EXISTS (
+              SELECT 1 FROM public.agent_finding finding
+              WHERE finding.result_message_id = $3
+                AND finding.workspace_id = step.workspace_id
+                AND finding.project_id = step.project_id
+                AND finding.author_agent_id = step.target_agent_id
+            ) AS has_structured_finding
+     FROM public.coordination_plan_step step
+     WHERE step.conversation_turn_id = $1 AND step.workspace_id = $2
+       AND step.status = 'active'`,
+    [input.conversationTurnId, input.workspaceId, input.resultMessageId]
+  );
+  const expectedOutput = output.rows[0];
+  if (!expectedOutput) return;
+  const stepStatus = resolveCoordinationStepStatus({
+    providerStatus: input.status,
+    expectedOutput: expectedOutput.expected_output,
+    hasResultMessage: input.resultMessageId !== null,
+    hasStructuredFinding: expectedOutput.has_structured_finding
+  });
   const completed = await client.query<{ id: string; plan_id: string; target_agent_id: string }>(
     `UPDATE public.coordination_plan_step
      SET status = $3, result_message_id = $4, completed_at = now()
      WHERE conversation_turn_id = $1 AND workspace_id = $2 AND status = 'active'
      RETURNING id, plan_id, target_agent_id`,
-    [input.conversationTurnId, input.workspaceId, input.status, input.resultMessageId]
+    [input.conversationTurnId, input.workspaceId, stepStatus, input.resultMessageId]
   );
   const planId = completed.rows[0]?.plan_id;
   if (!planId) return;
@@ -898,7 +1058,7 @@ export async function completeCoordinationStep(
        ELSE outcome
      END, updated_at = now()
      WHERE step_id = $1 AND reservation_kind = 'handoff'`,
-    [completed.rows[0]!.id, input.status]
+    [completed.rows[0]!.id, stepStatus]
   );
   await refreshCoordinationProviderUsage(client, planId, input.workspaceId);
   const evaluation = await client.query<{
@@ -917,16 +1077,16 @@ export async function completeCoordinationStep(
   if (evaluationContext) {
     await recordCollaborationEvaluationEvent(client, {
       workspaceId: evaluationContext.workspace_id, projectId: evaluationContext.project_id,
-      eventType: `outcome.${input.status}`, agentId: completed.rows[0]!.target_agent_id,
+      eventType: `outcome.${stepStatus}`, agentId: completed.rows[0]!.target_agent_id,
       routingPolicyVersion: evaluationContext.routing_policy_version,
       agentConfigurationVersion: `agent-config-${evaluationContext.agent_configuration_version}`,
       agentType: evaluationContext.agent_type_snapshot,
       promptVersion: 'coordination-step-v1', permissionPolicyVersion: 'coordination-budget-v1',
       outcomeType: 'coordination_step', outcomeId: completed.rows[0]!.id,
-      evidence: { status: input.status }
+      evidence: { status: stepStatus }
     });
   }
-  if (input.status === 'failed') {
+  if (stepStatus === 'failed') {
     await client.query(
       `UPDATE public.coordination_plan SET status = 'paused', updated_at = now() WHERE id = $1`,
       [planId]
@@ -1021,39 +1181,58 @@ async function finishCoordinationPlanIfComplete(client: PoolClient, planId: stri
       coordinating_agent_id: string; routing_policy_version: string;
       agent_configuration_version: number;
       agent_type_snapshot: string;
-      coordinator_member_id: string; result_ids: string[]; artifact_ids: string[];
+      coordinator_member_id: string; goal: string;
     }>(
       `SELECT plan.workspace_id, plan.project_id, plan.coordinating_agent_id,
               plan.routing_policy_version, plan.agent_configuration_version,
-              plan.agent_type_snapshot, source.channel_id,
+              plan.agent_type_snapshot, plan.goal, source.channel_id,
               COALESCE(source.parent_message_id, source.id) AS root_message_id,
-              member.id AS coordinator_member_id,
-              array_agg(step.result_message_id ORDER BY step.position)
-                FILTER (WHERE step.result_message_id IS NOT NULL) AS result_ids,
-              array_agg(step.artifact_id ORDER BY step.position)
-                FILTER (WHERE step.artifact_id IS NOT NULL) AS artifact_ids
+              member.id AS coordinator_member_id
        FROM public.coordination_plan plan
        JOIN public.message source ON source.id = plan.source_message_id
        JOIN public.workspace_member member ON member.agent_id = plan.coordinating_agent_id
-       JOIN public.coordination_plan_step step ON step.plan_id = plan.id
-       WHERE plan.id = $1
-       GROUP BY plan.id, source.id, member.id`,
+       WHERE plan.id = $1`,
       [planId]
     );
     const row = synthesis.rows[0];
     const synthesisMessageId = `coordination-synthesis:${planId}`;
     if (row) {
+      const stepResults = await client.query<{
+        step_key: string; agent_name: string; instruction: string; summary: string | null;
+        result_message_id: string | null; artifact_id: string | null;
+        artifact_url: string | null; artifact_result_message_id: string | null;
+      }>(
+        `SELECT step.step_key, agent.name AS agent_name, step.instruction,
+                COALESCE(finding.summary, result.body) AS summary,
+                step.result_message_id, step.artifact_id, artifact.url AS artifact_url,
+                artifact.result_message_id AS artifact_result_message_id
+         FROM public.coordination_plan_step step
+         JOIN public.agent agent ON agent.id = step.target_agent_id
+         LEFT JOIN public.message result ON result.id = step.result_message_id
+         LEFT JOIN public.agent_finding finding
+           ON finding.result_message_id = step.result_message_id
+         LEFT JOIN public.artifact artifact ON artifact.id = step.artifact_id
+         WHERE step.plan_id = $1
+         ORDER BY step.position, step.id`,
+        [planId]
+      );
+      const body = renderCoordinationSynthesis(row.goal, stepResults.rows.map((step) => ({
+        key: step.step_key,
+        agentName: step.agent_name,
+        instruction: step.instruction,
+        summary: step.summary,
+        resultMessageId: step.result_message_id,
+        artifactId: step.artifact_id,
+        artifactUrl: step.artifact_url,
+        artifactResultMessageId: step.artifact_result_message_id
+      })));
       await client.query(
         `INSERT INTO public.message (
            id, workspace_id, channel_id, author_workspace_member_id, parent_message_id, body
          ) VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (id) DO NOTHING`,
         [synthesisMessageId, row.workspace_id, row.channel_id, row.coordinator_member_id,
-          row.root_message_id,
-          `Coordination complete. Reviewed results: ${[
-            ...(row.result_ids ?? []).map((id) => `Message ${id}`),
-            ...(row.artifact_ids ?? []).map((id) => `Artifact ${id}`)
-          ].join(', ') || 'none'}.`]
+          row.root_message_id, body]
       );
       await client.query(
         `INSERT INTO public.notification_outbox (workspace_id, message_id, topic, payload)

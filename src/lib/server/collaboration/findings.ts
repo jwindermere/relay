@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 import type { WorkspaceAccess } from '../authentication/authorization.js';
 import { recordCollaborationEvaluationEvent } from './evaluation.js';
@@ -237,21 +237,20 @@ export async function createFinding(
   }
 }
 
-export async function createFindingFromAgentResult(
-  pool: Pool,
-  input: FindingInput & {
-    workspaceId: string; projectId: string; authorAgentId: string;
-    resultMessageId: string; sourceHandoffId?: string; routingPolicyVersion: string;
-    agentConfigurationVersion: string;
-    agentType: string;
-  }
+type AgentFindingResultInput = FindingInput & {
+  workspaceId: string; projectId: string; authorAgentId: string;
+  resultMessageId: string; sourceHandoffId?: string; routingPolicyVersion: string;
+  agentConfigurationVersion: string;
+  agentType: string;
+};
+
+export async function persistFindingFromAgentResult(
+  client: PoolClient,
+  input: AgentFindingResultInput
 ): Promise<string> {
   const finding = normalizeFindingInput(input);
-  const client = await pool.connect();
   const id = randomUUID();
-  try {
-    await client.query('BEGIN');
-    const source = await client.query<{ author_member_id: string }>(
+  const source = await client.query<{ author_member_id: string }>(
       `SELECT author.id AS author_member_id
        FROM public.message message
        JOIN public.channel channel ON channel.id = message.channel_id
@@ -346,6 +345,17 @@ export async function createFindingFromAgentResult(
         evidence: { duplicatesFindingId: duplicate.rows[0].id }
       });
     }
+  return id;
+}
+
+export async function createFindingFromAgentResult(
+  pool: Pool,
+  input: AgentFindingResultInput
+): Promise<string> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const id = await persistFindingFromAgentResult(client, input);
     await client.query('COMMIT');
     return id;
   } catch (error) {

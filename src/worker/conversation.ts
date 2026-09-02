@@ -19,9 +19,9 @@ import {
   proposeCoordinationPlan
 } from '../lib/server/collaboration/coordination.js';
 import {
-  createFindingFromAgentResult,
   loadAgentProjectMemoryContext,
   parseFindingResult,
+  persistFindingFromAgentResult,
   renderProjectMemoryContext
 } from '../lib/server/collaboration/findings.js';
 import {
@@ -612,6 +612,19 @@ async function finishConversationTurn(
       outcomeId: finishedHandoff.rows[0]?.id ?? messageId ?? claim.id,
       evidence: { status, errorCode }
     });
+    if (findingResult && messageId) {
+      await persistFindingFromAgentResult(client, {
+        ...findingResult.finding,
+        workspaceId: claim.workspace_id,
+        projectId: claim.project_id,
+        authorAgentId: claim.agent_id,
+        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
+        agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
+        agentType: claim.agent_type_snapshot,
+        resultMessageId: messageId,
+        ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
+      });
+    }
     await completeCoordinationStep(client, {
       workspaceId: claim.workspace_id,
       conversationTurnId: claim.id,
@@ -639,19 +652,6 @@ async function finishConversationTurn(
         routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
         agentConfigurationVersion: claim.agent_configuration_version,
         agentType: claim.agent_type_snapshot
-      }).catch(() => undefined);
-    }
-    if (findingResult && messageId) {
-      await createFindingFromAgentResult(pool, {
-        ...findingResult.finding,
-        workspaceId: claim.workspace_id,
-        projectId: claim.project_id,
-        authorAgentId: claim.agent_id,
-        routingPolicyVersion: claim.routing_policy_version ?? 'not-applicable-v1',
-        agentConfigurationVersion: `agent-config-${claim.agent_configuration_version}`,
-        agentType: claim.agent_type_snapshot,
-        resultMessageId: messageId,
-        ...(finishedHandoff.rows[0] ? { sourceHandoffId: finishedHandoff.rows[0].id } : {})
       }).catch(() => undefined);
     }
   } catch (error) {
