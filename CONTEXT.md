@@ -28,6 +28,10 @@ The primary collaboration surface where Pilot members and specialist Agents comm
 
 The human kind of Workspace member, linked to an authenticated human identity. Every invited collaborator has a separate account, membership, and attributable actions; the membership is distinct from the human's login identity.
 
+## Manually delivered invitation
+
+An email-bound, one-time Workspace invitation that the owner gives to its intended recipient through a trusted channel. Possession of its short-lived secret establishes the invited account's email for this Workspace without proving control of the corresponding mailbox.
+
 ## Agent
 
 The active or disabled agent kind of Workspace member, linked to its configurable name, type, role, instructions, participation policy, runtime configuration, and permissions. A Workspace may have multiple specialist Agents. Disabling prevents new work without erasing authorship or execution history.

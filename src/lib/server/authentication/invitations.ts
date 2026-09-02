@@ -3,6 +3,10 @@ import { hashPassword } from 'better-auth/crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import type { RelayAuth } from '../auth.js';
+import {
+  getInvitationDeliveryMode,
+  type InvitationDeliveryMode
+} from '../configuration.js';
 import { addPilotToCollaborationProject } from '../collaboration/setup.js';
 import { WorkspaceAccessError, type WorkspaceAccess } from './authorization.js';
 
@@ -23,6 +27,7 @@ export interface AcceptedWorkspaceInvitation {
 export interface InvitedAccount {
   userId: string;
   email: string;
+  verificationRequired: boolean;
 }
 
 export class WorkspaceInvitationError extends Error {
@@ -172,7 +177,8 @@ export async function registerInvitedAccount(
   pool: Pool,
   auth: RelayAuth,
   token: string,
-  input: { name: string; password: string }
+  input: { name: string; password: string },
+  options: { deliveryMode?: InvitationDeliveryMode } = {}
 ): Promise<InvitedAccount> {
   const name = input.name.trim();
   if (!name) throw new WorkspaceInvitationError('a name is required');
@@ -181,6 +187,8 @@ export async function registerInvitedAccount(
   }
 
   const passwordHash = await hashPassword(input.password);
+  const deliveryMode = options.deliveryMode ?? getInvitationDeliveryMode();
+  const verificationRequired = deliveryMode === 'email';
   const client = await pool.connect();
   let invitedAccount: InvitedAccount | undefined;
 
@@ -200,14 +208,26 @@ export async function registerInvitedAccount(
     }
 
     if (existing.rows[0]) {
-      invitedAccount = { userId: existing.rows[0].id, email: pending.email };
+      if (!verificationRequired) {
+        await client.query(
+          `UPDATE auth."user"
+           SET "emailVerified" = true, "updatedAt" = now()
+           WHERE id = $1`,
+          [existing.rows[0].id]
+        );
+      }
+      invitedAccount = {
+        userId: existing.rows[0].id,
+        email: pending.email,
+        verificationRequired
+      };
     } else {
       const userId = randomUUID();
       await client.query(
         `INSERT INTO auth."user" (
            id, name, email, "emailVerified", "createdAt", "updatedAt"
-         ) VALUES ($1, $2, $3, false, now(), now())`,
-        [userId, name, pending.email]
+         ) VALUES ($1, $2, $3, $4, now(), now())`,
+        [userId, name, pending.email, !verificationRequired]
       );
       await client.query(
         `INSERT INTO auth.account (
@@ -216,13 +236,37 @@ export async function registerInvitedAccount(
         [randomUUID(), userId, passwordHash]
       );
       await client.query(
-        `INSERT INTO public.audit_event (
+         `INSERT INTO public.audit_event (
            workspace_id, event_type, subject_type, subject_id, evidence
          ) VALUES ($1, 'authentication.invited_account.created', 'user', $2,
-           jsonb_build_object('invitationId', $3::text, 'email', $4::text))`,
-        [pending.workspace_id, userId, pending.id, pending.email]
+           jsonb_build_object(
+             'invitationId', $3::text,
+             'email', $4::text,
+             'verification', $5::text
+           ))`,
+        [
+          pending.workspace_id,
+          userId,
+          pending.id,
+          pending.email,
+          verificationRequired ? 'email' : 'invitation_token'
+        ]
       );
-      invitedAccount = { userId, email: pending.email };
+      invitedAccount = { userId, email: pending.email, verificationRequired };
+    }
+
+    if (!verificationRequired && invitedAccount) {
+      await client.query(
+        `INSERT INTO public.audit_event (
+           workspace_id, event_type, subject_type, subject_id, evidence
+         ) VALUES ($1, 'authentication.invited_account.manually_verified', 'user', $2,
+           jsonb_build_object(
+             'invitationId', $3::text,
+             'email', $4::text,
+             'verification', 'invitation_token'
+           ))`,
+        [pending.workspace_id, invitedAccount.userId, pending.id, pending.email]
+      );
     }
 
     await client.query('COMMIT');
@@ -234,9 +278,11 @@ export async function registerInvitedAccount(
   }
 
   if (!invitedAccount) throw new WorkspaceInvitationError('invited account could not be created');
-  await auth.api.sendVerificationEmail({
-    body: { email: invitedAccount.email, callbackURL: '/sign-in' }
-  });
+  if (verificationRequired) {
+    await auth.api.sendVerificationEmail({
+      body: { email: invitedAccount.email, callbackURL: '/sign-in' }
+    });
+  }
   return invitedAccount;
 }
 

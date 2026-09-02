@@ -5,6 +5,10 @@ worker, and PostgreSQL. The disposable product and execution prototypes remain u
 [`prototype/`](prototype/README.md) as design evidence; production code lives under
 [`src/`](src/).
 
+The Portainer/UmbrelOS deployment behind Nginx Proxy Manager is documented in
+[`ops/portainer/README.md`](ops/portainer/README.md). It pulls the Docker Hub image
+published after successful `main` CI and exposes the web service on host port `9095`.
+
 ## Local production stack
 
 Copy `.env.example` to `.env`, provision the referenced secret files and off-host
@@ -116,6 +120,13 @@ request (and `RELAY_EMAIL_DELIVERY_TOKEN` when it requires a bearer credential):
 
 The gateway response must be successful before registration reports success. Relay
 stores neither the invitation's raw token nor the email-verification token.
+
+A self-hosted deployment without an email gateway may explicitly set
+`RELAY_INVITATION_DELIVERY_MODE=manual`. In that mode the owner must deliver the
+email-bound, one-time invitation through a trusted channel; possession of its 24-hour
+secret marks the invited account verified without proving mailbox control. Email
+delivery remains the default, and manual mode provides neither password recovery nor
+email notifications.
 
 ## Prototypes
 

@@ -1,5 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
+export type InvitationDeliveryMode = 'email' | 'manual';
+
 export const WORKER_SECRET_ENVIRONMENT = Object.freeze([
   'DATABASE_URL',
   'RELAY_GITHUB_PRIVATE_KEY'
@@ -22,6 +24,16 @@ export async function loadFileBackedEnvironment(
     environment[name] = value;
     delete environment[fileVariable];
   }
+}
+
+export function getInvitationDeliveryMode(
+  environment: NodeJS.ProcessEnv = process.env
+): InvitationDeliveryMode {
+  const configured = environment.RELAY_INVITATION_DELIVERY_MODE?.trim().toLowerCase() || 'email';
+  if (configured !== 'email' && configured !== 'manual') {
+    throw new Error('RELAY_INVITATION_DELIVERY_MODE must be email or manual');
+  }
+  return configured;
 }
 
 export function getJitsiBaseUrl(environment: NodeJS.ProcessEnv = process.env): string {

@@ -1,0 +1,132 @@
+x-relay-image: &relay-image
+  image: ${RELAY_IMAGE:?set RELAY_IMAGE to your Docker Hub image, for example account/relay:latest}
+  pull_policy: always
+
+x-no-watchtower: &no-watchtower
+  com.centurylinklabs.watchtower.enable: "false"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    labels: *no-watchtower
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-relay}
+      POSTGRES_USER: ${POSTGRES_USER:-relay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in Portainer}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+
+  migrate:
+    <<: *relay-image
+    labels: *no-watchtower
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in Portainer}
+    command: ["npm", "run", "start:migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+  web:
+    <<: *relay-image
+    restart: unless-stopped
+    labels: *no-watchtower
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in Portainer}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in Portainer}
+      BETTER_AUTH_URL: https://${RELAY_HOSTNAME:?set RELAY_HOSTNAME}
+      ORIGIN: https://${RELAY_HOSTNAME:?set RELAY_HOSTNAME}
+      RELAY_INVITATION_DELIVERY_MODE: ${RELAY_INVITATION_DELIVERY_MODE:-manual}
+      RELAY_EMAIL_DELIVERY_URL: ${RELAY_EMAIL_DELIVERY_URL:-}
+      RELAY_REALTIME_SECRET: ${RELAY_REALTIME_SECRET:?set RELAY_REALTIME_SECRET in Portainer}
+      RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID}
+      RELAY_GITHUB_PRIVATE_KEY: ${RELAY_GITHUB_PRIVATE_KEY:?set RELAY_GITHUB_PRIVATE_KEY in Portainer}
+      RELAY_GITHUB_WEBHOOK_SECRET: ${RELAY_GITHUB_WEBHOOK_SECRET:?set RELAY_GITHUB_WEBHOOK_SECRET in Portainer}
+      RELAY_JITSI_BASE_URL: ${RELAY_JITSI_BASE_URL:-https://meet.jit.si}
+      RELAY_JITSI_EMBED_ENABLED: ${RELAY_JITSI_EMBED_ENABLED:-false}
+      HOST: 0.0.0.0
+      PORT: 3000
+    command: ["npm", "run", "start:web"]
+    ports:
+      - "${RELAY_BIND_ADDRESS:-0.0.0.0}:${RELAY_PORT:-9095}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    stop_grace_period: 30s
+    networks: [edge, backend]
+
+  worker:
+    <<: *relay-image
+    restart: unless-stopped
+    labels: *no-watchtower
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in Portainer}
+      RELAY_CODEX_BIN: ${RELAY_CODEX_BIN:-codex}
+      RELAY_AGENT_WORKSPACE_ROOT: /var/lib/relay/agent-runs
+      RELAY_GITHUB_APP_ID: ${RELAY_GITHUB_APP_ID:?set RELAY_GITHUB_APP_ID}
+      RELAY_GITHUB_PRIVATE_KEY: ${RELAY_GITHUB_PRIVATE_KEY:?set RELAY_GITHUB_PRIVATE_KEY in Portainer}
+    command: ["npm", "run", "start:worker"]
+    volumes:
+      - codex-state:/home/node/.codex
+      - agent-run-workspaces:/var/lib/relay/agent-runs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 30m
+    networks: [backend]
+
+  backup:
+    <<: *relay-image
+    restart: unless-stopped
+    labels: *no-watchtower
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in Portainer}
+      BACKUP_DIRECTORY: /backups
+      BACKUP_INTERVAL_SECONDS: ${RELAY_BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${RELAY_BACKUP_RETENTION_DAYS:-14}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec /ops/postgres/run-scheduled-backups.sh
+    volumes:
+      - database-backups:/backups
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+
+  evaluation-retention:
+    <<: *relay-image
+    restart: unless-stopped
+    labels: *no-watchtower
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in Portainer}
+      EVALUATION_RETENTION_INTERVAL_SECONDS: ${RELAY_EVALUATION_RETENTION_INTERVAL_SECONDS:-3600}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec /ops/postgres/run-evaluation-retention.sh
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+
+volumes:
+  postgres-data:
+  codex-state:
+  agent-run-workspaces:
+  database-backups:
+
+networks:
+  edge:
+  backend:

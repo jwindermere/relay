@@ -6,3 +6,4 @@ build/
 build-runtime/
 node_modules/
 .relay/
+ops/portainer/stack.env
