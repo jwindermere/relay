@@ -93,9 +93,9 @@
   let selectedAgentTemplate = $derived(
     data.agentTemplates.find((template) => template.key === agentTemplateKey)
   );
-  let selectedTemplateOverlap = $derived(selectedAgentTemplate?.ambientTriggers.find((topic) =>
-    data.agentConfiguration.agents.some((agent) => agent.ambientTriggers.includes(topic))
-  ));
+  let selectedTemplatePreview = $derived(
+    selectedAgentTemplate ? data.agentTemplatePreviews[selectedAgentTemplate.key] : undefined
+  );
   let agentHandoffs = $derived(
     realtimeHandoffs.length > 0 ? realtimeHandoffs : data.reconciliation.handoffs
   );
@@ -758,13 +758,13 @@
       const response = await fetch('/api/workspace/agent-templates', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ key: selectedAgentTemplate.key, availableCapabilities: [] })
+        body: JSON.stringify({ key: selectedAgentTemplate.key })
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.message ?? 'Agent template could not be instantiated');
       agentMessage = result.disabledCapabilities.length > 0
         ? `Agent added with unavailable capabilities disabled: ${result.disabledCapabilities.join(', ')}.`
-        : 'Agent added from template.';
+        : 'Agent added from Agent template.';
       agentTemplateKey = '';
       await invalidateAll();
     } catch (error) {
@@ -1913,6 +1913,12 @@
             <span class="min-w-0 flex-1">
               <strong class="block truncate text-sm">{agent.name}</strong>
               <span class="block truncate text-xs text-base-content/45">{agent.roleLabel} · {agent.participationMode}</span>
+              {#if agent.templateProvenance}
+                <span class="block truncate text-xs text-base-content/45">
+                  Agent template {agent.templateProvenance.key} · v{agent.templateProvenance.version}
+                  {#if data.agentTemplateUpgrades[agent.id]} · v{data.agentTemplateUpgrades[agent.id]?.toVersion} available{/if}
+                </span>
+              {/if}
             </span>
             <span class="text-xs text-primary">Edit</span>
           </button>
@@ -1921,9 +1927,9 @@
       {#if data.agentConfiguration.canManage}
         <div class="mt-5 space-y-3 border-t border-white/10 pt-5">
           <div class="space-y-2 border border-white/10 p-3">
-            <label class="text-xs text-base-content/60" for="agent-template">Optional bounded template</label>
+            <label class="text-xs text-base-content/60" for="agent-template">Optional bounded Agent template</label>
             <select id="agent-template" class="select select-sm w-full border-white/18 bg-transparent" bind:value={agentTemplateKey}>
-              <option value="">Choose a specialist template</option>
+              <option value="">Choose a specialist Agent template</option>
               {#each data.agentTemplates as template (template.key)}
                 <option value={template.key}>{template.name} · v{template.version}</option>
               {/each}
@@ -1932,12 +1938,23 @@
               <div class="text-xs leading-5 text-base-content/55">
                 <strong class="text-[#f1efe8]">{selectedAgentTemplate.roleLabel}</strong>
                 <p>{selectedAgentTemplate.instructions}</p>
+                <p>Type: {selectedAgentTemplate.agentType}.</p>
+                <p>Ambient topics: {selectedAgentTemplate.ambientTriggers.join(', ')}.</p>
+                <p>Participation: {selectedAgentTemplate.participationMode}; replies: {selectedAgentTemplate.replyMode}.</p>
+                <p>Required capabilities: {selectedAgentTemplate.requiredCapabilities.join(', ')}.</p>
                 <p>Permission ceiling: {selectedAgentTemplate.permissionCeiling.replaceAll('_', ' ')}.</p>
+                <p>Expected outputs: {selectedAgentTemplate.expectedResultShapes.join(', ').replaceAll('_', ' ')}.</p>
                 <p>Does not own: {selectedAgentTemplate.nonResponsibilities.join(', ')}.</p>
-                {#if selectedTemplateOverlap}<p class="text-warning">Ambient topic “{selectedTemplateOverlap}” overlaps an existing Agent.</p>{/if}
+                <p>Stays silent when: {selectedAgentTemplate.staySilentWhen.join('; ')}.</p>
+                {#if selectedTemplatePreview?.disabledCapabilities.length}
+                  <p class="text-warning">Unavailable capabilities will be disabled: {selectedTemplatePreview.disabledCapabilities.join(', ')}.</p>
+                {/if}
+                {#each selectedTemplatePreview?.warnings ?? [] as warning}
+                  <p class="text-warning">{warning}</p>
+                {/each}
               </div>
               <button class="btn btn-outline btn-primary btn-sm" type="button" disabled={agentBusy} onclick={() => void instantiateTemplate()}>
-                Add from template
+                Add from Agent template
               </button>
             {/if}
           </div>

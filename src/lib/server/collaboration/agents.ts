@@ -10,6 +10,7 @@ import {
 export type AgentType = 'engineering' | 'research' | 'product' | 'support' | 'general';
 export type AgentParticipationMode = 'reactive' | 'ambient';
 export type AgentReplyMode = 'adaptive' | 'channel' | 'thread';
+export type AgentPermissionCeiling = 'none' | 'read_only' | 'repository_write';
 
 export interface ConfigurableAgent {
   id: string;
@@ -23,7 +24,7 @@ export interface ConfigurableAgent {
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
   templateProvenance: { key: string; version: number } | null;
-  permissionCeiling: 'none' | 'read_only' | 'repository_write';
+  permissionCeiling: AgentPermissionCeiling;
   disabledCapabilities: string[];
 }
 
@@ -31,6 +32,17 @@ export class AgentConfigurationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AgentConfigurationError';
+  }
+}
+
+export function assertAgentTemplatePermissionCeiling(
+  agentType: AgentType,
+  permissionCeiling: AgentPermissionCeiling
+): void {
+  if (agentType === 'engineering' && permissionCeiling !== 'repository_write') {
+    throw new AgentConfigurationError(
+      `Engineering authority exceeds the template permission ceiling (${permissionCeiling})`
+    );
   }
 }
 
@@ -240,6 +252,20 @@ export async function updateWorkspaceAgent(
   try {
     await client.query('BEGIN');
     await assertCurrentWorkspaceOwner(client, access);
+    const existing = await client.query<{
+      template_key: string | null;
+      permission_ceiling: AgentPermissionCeiling;
+    }>(
+      `SELECT template_key, permission_ceiling
+       FROM public.agent
+       WHERE id = $1 AND workspace_id = $2
+       FOR UPDATE`,
+      [agentId, access.workspace.id]
+    );
+    if (!existing.rows[0]) throw new AgentConfigurationError('Agent was not found');
+    if (existing.rows[0].template_key) {
+      assertAgentTemplatePermissionCeiling(agent.agentType, existing.rows[0].permission_ceiling);
+    }
     const updated = await client.query(
       `UPDATE public.agent
        SET name = $3, agent_type = $4, role_label = $5, instructions = $6,

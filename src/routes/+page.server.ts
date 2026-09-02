@@ -12,7 +12,12 @@ import {
   postChannelMessage
 } from '$lib/server/collaboration/channel.js';
 import { loadWorkspaceAgents } from '$lib/server/collaboration/agents.js';
-import { listAgentTemplates } from '$lib/server/collaboration/agent-templates.js';
+import {
+  findAgentTemplateUpgrade,
+  listAgentTemplates,
+  loadAvailableAgentTemplateCapabilities,
+  previewAgentTemplate
+} from '$lib/server/collaboration/agent-templates.js';
 import { loadActiveChannelCall } from '$lib/server/collaboration/calls.js';
 import { loadAvailableWorkspaces } from '$lib/server/collaboration/workspaces.js';
 import { loadChannelReconciliation } from '$lib/server/collaboration/reconciliation.js';
@@ -30,7 +35,7 @@ export async function load({ request }) {
       getRelayAuth(),
       request.headers
     );
-    const [sharedChannel, providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces] = await Promise.all([
+    const [sharedChannel, providerConnection, linkedRepository, currentUserResult, agentConfiguration, workspaces, agentTemplateCapabilities] = await Promise.all([
       loadSharedAgentChannel(pool, access),
       loadProviderConnection(pool, access),
       loadLinkedRepository(pool, access),
@@ -39,13 +44,15 @@ export async function load({ request }) {
         [access.identity.userId]
       ),
       loadWorkspaceAgents(pool, access),
-      loadAvailableWorkspaces(pool, access)
+      loadAvailableWorkspaces(pool, access),
+      loadAvailableAgentTemplateCapabilities(pool, access)
     ]);
     const [reconciliation, activeCall, accountability] = await Promise.all([
       loadChannelReconciliation(pool, access, sharedChannel.channel.id, {}),
       loadActiveChannelCall(pool, access, sharedChannel.channel.id),
       loadCollaborationAccountability(pool, access, sharedChannel.project.id)
     ]);
+    const agentTemplates = listAgentTemplates();
     return {
       email: access.identity.email,
       role: access.membership.role,
@@ -59,7 +66,18 @@ export async function load({ request }) {
       providerConnection,
       linkedRepository,
       agentConfiguration,
-      agentTemplates: listAgentTemplates(),
+      agentTemplates,
+      agentTemplatePreviews: Object.fromEntries(agentTemplates.map((template) => [
+        template.key,
+        previewAgentTemplate(template.key, {
+          availableCapabilities: agentTemplateCapabilities,
+          existingAgents: agentConfiguration.agents
+        })
+      ])),
+      agentTemplateUpgrades: Object.fromEntries(agentConfiguration.agents.map((agent) => [
+        agent.id,
+        agent.templateProvenance ? findAgentTemplateUpgrade(agent.templateProvenance) : null
+      ])),
       workspaces,
       reconciliation,
       accountability,

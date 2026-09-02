@@ -24,6 +24,12 @@ import {
   parseFindingResult,
   renderProjectMemoryContext
 } from '../lib/server/collaboration/findings.js';
+import {
+  renderAgentTemplateExecutionBounds,
+  type AgentCapability,
+  type AgentExpectedResultShape
+} from '../lib/server/collaboration/agent-templates.js';
+import type { AgentPermissionCeiling } from '../lib/server/collaboration/agents.js';
 
 interface ClaimedConversationTurn {
   id: string;
@@ -40,6 +46,11 @@ interface ClaimedConversationTurn {
   agent_type: string;
   agent_role_label: string;
   agent_instructions: string;
+  template_expected_result_shapes: AgentExpectedResultShape[];
+  template_non_responsibilities: string[];
+  template_stay_silent_when: string[];
+  disabled_capabilities: AgentCapability[];
+  permission_ceiling: AgentPermissionCeiling;
   collaborator_roster: string;
   response_parent_message_id: string | null;
   ambient: boolean;
@@ -113,6 +124,13 @@ export async function processNextConversationTurn(
 
   try {
     const channelMemory = await loadConversationMemory(pool, claim);
+    const templateBounds = renderAgentTemplateExecutionBounds({
+      expectedResultShapes: claim.template_expected_result_shapes,
+      nonResponsibilities: claim.template_non_responsibilities,
+      staySilentWhen: claim.template_stay_silent_when,
+      disabledCapabilities: claim.disabled_capabilities,
+      permissionCeiling: claim.permission_ceiling
+    });
     await provider.execute({
       signal: executionAbort.signal,
       credentialStoreReference: claim.credential_store_reference,
@@ -121,6 +139,7 @@ export async function processNextConversationTurn(
         `You are ${claim.agent_name}, a ${claim.agent_role_label} (${claim.agent_type} Agent).`,
         'You are participating as a thoughtful, human-like teammate in a Relay Channel.',
         claim.agent_instructions ? `Your standing instructions: ${claim.agent_instructions}` : '',
+        templateBounds,
         claim.ambient
           ? 'You were not tagged. Reply only if your contribution is relevant, useful, and timely. If staying silent is better, return exactly [RELAY_SILENT].'
           : 'Reply directly and naturally to the latest message.',
@@ -134,6 +153,7 @@ export async function processNextConversationTurn(
           ? 'If several specialties are genuinely required, preview one bounded plan using a final fenced relay-coordination-plan JSON object with goal, constraints, allowParallel, budget, and steps. Do not start plan work; a Pilot member must approve it.'
           : '',
         claim.agent_type === 'research'
+          && !claim.template_expected_result_shapes.includes('structured_finding')
           ? 'Return a concise answer plus a final fenced relay-finding JSON object containing summary, confidence, observedEvidence, inferences, assumptions, openQuestions, and evidence. Each evidence item needs type, stableReference, title, retrievedAt, and claim.'
           : '',
         'Do not repeat an answer already present in the recent context.',
@@ -224,6 +244,13 @@ async function claimNextConversationTurn(
               agent_member.id AS agent_member_id, agent.name AS agent_name,
               agent.agent_type, agent.role_label AS agent_role_label,
               agent.instructions AS agent_instructions,
+              COALESCE(agent.template_snapshot -> 'expectedResultShapes', '[]'::jsonb)
+                AS template_expected_result_shapes,
+              COALESCE(agent.template_snapshot -> 'nonResponsibilities', '[]'::jsonb)
+                AS template_non_responsibilities,
+              COALESCE(agent.template_snapshot -> 'staySilentWhen', '[]'::jsonb)
+                AS template_stay_silent_when,
+              agent.disabled_capabilities, agent.permission_ceiling,
               COALESCE((
                 SELECT string_agg('@' || collaborator.name || ' (' || collaborator.role_label || ')', ', '
                                   ORDER BY collaborator.name, collaborator.id)
@@ -452,7 +479,10 @@ async function finishConversationTurn(
     && claim.handoff_depth === 0) {
     try { proposal = parseCoordinationPlanProposal(body); } catch { proposal = null; }
   }
-  if (body !== null && status === 'completed' && claim.agent_type === 'research') {
+  if (body !== null && status === 'completed' && (
+    claim.agent_type === 'research'
+    || claim.template_expected_result_shapes.includes('structured_finding')
+  )) {
     try { findingResult = parseFindingResult(body); } catch { findingResult = null; }
   }
   const visibleBody = proposal?.message || findingResult?.message || body;

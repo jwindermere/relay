@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 
 import type { AgentMentionResult } from './delegation.js';
+import type { AgentExpectedResultShape } from './agent-templates.js';
 import { loadChannelContextBeforeMessage } from './channel-context.js';
 import {
   explicitAgentMentionPattern,
@@ -32,6 +33,7 @@ interface AgentCandidate {
   enabled: boolean;
   status: 'idle' | 'working' | 'waiting' | 'disabled';
   configuration_version: number;
+  template_expected_result_shapes: AgentExpectedResultShape[];
 }
 
 function ambientTriggerMatches(normalizedBody: string, trigger: string): boolean {
@@ -74,7 +76,9 @@ export async function acceptAgentConversation(
 ): Promise<AgentMentionResult> {
   const agents = await client.query<AgentCandidate>(
     `SELECT id, name, agent_type, role_label, instructions, participation_mode,
-            ambient_triggers, reply_mode, enabled, status, configuration_version
+            ambient_triggers, reply_mode, enabled, status, configuration_version,
+            COALESCE(template_snapshot -> 'expectedResultShapes', '[]'::jsonb)
+              AS template_expected_result_shapes
      FROM public.agent WHERE workspace_id = $1
      ORDER BY length(name) DESC, id`,
     [context.workspaceId]
@@ -355,6 +359,7 @@ export async function acceptAgentConversation(
       url: artifact.url
     }));
     const expectedResponseShape = agent.agent_type === 'research'
+      || agent.template_expected_result_shapes.includes('structured_finding')
       ? 'structured_finding'
       : 'concise_text';
     const suppliedContext = await loadChannelContextBeforeMessage(

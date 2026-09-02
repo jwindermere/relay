@@ -18,6 +18,14 @@ import {
   postChannelMessage
 } from '../src/lib/server/collaboration/channel.js';
 import {
+  loadWorkspaceAgents,
+  updateWorkspaceAgent
+} from '../src/lib/server/collaboration/agents.js';
+import {
+  instantiateAgentTemplate,
+  loadAvailableAgentTemplateCapabilities
+} from '../src/lib/server/collaboration/agent-templates.js';
+import {
   endChannelCall,
   joinChannelCall,
   loadActiveChannelCall,
@@ -612,6 +620,56 @@ if (connectionString) {
     await assert.rejects(
       issueWorkspaceInvitation(pool, ownerAccess, { email: 'third@example.com' }),
       /already has an active invitation/
+    );
+  });
+
+  test('Agent template instantiation preserves bounded provenance through owner customization', async () => {
+    const auth = createTestAuth();
+    const signIn = await auth.handler(new Request('http://relay.test/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://relay.test' },
+      body: JSON.stringify({ email: 'owner@example.com', password: 'correct horse battery staple' })
+    }));
+    const ownerCookie = signIn.headers.get('set-cookie');
+    assert.ok(ownerCookie);
+    const ownerAccess = await authorizeWorkspaceRequest(
+      pool,
+      auth,
+      new Headers({ cookie: ownerCookie.split(';', 1)[0] })
+    );
+    const existingAgents = (await loadWorkspaceAgents(pool, ownerAccess)).agents;
+    const availableCapabilities = await loadAvailableAgentTemplateCapabilities(pool, ownerAccess);
+    const created = await instantiateAgentTemplate(pool, ownerAccess, 'designer', {
+      availableCapabilities,
+      existingAgents,
+      name: 'Journey Designer',
+      roleLabel: 'Onboarding designer',
+      instructions: 'Review authorised onboarding evidence.',
+      ambientTriggers: ['onboarding', 'journey']
+    });
+
+    assert.deepEqual(created.agent.templateProvenance, { key: 'designer', version: 2 });
+    assert.deepEqual(created.disabledCapabilities, ['design_assets']);
+    await updateWorkspaceAgent(pool, ownerAccess, created.agent.id, {
+      ...created.agent,
+      roleLabel: 'Activation designer',
+      instructions: 'Review authorised activation evidence.'
+    });
+
+    const customized = (await loadWorkspaceAgents(pool, ownerAccess)).agents.find(
+      ({ id }) => id === created.agent.id
+    );
+    assert.equal(customized?.roleLabel, 'Activation designer');
+    assert.deepEqual(customized?.templateProvenance, { key: 'designer', version: 2 });
+    assert.equal(customized?.permissionCeiling, 'read_only');
+    assert.deepEqual(customized?.disabledCapabilities, ['design_assets']);
+    await assert.rejects(
+      updateWorkspaceAgent(pool, ownerAccess, created.agent.id, {
+        ...created.agent,
+        agentType: 'engineering',
+        roleLabel: 'Engineering designer'
+      }),
+      /permission ceiling/i
     );
   });
 
